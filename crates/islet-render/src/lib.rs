@@ -417,6 +417,7 @@ impl Renderer {
                 sample.bubble_corner,
             )),
             sample.gap,
+            sample.inset,
             self.logical_width,
             self.logical_height,
             self.anchor_top,
@@ -466,6 +467,7 @@ struct Sample {
     bubble_height: f32,
     bubble_corner: f32,
     gap: f32,
+    inset: f32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -483,6 +485,7 @@ struct Animator {
     bubble_height: Spring,
     bubble_corner: Spring,
     gap: Spring,
+    inset: Spring,
 }
 
 impl Animator {
@@ -495,6 +498,13 @@ impl Animator {
             bubble_height: Spring::new(0.0, 0.0, SpringParams::EXPAND, now),
             bubble_corner: Spring::new(0.0, 0.0, SpringParams::EXPAND, now),
             gap: Spring::new(0.0, 0.0, SpringParams::EXPAND, now),
+            // Starts at rest at its target so the first show does not slide.
+            inset: Spring::new(
+                f64::from(target.inset),
+                f64::from(target.inset),
+                SpringParams::EXPAND,
+                now,
+            ),
         };
         animator.set_target(target, now);
         animator
@@ -554,6 +564,12 @@ impl Animator {
             now,
         );
         retarget(&mut self.gap, f64::from(target.gap), params, now);
+        retarget(
+            &mut self.inset,
+            f64::from(target.inset),
+            SpringParams::COLLAPSE,
+            now,
+        );
     }
 
     fn sample(&self, now: f64) -> Sample {
@@ -565,6 +581,7 @@ impl Animator {
             bubble_height: self.bubble_height.position(now).max(0.0) as f32,
             bubble_corner: self.bubble_corner.position(now).max(0.0) as f32,
             gap: self.gap.position(now).max(0.0) as f32,
+            inset: self.inset.position(now).max(0.0) as f32,
         }
     }
 
@@ -576,6 +593,7 @@ impl Animator {
             && self.bubble_height.is_settled(now)
             && self.bubble_corner.is_settled(now)
             && self.gap.is_settled(now)
+            && self.inset.is_settled(now)
     }
 }
 
@@ -1095,6 +1113,9 @@ impl Gfx {
         if width < 60.0 && height < 60.0 {
             return self.draw_bubble(now, width, height, corner, card, accent, alpha);
         }
+        if height < 31.0 && !matches!(card, ContentCard::Dictation(_)) {
+            return self.draw_tucked(now, width, height, card, accent, alpha);
+        }
         match card {
             ContentCard::Media(media) => {
                 if height > 60.0 {
@@ -1158,19 +1179,11 @@ impl Gfx {
             color([173, 180, 199], 0.88 * alpha),
         )?;
 
-        let levels = self.bar_levels.filter(|_| media.playing);
         let start = width - 46.0 - 10.0;
         let mid = height * 0.5;
         for index in 0..BAR_COUNT {
-            let level = match levels {
-                Some(levels) => levels[index],
-                None if media.playing => {
-                    let phase = now * 7.2 + index as f64 * 0.85;
-                    (phase.sin() * 0.5 + 0.5) as f32 * 0.65 + 0.35
-                }
-                None => 0.12,
-            };
-            let bar_h = 3.0 + level.clamp(0.0, 1.0) * 15.0;
+            let level = self.bar_level(now, index, media.playing);
+            let bar_h = 3.0 + level * 15.0;
             self.fill_round_rect(
                 start + index as f32 * 8.0,
                 mid - bar_h * 0.5,
@@ -1181,6 +1194,99 @@ impl Gfx {
             )?;
         }
         Ok(())
+    }
+
+    /// One line for the slim docked island: what is playing (or what
+    /// happened) stays readable while the island keeps out of the way.
+    unsafe fn draw_tucked(
+        &mut self,
+        now: f64,
+        width: f32,
+        height: f32,
+        card: &ContentCard,
+        accent: [u8; 3],
+        alpha: f32,
+    ) -> RenderResult<()> {
+        let (text, trailing_bars) = match card {
+            ContentCard::Media(media) => {
+                let art = (height - 8.0).max(8.0);
+                self.draw_art(
+                    Rect::new(5.0, (height - art) * 0.5, art, art),
+                    5.0,
+                    media.art.as_ref(),
+                    accent,
+                    alpha,
+                )?;
+                let text = if media.artist.is_empty() {
+                    media.title.clone()
+                } else {
+                    format!("{}  \u{b7}  {}", media.title, media.artist)
+                };
+                (text, Some(media))
+            }
+            ContentCard::Notification(notification) => {
+                self.fill_circle(13.0, height * 0.5, 3.5, color(accent, alpha))?;
+                (
+                    format!("{}  \u{b7}  {}", notification.title, notification.source),
+                    None,
+                )
+            }
+            ContentCard::Agent(agent) => {
+                self.fill_circle(13.0, height * 0.5, 3.5, color(accent, alpha))?;
+                (
+                    format!("{}  \u{b7}  {}", agent.project, agent.activity),
+                    None,
+                )
+            }
+            ContentCard::Dictation(_) => return Ok(()),
+        };
+
+        let text_x = if trailing_bars.is_some() {
+            height + 6.0
+        } else {
+            24.0
+        };
+        let bars_w = if trailing_bars.is_some() { 30.0 } else { 0.0 };
+        self.draw_text(
+            &text,
+            FormatId::Tucked,
+            text_x,
+            0.0,
+            (width - text_x - bars_w - 12.0).max(10.0),
+            height,
+            color([236, 238, 245], 0.95 * alpha),
+        )?;
+
+        if let Some(media) = trailing_bars {
+            let start = width - bars_w - 6.0;
+            let mid = height * 0.5;
+            for index in 0..4 {
+                let level = self.bar_level(now, index, media.playing);
+                let bar_h = 2.5 + level * (height - 12.0);
+                self.fill_round_rect(
+                    start + index as f32 * 6.5,
+                    mid - bar_h * 0.5,
+                    2.4,
+                    bar_h,
+                    1.2,
+                    color(accent, if media.playing { 0.92 } else { 0.5 } * alpha),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Bar height 0..1: real loopback levels when fresh, otherwise a gentle
+    /// procedural wave while playing, and a low rest when paused.
+    fn bar_level(&self, now: f64, index: usize, playing: bool) -> f32 {
+        if !playing {
+            return 0.12;
+        }
+        if let Some(levels) = self.bar_levels {
+            return levels[index % BAR_COUNT].clamp(0.0, 1.0);
+        }
+        let phase = now * 7.2 + index as f64 * 0.85;
+        (phase.sin() * 0.5 + 0.5) as f32 * 0.65 + 0.35
     }
 
     unsafe fn draw_media_expanded(
@@ -2016,6 +2122,7 @@ enum FormatId {
     Sub,
     Tiny,
     TinyRight,
+    Tucked,
     Bubble,
     Timer,
 }
@@ -2027,6 +2134,7 @@ struct TextFormats {
     sub: IDWriteTextFormat,
     tiny: IDWriteTextFormat,
     tiny_right: IDWriteTextFormat,
+    tucked: IDWriteTextFormat,
     bubble: IDWriteTextFormat,
     timer: IDWriteTextFormat,
 }
@@ -2076,6 +2184,13 @@ impl TextFormats {
                 DWRITE_TEXT_ALIGNMENT_TRAILING,
                 DWRITE_PARAGRAPH_ALIGNMENT_NEAR,
             )?,
+            tucked: create_format(
+                factory,
+                12.0,
+                DWRITE_FONT_WEIGHT_DEMI_BOLD,
+                DWRITE_TEXT_ALIGNMENT_LEADING,
+                DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
+            )?,
             bubble: create_format(
                 factory,
                 14.0,
@@ -2101,6 +2216,7 @@ impl TextFormats {
             FormatId::Sub => &self.sub,
             FormatId::Tiny => &self.tiny,
             FormatId::TinyRight => &self.tiny_right,
+            FormatId::Tucked => &self.tucked,
             FormatId::Bubble => &self.bubble,
             FormatId::Timer => &self.timer,
         }

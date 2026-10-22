@@ -47,6 +47,9 @@ pub struct GeneralConfig {
     pub idle_style: IdleStyle,
     pub hide_in_fullscreen: bool,
     pub start_with_windows: bool,
+    /// Slim down and dock to the screen edge while an app window is behind
+    /// the island.
+    pub tuck_behind_windows: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -139,6 +142,7 @@ impl Default for GeneralConfig {
             idle_style: IdleStyle::Hidden,
             hide_in_fullscreen: true,
             start_with_windows: false,
+            tuck_behind_windows: true,
         }
     }
 }

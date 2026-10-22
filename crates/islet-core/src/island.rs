@@ -15,6 +15,8 @@ pub const DONE_VISIBLE_MS: u32 = 4_000;
 /// Default delay before paused media closes (`media.pause_hide_seconds`).
 pub const MEDIA_PAUSED_MS: u32 = 5 * 1_000;
 pub const SPLIT_GAP_DP: f32 = 6.0;
+/// Gap between the island and the screen edge (work area), in DIPs.
+pub const EDGE_GAP_DP: f32 = 8.0;
 
 /// Sizes from PLAN.md §4.4, in logical pixels (DIPs).
 pub const COMPACT: PillSize = PillSize::new(220.0, 36.0, 18.0);
@@ -22,6 +24,10 @@ pub const SPLIT_BUBBLE: PillSize = PillSize::new(36.0, 36.0, 18.0);
 pub const NOTIFICATION: PillSize = PillSize::new(380.0, 76.0, 30.0);
 pub const MEDIA: PillSize = PillSize::new(400.0, 168.0, 38.0);
 pub const DICTATION: PillSize = PillSize::new(260.0, 44.0, 22.0);
+/// Slim form docked to the screen edge while an app window is behind the
+/// island: still shows art, "Title · Artist", and bars on one line.
+pub const TUCKED: PillSize = PillSize::new(300.0, 26.0, 13.0);
+pub const TUCKED_BUBBLE: PillSize = PillSize::new(26.0, 26.0, 13.0);
 pub const SLIVER: PillSize = PillSize::new(120.0, 6.0, 3.0);
 pub const HIDDEN: PillSize = PillSize::new(0.0, 0.0, 0.0);
 
@@ -49,6 +55,8 @@ pub struct LayoutTarget {
     pub main: PillSize,
     pub bubble: Option<PillSize>,
     pub gap: f32,
+    /// Distance from the screen edge. Springs to 0 when tucked.
+    pub inset: f32,
     pub visible: bool,
 }
 
@@ -57,6 +65,7 @@ impl LayoutTarget {
         main: HIDDEN,
         bubble: None,
         gap: 0.0,
+        inset: EDGE_GAP_DP,
         visible: false,
     };
 
@@ -66,6 +75,7 @@ impl LayoutTarget {
             main: size,
             bubble: None,
             gap: 0.0,
+            inset: EDGE_GAP_DP,
             visible: true,
         }
     }
@@ -76,8 +86,15 @@ impl LayoutTarget {
             main,
             bubble: Some(bubble),
             gap: SPLIT_GAP_DP,
+            inset: EDGE_GAP_DP,
             visible: true,
         }
+    }
+
+    /// The same target docked flush against the screen edge.
+    #[must_use]
+    pub const fn docked(self) -> Self {
+        Self { inset: 0.0, ..self }
     }
 
     #[must_use]
@@ -116,14 +133,17 @@ impl PillFrame {
 }
 
 /// Places the main pill and optional bubble in a `window_width` x
-/// `window_height` window. The group is centred horizontally and anchored to
-/// the edge nearest the screen edge; the bubble sits to the right, centred
-/// vertically on the main pill. Sizes below half a pixel are treated as gone.
+/// `window_height` window. The group is centred horizontally and sits
+/// `inset` away from the edge nearest the screen edge; the bubble sits to
+/// the right, centred vertically on the main pill. Sizes below half a pixel
+/// are treated as gone.
 #[must_use]
+#[allow(clippy::too_many_arguments)]
 pub fn arrange(
     main: PillSize,
     bubble: Option<PillSize>,
     gap: f32,
+    inset: f32,
     window_width: f32,
     window_height: f32,
     anchor_top: bool,
@@ -141,10 +161,11 @@ pub fn arrange(
             0.0
         };
     let main_x = (window_width - group_w) * 0.5;
+    let inset = inset.max(0.0);
     let main_y = if anchor_top {
-        0.0
+        inset
     } else {
-        window_height - main_h
+        window_height - main_h - inset
     };
     PillFrame {
         main: Rect::new(main_x, main_y, main_w, main_h),
@@ -320,6 +341,8 @@ pub struct IslandState {
     /// How long paused media stays before closing.
     pub media_paused_ms: u32,
     pub idle_style: IdleStyle,
+    /// An app window is behind the island: use the slim docked form.
+    pub tucked: bool,
     pub expanded: bool,
     pub pointer_inside: bool,
     pub done_deadline: Option<f64>,
@@ -336,6 +359,7 @@ impl Default for IslandState {
             media_dismissed: false,
             media_paused_ms: MEDIA_PAUSED_MS,
             idle_style: IdleStyle::Hidden,
+            tucked: false,
             expanded: false,
             pointer_inside: false,
             done_deadline: None,
@@ -411,6 +435,18 @@ impl IslandState {
     pub fn layout(&self) -> LayoutTarget {
         if self.dictation.is_some() {
             return LayoutTarget::single(DICTATION);
+        }
+
+        // Out of the way of the window behind; hovering expands as usual.
+        if self.tucked && !self.expanded {
+            let target = if self.persistent_count() >= 2 {
+                LayoutTarget::split(TUCKED, TUCKED_BUBBLE)
+            } else if self.primary_kind().is_some() {
+                LayoutTarget::single(TUCKED)
+            } else {
+                LayoutTarget::idle(self.idle_style)
+            };
+            return target.docked();
         }
 
         if self.expanded {
@@ -491,6 +527,7 @@ pub enum IslandEvent {
     Tick { now: f64 },
     SetExpanded(bool),
     SetIdleStyle(IdleStyle),
+    SetTucked(bool),
     SetDictation(Option<DictationCard>),
     SetMedia(Option<MediaCard>),
     SetNeedsInput(Option<NotificationCard>),
@@ -575,6 +612,14 @@ pub fn reduce(state: &mut IslandState, event: IslandEvent, now: f64) -> Vec<Effe
         IslandEvent::SetExpanded(expanded) => {
             if state.expanded != expanded {
                 state.expanded = expanded;
+                vec![Effect::LayoutChanged]
+            } else {
+                Vec::new()
+            }
+        }
+        IslandEvent::SetTucked(tucked) => {
+            if state.tucked != tucked {
+                state.tucked = tucked;
                 vec![Effect::LayoutChanged]
             } else {
                 Vec::new()
@@ -1012,12 +1057,12 @@ mod tests {
 
     #[test]
     fn arrange_centres_and_anchors_the_main_pill() {
-        let bottom = arrange(COMPACT, None, 0.0, 440.0, 200.0, false);
+        let bottom = arrange(COMPACT, None, 0.0, 0.0, 440.0, 200.0, false);
         assert_eq!(bottom.main, Rect::new(110.0, 164.0, 220.0, 36.0));
         assert_eq!(bottom.bubble, None);
         assert_eq!(bottom.bounds(), Some(bottom.main));
 
-        let top = arrange(COMPACT, None, 0.0, 440.0, 200.0, true);
+        let top = arrange(COMPACT, None, 0.0, 0.0, 440.0, 200.0, true);
         assert_eq!(top.main.y, 0.0);
     }
 
@@ -1027,6 +1072,7 @@ mod tests {
             COMPACT,
             Some(SPLIT_BUBBLE),
             SPLIT_GAP_DP,
+            0.0,
             440.0,
             200.0,
             false,
@@ -1039,14 +1085,69 @@ mod tests {
     }
 
     #[test]
+    fn arrange_applies_the_edge_inset() {
+        let bottom = arrange(COMPACT, None, 0.0, EDGE_GAP_DP, 440.0, 200.0, false);
+        assert_eq!(bottom.main.bottom(), 200.0 - EDGE_GAP_DP);
+        let top = arrange(COMPACT, None, 0.0, EDGE_GAP_DP, 440.0, 200.0, true);
+        assert_eq!(top.main.y, EDGE_GAP_DP);
+    }
+
+    #[test]
+    fn tucked_island_is_slim_and_docked_until_hovered() {
+        let mut state = IslandState::default();
+        reduce(&mut state, IslandEvent::SetMedia(Some(media())), 0.0);
+        assert_eq!(state.layout().inset, EDGE_GAP_DP);
+
+        let effects = reduce(&mut state, IslandEvent::SetTucked(true), 0.0);
+        assert_eq!(effects, vec![Effect::LayoutChanged]);
+        assert_eq!(state.layout(), LayoutTarget::single(TUCKED).docked());
+        // Content is unchanged: the renderer draws it in one line.
+        assert!(matches!(
+            state.content().primary,
+            Some(ContentCard::Media(_))
+        ));
+
+        // Hover expands to the full media view as usual.
+        reduce(&mut state, IslandEvent::SetExpanded(true), 0.0);
+        assert_eq!(state.layout(), LayoutTarget::single(MEDIA));
+
+        reduce(&mut state, IslandEvent::SetExpanded(false), 0.0);
+        reduce(&mut state, IslandEvent::SetRunning(Some(agent())), 0.0);
+        assert_eq!(
+            state.layout(),
+            LayoutTarget::split(TUCKED, TUCKED_BUBBLE).docked()
+        );
+
+        reduce(&mut state, IslandEvent::SetTucked(false), 0.0);
+        assert_eq!(state.layout(), LayoutTarget::split(COMPACT, SPLIT_BUBBLE));
+    }
+
+    #[test]
+    fn dictation_is_never_tucked() {
+        let mut state = IslandState::default();
+        reduce(&mut state, IslandEvent::SetTucked(true), 0.0);
+        reduce(
+            &mut state,
+            IslandEvent::SetDictation(Some(DictationCard {
+                elapsed_ms: 0,
+                level: 0.5,
+                phase: DictationPhase::Recording,
+            })),
+            0.0,
+        );
+        assert_eq!(state.layout(), LayoutTarget::single(DICTATION));
+    }
+
+    #[test]
     fn arrange_of_hidden_has_no_bounds() {
-        let frame = arrange(HIDDEN, None, 0.0, 440.0, 200.0, false);
+        let frame = arrange(HIDDEN, None, 0.0, 0.0, 440.0, 200.0, false);
         assert_eq!(frame.bounds(), None);
         // A collapsing sub-pixel bubble is treated as gone.
         let frame = arrange(
             COMPACT,
             Some(PillSize::new(0.3, 0.3, 0.1)),
             6.0,
+            0.0,
             440.0,
             200.0,
             false,

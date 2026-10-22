@@ -4,6 +4,7 @@ mod config_watch;
 mod icon;
 mod island_window;
 mod logging;
+mod occlusion;
 mod paths;
 mod settings;
 mod tray;

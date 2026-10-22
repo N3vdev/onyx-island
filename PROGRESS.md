@@ -446,3 +446,30 @@ Chosen in PLAN §1; it lives only in the settings exe.
 | `islet.exe` | 1.81 MB |
 | `islet-settings.exe` | 3.95 MB |
 | settings window open (release) | 28.2 MiB private, 0 ms CPU over 5 s idle |
+
+## Slim bar over apps (user request, 2026-10-22)
+
+With the island at the top, it covered the browser's tab strip. Now, while
+an app window overlaps where the island normally sits, it becomes a slim
+300x26 dp bar docked flush at the **bottom** screen edge (one line: art,
+"Title · Artist", mini bars; notifications and agents get a dot and one
+line). Hover expands to the full island as usual. Dictation never slims.
+When the spot is clear again it returns to its configured edge.
+
+- Core: `IslandState::tucked`, `TUCKED`/`TUCKED_BUBBLE` sizes, and a new
+  `LayoutTarget::inset` (edge gap) that `arrange` applies. The island window
+  is now flush with the work area and the 8 dp gap is drawn as a spring, so
+  docking slides instead of jumping.
+- Detection (`islet-app::occlusion`): out-of-context WinEvent hooks
+  (foreground, move/size end, minimize, show/hide/destroy, location,
+  cloak) post to the island window; a 120 ms debounce then enumerates
+  top-level windows and checks overlap with the strip at the configured
+  edge using DWM extended frame bounds. Skips this process, the desktop,
+  taskbars, minimised, cloaked, and click-through windows. Asking about the
+  configured spot (not where the bar currently is) prevents top/bottom
+  flapping. No polling.
+- The window moves to the bottom before the snapshot is sent, so no frame
+  is drawn at the old edge.
+- Config `general.tuck_behind_windows` (default on) with a Settings toggle.
+- Verified live: Position = Top, Firefox maximised, Spotify playing: tabs
+  clear, slim bar at the bottom edge with art, title, and live bars.

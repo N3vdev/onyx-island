@@ -17,6 +17,8 @@ use islet_core::music::MusicFilter;
 use islet_core::{Config, Rect};
 use islet_media::{MediaCommand, MediaInfo, MediaService};
 use islet_render::{HitRegion, Renderer, RendererConfig};
+
+use crate::occlusion;
 use windows::core::{s, w, Result as WinResult};
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::Graphics::Dwm::DwmFlush;
@@ -45,7 +47,6 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 pub const WINDOW_LOGICAL_WIDTH: f32 = 440.0;
 pub const WINDOW_LOGICAL_HEIGHT: f32 = 200.0;
-const EDGE_GAP_DP: f32 = 8.0;
 
 const TIMER_HOVER_EXPAND: usize = 1;
 const TIMER_HOVER_COLLAPSE: usize = 2;
@@ -53,6 +54,9 @@ const TIMER_DONE_EXPIRY: usize = 3;
 const TIMER_POLL: usize = 4;
 const TIMER_DEMO: usize = 5;
 const TIMER_MEDIA_PAUSED: usize = 6;
+const TIMER_OCCLUSION: usize = 7;
+/// Window moves arrive in bursts (dragging); check what is behind after this.
+const OCCLUSION_DEBOUNCE_MS: u32 = 120;
 const WM_MOUSELEAVE: u32 = 0x02A3;
 /// Shell appbar notifications (only `ABN_FULLSCREENAPP` is used).
 const WM_APP_APPBAR: u32 = WM_APP + 20;
@@ -61,6 +65,8 @@ const WM_APP_APPBAR: u32 = WM_APP + 20;
 const WM_APP_SETTLED: u32 = WM_APP + 21;
 /// Posted by the media thread when now-playing changed.
 const WM_APP_MEDIA: u32 = WM_APP + 22;
+/// Posted by the WinEvent hooks when any top-level window changed.
+const WM_APP_WINDOWS_CHANGED: u32 = WM_APP + 23;
 /// Extra room around a morphing island's window region for spring overshoot.
 const REGION_MORPH_MARGIN_DP: f32 = 12.0;
 
@@ -140,6 +146,9 @@ pub struct IslandHost {
     pixel_width: u32,
     pixel_height: u32,
     last_layout: Option<WindowLayout>,
+    /// Layout at the configured edge. The slim bar may sit elsewhere, but
+    /// "is a window behind the island?" is always asked about this spot.
+    home_layout: Option<WindowLayout>,
     demo: Option<Demo>,
     poll_interval: Option<u32>,
     appbar: bool,
@@ -159,6 +168,9 @@ pub struct IslandHost {
     color_tint: bool,
     music_filter: MusicFilter,
     scrubbing: bool,
+    tuck_enabled: bool,
+    window_events: Option<occlusion::WindowEvents>,
+    occlusion_pending: bool,
     warned_disconnected: bool,
 }
 
@@ -170,7 +182,8 @@ impl IslandHost {
         demo_state: Option<usize>,
     ) -> WinResult<Box<Self>> {
         let config = read_config(&shared);
-        let layout = compute_window_layout(hwnd, &config)?;
+        let layout =
+            compute_window_layout(&config, config.general.position == ScreenPosition::Top)?;
         apply_window_layout(hwnd, layout)?;
 
         let hit = Arc::new(Mutex::new(HitRegion::default()));
@@ -213,6 +226,7 @@ impl IslandHost {
             pixel_width: layout.width as u32,
             pixel_height: layout.height as u32,
             last_layout: Some(layout),
+            home_layout: Some(layout),
             demo: None,
             poll_interval: None,
             appbar: false,
@@ -230,6 +244,9 @@ impl IslandHost {
             color_tint: config.media.color_tint,
             music_filter: music_filter(&config),
             scrubbing: false,
+            tuck_enabled: config.general.tuck_behind_windows,
+            window_events: None,
+            occlusion_pending: false,
             warned_disconnected: false,
         });
 
@@ -250,6 +267,8 @@ impl IslandHost {
             }
             host.demo_advance();
         }
+        // After the demo is set up: the demo never tucks.
+        host.update_window_events();
         Ok(host)
     }
 
@@ -267,7 +286,9 @@ impl IslandHost {
             let _ = KillTimer(Some(self.hwnd), TIMER_POLL);
             let _ = KillTimer(Some(self.hwnd), TIMER_DEMO);
             let _ = KillTimer(Some(self.hwnd), TIMER_MEDIA_PAUSED);
+            let _ = KillTimer(Some(self.hwnd), TIMER_OCCLUSION);
         }
+        self.window_events = None;
         self.loopback = None;
         self.media = None;
         self.poll_interval = None;
@@ -309,6 +330,8 @@ impl IslandHost {
             }
             self.music_filter = filter;
         }
+        self.tuck_enabled = config.general.tuck_behind_windows;
+        self.update_window_events();
         let tint_changed = self.color_tint != config.media.color_tint;
         self.real_bars = config.media.real_bars;
         self.color_tint = config.media.color_tint;
@@ -393,6 +416,20 @@ impl IslandHost {
                 }
                 Some(LRESULT(0))
             }
+            WM_APP_WINDOWS_CHANGED => {
+                if !self.occlusion_pending {
+                    self.occlusion_pending = true;
+                    unsafe {
+                        SetTimer(
+                            Some(self.hwnd),
+                            TIMER_OCCLUSION,
+                            OCCLUSION_DEBOUNCE_MS,
+                            None,
+                        );
+                    }
+                }
+                Some(LRESULT(0))
+            }
             WM_APP_MEDIA => {
                 let mut latest = None;
                 while let Ok(info) = self.media_rx.try_recv() {
@@ -460,6 +497,67 @@ impl IslandHost {
         }
         self.update_poll_timer();
         self.update_loopback();
+    }
+
+    /// Hooks window events only while slim mode is enabled.
+    fn update_window_events(&mut self) {
+        let wanted = self.tuck_enabled && self.demo.is_none();
+        match (wanted, self.window_events.is_some()) {
+            (true, false) => {
+                self.window_events = Some(occlusion::WindowEvents::install(
+                    self.hwnd,
+                    WM_APP_WINDOWS_CHANGED,
+                ));
+            }
+            (false, true) => self.window_events = None,
+            _ => {}
+        }
+        self.update_tucked();
+    }
+
+    /// Slims the island while an app window overlaps where it normally sits.
+    fn update_tucked(&mut self) {
+        let tucked = self.window_events.is_some() && self.window_behind_island();
+        if tucked == self.state.tucked {
+            return;
+        }
+        // Move the window first (the bar may change edge), then send the
+        // snapshot, so no frame is drawn at the old edge.
+        if let Err(error) = self.reposition_for(tucked) {
+            tracing::warn!(%error, "could not move the island");
+        }
+        self.dispatch(IslandEvent::SetTucked(tucked));
+    }
+
+    fn window_behind_island(&self) -> bool {
+        let Some(home) = self.home_layout else {
+            return false;
+        };
+        // The strip between the screen edge and the far side of the normal
+        // compact island, at the configured edge, in screen pixels.
+        let scale = home.dpi as f32 / 96.0;
+        let compact = arrange(
+            islet_core::island::COMPACT,
+            None,
+            0.0,
+            islet_core::island::EDGE_GAP_DP,
+            WINDOW_LOGICAL_WIDTH,
+            WINDOW_LOGICAL_HEIGHT,
+            home.anchor_top,
+        )
+        .main;
+        let (top, bottom) = if home.anchor_top {
+            (0.0, compact.bottom())
+        } else {
+            (compact.y, WINDOW_LOGICAL_HEIGHT)
+        };
+        let zone = Rect::new(
+            home.x as f32 + compact.x * scale,
+            home.y as f32 + top * scale,
+            compact.width * scale,
+            (bottom - top) * scale,
+        );
+        occlusion::window_behind(zone)
     }
 
     fn start_media(&mut self) {
@@ -707,7 +805,7 @@ impl IslandHost {
         let command = RenderCommand::Snapshot {
             target,
             content: Box::new(self.state.content()),
-            anchor_top: self.anchor_top,
+            anchor_top: self.effective_anchor_top(),
             generation: self.generation,
         };
         if self.tx.send(command).is_err() && !self.warned_disconnected {
@@ -721,10 +819,17 @@ impl IslandHost {
             target.main,
             target.bubble,
             target.gap,
+            target.inset,
             WINDOW_LOGICAL_WIDTH,
             WINDOW_LOGICAL_HEIGHT,
-            self.anchor_top,
+            self.effective_anchor_top(),
         )
+    }
+
+    /// The slim bar always docks at the bottom edge: at the top it would
+    /// cover browser tabs and title bars.
+    fn effective_anchor_top(&self) -> bool {
+        self.anchor_top && !self.state.tucked
     }
 
     fn update_region(&mut self) {
@@ -805,6 +910,13 @@ impl IslandHost {
                     let _ = KillTimer(Some(self.hwnd), TIMER_DONE_EXPIRY);
                 }
                 self.dispatch(IslandEvent::Tick { now: clock_now() });
+            }
+            TIMER_OCCLUSION => {
+                unsafe {
+                    let _ = KillTimer(Some(self.hwnd), TIMER_OCCLUSION);
+                }
+                self.occlusion_pending = false;
+                self.update_tucked();
             }
             TIMER_MEDIA_PAUSED => {
                 unsafe {
@@ -890,8 +1002,22 @@ impl IslandHost {
     }
 
     fn reposition(&mut self) -> WinResult<()> {
+        self.reposition_for(self.state.tucked)?;
+        self.update_tucked();
+        Ok(())
+    }
+
+    /// Places the window at the configured edge, or at the bottom while the
+    /// slim bar is shown.
+    fn reposition_for(&mut self, tucked: bool) -> WinResult<()> {
         let config = read_config(&self.shared);
-        let layout = compute_window_layout(self.hwnd, &config)?;
+        let home = compute_window_layout(&config, self.anchor_top)?;
+        self.home_layout = Some(home);
+        let layout = if tucked && home.anchor_top {
+            compute_window_layout(&config, false)?
+        } else {
+            home
+        };
         if self.last_layout == Some(layout) {
             return Ok(());
         }
@@ -1282,7 +1408,7 @@ fn point_from_lparam(lparam: LPARAM) -> POINT {
     POINT { x, y }
 }
 
-fn compute_window_layout(hwnd: HWND, config: &Config) -> WinResult<WindowLayout> {
+fn compute_window_layout(config: &Config, anchor_top: bool) -> WinResult<WindowLayout> {
     let monitor = if config.general.monitor == MonitorChoice::FollowCursor {
         let mut point = POINT::default();
         unsafe { GetCursorPos(&mut point) }?;
@@ -1300,16 +1426,15 @@ fn compute_window_layout(hwnd: HWND, config: &Config) -> WinResult<WindowLayout>
     let width = (WINDOW_LOGICAL_WIDTH * dpi as f32 / 96.0).round() as i32;
     let height = (WINDOW_LOGICAL_HEIGHT * dpi as f32 / 96.0).round() as i32;
     let work = info.rcWork;
-    let gap = (EDGE_GAP_DP * dpi as f32 / 96.0).round() as i32;
-    let anchor_top = config.general.position == ScreenPosition::Top;
     let x = work.left + ((work.right - work.left) - width) / 2;
+    // Flush with the work area: the edge gap is drawn by the renderer as an
+    // animatable inset, so the island can dock against the edge.
     let y = if anchor_top {
-        work.top + gap
+        work.top
     } else {
-        work.bottom - height - gap
+        work.bottom - height
     };
 
-    let _ = hwnd;
     Ok(WindowLayout {
         x,
         y,
