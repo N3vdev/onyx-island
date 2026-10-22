@@ -617,6 +617,7 @@ version = "0.1.0"
 dependencies = [
  "crossbeam-channel",
  "islet-core",
+ "islet-render",
  "notify",
  "tracing",
  "tracing-appender",
@@ -642,6 +643,15 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "toml",
+]
+
+[[package]]
+name = "islet-render"
+version = "0.1.0"
+dependencies = [
+ "islet-core",
+ "windows",
+ "windows-numerics",
 ]
 
 [[package]]

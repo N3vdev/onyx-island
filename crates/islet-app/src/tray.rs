@@ -18,11 +18,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GWLP_USERDATA, HICON, IDC_ARROW, IDI_APPLICATION, MF_SEPARATOR, MF_STRING, MSG, SW_SHOWNORMAL,
     TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE,
     WM_COMMAND, WM_CONTEXTMENU, WM_CREATE, WM_DESTROY, WM_LBUTTONUP, WM_NCCREATE, WM_NCDESTROY,
-    WM_NULL, WM_RBUTTONUP, WNDCLASSW,
+    WM_NULL, WM_RBUTTONUP, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 use crate::config_watch;
 use crate::icon;
+use crate::island_window;
 
 pub const WM_APP_TRAY: u32 = WM_APP + 1;
 pub const WM_APP_CONFIG_CHANGED: u32 = WM_APP + 2;
@@ -42,11 +44,14 @@ struct AppState {
     log_dir: PathBuf,
     shared: Arc<RwLock<Config>>,
     taskbar_created: u32,
+    island_hwnd: HWND,
+    island_host: Option<Box<island_window::IslandHost>>,
 }
 
 impl Drop for AppState {
     fn drop(&mut self) {
         self.remove_tray();
+        self.shutdown_island();
         icon::destroy(self.icon);
     }
 }
@@ -67,6 +72,8 @@ impl AppState {
             log_dir,
             shared,
             taskbar_created: 0,
+            island_hwnd: HWND::default(),
+            island_host: None,
         }
     }
 
@@ -164,12 +171,32 @@ impl AppState {
             }
         }
     }
+
+    fn apply_config(&mut self) {
+        if let Some(host) = &mut self.island_host {
+            host.apply_config();
+        }
+    }
+
+    fn shutdown_island(&mut self) {
+        if let Some(mut host) = self.island_host.take() {
+            host.shutdown();
+        }
+        if !self.island_hwnd.0.is_null() {
+            unsafe {
+                let _ = DestroyWindow(self.island_hwnd);
+            }
+            self.island_hwnd = HWND::default();
+        }
+    }
 }
 
 pub fn run(
     config_file: PathBuf,
     log_dir: PathBuf,
     shared: Arc<RwLock<Config>>,
+    demo: bool,
+    demo_state: Option<usize>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let hinstance = unsafe { GetModuleHandleW(None)? };
     let icon = icon::create().or_else(|error| {
@@ -192,6 +219,23 @@ pub fn run(
     };
     let atom = unsafe { RegisterClassW(&window_class) };
     if atom == 0 {
+        return Err(Box::new(Error::from_thread()));
+    }
+
+    let island_class_name = w!("IsletIslandWindow");
+    let island_class = WNDCLASSW {
+        style: Default::default(),
+        lpfnWndProc: Some(island_window::window_proc),
+        cbClsExtra: 0,
+        cbWndExtra: 0,
+        hInstance: HINSTANCE(hinstance.0),
+        hIcon: icon,
+        hCursor: unsafe { LoadCursorW(None, IDC_ARROW) }.unwrap_or_default(),
+        hbrBackground: Default::default(),
+        lpszMenuName: PCWSTR::null(),
+        lpszClassName: island_class_name,
+    };
+    if unsafe { RegisterClassW(&island_class) } == 0 {
         return Err(Box::new(Error::from_thread()));
     }
 
@@ -229,6 +273,61 @@ pub fn run(
     };
 
     tracing::info!(hwnd = ?hwnd, "tray window created");
+
+    let island_hwnd = match unsafe {
+        CreateWindowExW(
+            WINDOW_EX_STYLE(
+                WS_EX_TOPMOST.0
+                    | WS_EX_TOOLWINDOW.0
+                    | WS_EX_NOACTIVATE.0
+                    | WS_EX_NOREDIRECTIONBITMAP.0,
+            ),
+            island_class_name,
+            w!("Islet"),
+            WS_POPUP,
+            0,
+            0,
+            1,
+            1,
+            None,
+            None,
+            Some(HINSTANCE(hinstance.0)),
+            None,
+        )
+    } {
+        Ok(hwnd) => hwnd,
+        Err(error) => {
+            unsafe {
+                let _ = DestroyWindow(hwnd);
+            }
+            return Err(Box::new(error));
+        }
+    };
+
+    let mut host =
+        match island_window::IslandHost::new(island_hwnd, Arc::clone(&shared), demo, demo_state) {
+            Ok(host) => host,
+            Err(error) => {
+                unsafe {
+                    let _ = DestroyWindow(island_hwnd);
+                    let _ = DestroyWindow(hwnd);
+                }
+                return Err(Box::new(error));
+            }
+        };
+    unsafe {
+        SetWindowLongPtrW(
+            island_hwnd,
+            GWLP_USERDATA,
+            (&mut *host as *mut island_window::IslandHost) as isize,
+        );
+    }
+    host.show();
+    unsafe {
+        (*state_pointer).island_hwnd = island_hwnd;
+        (*state_pointer).island_host = Some(host);
+    }
+    tracing::info!(hwnd = ?island_hwnd, demo, "island window created");
 
     // The watcher lives for the whole message loop. Dropping it disconnects the
     // watcher thread, which then exits naturally.
@@ -301,6 +400,7 @@ unsafe extern "system" fn window_proc(
         }
         WM_APP_CONFIG_CHANGED => {
             tracing::debug!("UI notified of config reload");
+            with_state(hwnd, AppState::apply_config);
             LRESULT(0)
         }
         WM_COMMAND => {
@@ -315,6 +415,7 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         WM_DESTROY => {
+            with_state(hwnd, AppState::shutdown_island);
             with_state(hwnd, AppState::remove_tray);
             unsafe { PostQuitMessage(0) };
             LRESULT(0)

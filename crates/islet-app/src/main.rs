@@ -2,6 +2,7 @@
 
 mod config_watch;
 mod icon;
+mod island_window;
 mod logging;
 mod paths;
 mod tray;
@@ -80,7 +81,19 @@ fn run(paths: Paths) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let shared = Arc::new(RwLock::new(config));
-    tray::run(paths.config_file, paths.log_dir, shared)
+    let mut demo = false;
+    let mut demo_state = None;
+    for arg in std::env::args().skip(1) {
+        if arg == "--demo" {
+            demo = true;
+        } else if let Some(value) = arg.strip_prefix("--demo-state=") {
+            match value.parse::<usize>() {
+                Ok(step) => demo_state = Some(step % 8),
+                Err(_) => eprintln!("ignoring invalid --demo-state value: {value}"),
+            }
+        }
+    }
+    tray::run(paths.config_file, paths.log_dir, shared, demo, demo_state)
 }
 
 /// Holds the per-session singleton mutex for the lifetime of the process.

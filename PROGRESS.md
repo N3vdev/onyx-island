@@ -182,3 +182,108 @@ shipping path.
 - [x] Chosen engine transcribes the 5 s, 15 s, and 55 s fixtures correctly.
 - [x] Tests green, clippy `-D warnings` clean, `PROGRESS.md` updated.
 - [x] One `P0:` commit.
+
+## P1 - Island shell (complete, 2026-10-22)
+
+**Status:** P1 acceptance checks pass on the 60 Hz and 144 Hz modes of the
+development display. Started by the previous agent (renderer, state machine,
+window, demo driver); finished and measured in this pass.
+
+### What was built
+
+- `islet-core::island`: priority-ordered activities (dictation > needs-input >
+  done > running agent > media > idle), split mode for two persistent
+  activities, hover/click/done-expiry reducer with timers as `Effect`s, the
+  §4.4 size table, and `arrange()` which places the main pill and bubble in
+  the window. Shared by the renderer and the UI thread's window region.
+- `islet-render`: D3D11 -> DXGI -> D2D device context -> DComp visual on a
+  premultiplied flip-sequential swap chain. Squircle path geometry cached per
+  quantized size, cached DirectWrite layouts, pure black pill with 6% white
+  hairline, content morph (fade + scale 0.945 + Gaussian blur 0..6 px) through
+  two offscreen layers that exist only while transitioning, 7 spring-driven
+  scalars (main w/h/corner, bubble w/h/corner, gap).
+- `islet-app::island_window`: `WS_POPUP` + `TOPMOST | TOOLWINDOW | NOACTIVATE |
+  NOREDIRECTIONBITMAP`, fixed 440x200 dp window at the bottom (or top) centre
+  of the work area, per-monitor DPI, follow-cursor monitor option, hover
+  expand (250 ms) / collapse (400 ms), click to toggle, `--demo` (cycles all 8
+  states every 3 s) and `--demo-state=N`.
+
+### Changes made while finishing P1
+
+1. **Click-through was broken.** `WM_NCHITTEST -> HTTRANSPARENT` only forwards
+   to windows on the same thread, so the transparent part of the 440x200
+   window swallowed clicks meant for other apps. Fixed with a window region:
+   before each snapshot the UI thread grows the region to the union of the
+   old and new shapes (+12 dp overshoot margin); when the render thread parks
+   it posts `WM_APP_SETTLED` with the snapshot generation and the UI thread
+   shrinks the region to the exact rounded pill + bubble (1 px larger than the
+   squircle, so AA edges are never trimmed). Stale settle notices are ignored
+   by generation.
+2. **Idle wakeups.** A 100 ms UI poll timer ran forever (10 wakeups/s).
+   Full-screen detection is now event driven (`ABM_NEW` appbar registration
+   for `ABN_FULLSCREENAPP`, confirmed against foreground-covers-monitor +
+   `SHQueryUserNotificationState`). The poll timer only runs while the pointer
+   is over the pill (100 ms) or in follow-cursor mode (500 ms).
+3. **Frame pacing.** Uses `DCompositionWaitForCompositorClock` (resolved at
+   runtime so Windows 10 still loads; falls back to `DwmFlush`).
+4. **Content-only animation capped at 30 Hz** (media bars, waveform), by
+   counting compositor vblanks instead of sleeping (sleep overshot to ~21 fps
+   on the 15.6 ms timer). Morphs and transitions still run every vblank.
+5. **Expand stall from hidden.** Graphics were released the instant the
+   island hid, and recreating the device (~150 ms) ate the start of the next
+   expand. Graphics are now kept 15 s after hiding (one timed wakeup, then
+   released), and if they must be recreated the springs restart from the
+   post-creation time.
+6. Pill fill changed from 96.5%-alpha near-black to pure black per §4.2.
+
+### Measurements (release, static CRT, i5-12400F, 1920x1080)
+
+Frame intervals from the in-app log (`ISLET_FRAME_LOG=<file>`), 30 s `--demo`
+cycle. `m` = morph/transition frames, `c` = content-only frames.
+
+| refresh | morph median | morph p99 | morph max | content median |
+|---|---:|---:|---:|---:|
+| 60 Hz | 16.69 ms | 18.77 ms | 21.99 ms | 33.34 ms |
+| 144 Hz | 6.94 ms | 7.71 ms | 21.12 ms* | 34.78 ms |
+
+\* The only morph intervals above 1.5 vblanks are the first frame after a
+snapshot arrives during 30 Hz content animation (measured against a content
+frame up to 33 ms earlier) and process start. No morph frame skipped a vblank.
+
+| state | avg CPU (12 logical) | private WS | working set |
+|---|---:|---:|---:|
+| idle, hidden (no graphics) | 0.000% (0 ms / 15 s) | 5.4 MiB | 15.8 MiB |
+| static notification shown | 0.000%, render thread parked | 19.8 MiB | 52.4 MiB |
+| compact media, bars animating | 0.52% | 20.1 MiB | 53.1 MiB |
+| dictation waveform | 0.35% | 19.6 MiB | 51.6 MiB |
+
+`islet.exe` release size: 1.62 MB.
+
+Interaction checks (automated with a topmost test form under the island):
+click above the pill reaches the app below; click on the pill does not;
+the foreground window is unchanged after clicking the pill; hovering the
+compact pill expands it and moving away collapses it.
+
+### Open issues
+
+- Frame pacing was measured with the in-app present-cadence log, not
+  PresentMon (not installed). It shows CPU-side cadence, not compositor
+  misses. Re-check with PresentMon before release.
+- `ABN_FULLSCREENAPP` hiding has not been exercised with a real exclusive
+  full-screen game yet; borderless/maximised windows are filtered by design.
+- Only one monitor was available: DPI change and follow-cursor across
+  monitors are implemented but untested on hardware.
+- Another always-on-top window can cover the island; we only re-assert
+  topmost on our own z-order changes (no polling, by design).
+- Hit-testing on the pill uses the enclosing rounded rect (slightly generous
+  at corners), not the exact squircle.
+
+### P1 acceptance
+
+- [x] 0 skipped vblanks in morph frames over a 30 s `--demo` cycle at 60 Hz
+  and 144 Hz (in-app log; PresentMon pending).
+- [x] Idle CPU 0.000%, render thread parked, no UI-thread timers when idle.
+- [x] Idle private working set 5.4 MiB; active 20 MiB (budget 30 MB).
+- [x] Clicks pass through outside the pill; no focus stealing.
+- [x] Tests green (36 core, 4 render, 7 ASR/bench), clippy `-D warnings`
+  clean, `cargo fmt --check` clean.
