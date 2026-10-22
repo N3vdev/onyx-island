@@ -344,6 +344,7 @@ fn run(
         .ok();
     let mut state = State {
         filter,
+        last_played: None,
         tabs,
         recheck_at: None,
         rechecked: std::collections::HashSet::new(),
@@ -383,6 +384,11 @@ fn run(
                 state.subscription = None;
             }
             let info = state.info();
+            if let Some(info) = info.as_ref().filter(|info| info.playing) {
+                if state.last_played.as_deref() != Some(info.app_id.as_str()) {
+                    state.last_played = Some(info.app_id.clone());
+                }
+            }
             if info != state.last_sent {
                 state.last_sent.clone_from(&info);
                 on_update(info);
@@ -428,6 +434,8 @@ fn cleanup(manager: &Manager, sessions: i64, current: i64) -> WinResult<()> {
 
 struct State {
     filter: MusicFilter,
+    /// App id of the music session most recently seen playing.
+    last_played: Option<String>,
     tabs: Option<tabs::TabReader>,
     /// One-shot re-check for a browser track rejected before its tab title
     /// caught up.
@@ -460,7 +468,12 @@ impl State {
         wic: Option<&IWICImagingFactory>,
     ) -> WinResult<()> {
         if flags.sessions || self.subscription.is_none() {
-            let pick = pick_session(manager, &self.filter, self.tabs.as_mut())?;
+            let pick = pick_session(
+                manager,
+                &self.filter,
+                self.last_played.as_deref(),
+                self.tabs.as_mut(),
+            )?;
             for key in pick.rejected_browser_tracks {
                 if self.rechecked.len() > 256 {
                     self.rechecked.clear();
@@ -650,6 +663,7 @@ struct Pick {
 fn pick_session(
     manager: &Manager,
     filter: &MusicFilter,
+    last_played: Option<&str>,
     mut tabs: Option<&mut tabs::TabReader>,
 ) -> WinResult<Pick> {
     let sessions = manager.GetSessions()?;
@@ -734,6 +748,7 @@ fn pick_session(
         .map(|&index| SessionCandidate {
             app_id: &ids[index],
             playing: playing[index],
+            last_played: last_played == Some(ids[index].as_str()),
         })
         .collect();
     let current = current.and_then(|current| eligible.iter().position(|&index| index == current));

@@ -79,10 +79,13 @@ pub fn format_clock(seconds: f64) -> String {
 pub struct SessionCandidate<'a> {
     pub app_id: &'a str,
     pub playing: bool,
+    /// This session was the last one seen playing.
+    pub last_played: bool,
 }
 
 /// Picks the session to show. Something playing always beats something
-/// paused; within the same play state Spotify wins, then the system's
+/// paused. When nothing plays, the session that played last wins (so
+/// pausing keeps your song on screen). Then Spotify, then the system's
 /// current session, then the first one.
 #[must_use]
 pub fn choose_session(sessions: &[SessionCandidate<'_>], current: Option<usize>) -> Option<usize> {
@@ -96,6 +99,7 @@ pub fn choose_session(sessions: &[SessionCandidate<'_>], current: Option<usize>)
     (0..sessions.len()).max_by_key(|&index| {
         (
             sessions[index].playing,
+            !sessions[index].playing && sessions[index].last_played,
             is_spotify(index),
             current == Some(index),
             // max_by_key keeps the last maximum; prefer earlier sessions.
@@ -546,7 +550,11 @@ mod tests {
 
     fn sessions<'a>(list: &[(&'a str, bool)]) -> Vec<SessionCandidate<'a>> {
         list.iter()
-            .map(|&(app_id, playing)| SessionCandidate { app_id, playing })
+            .map(|&(app_id, playing)| SessionCandidate {
+                app_id,
+                playing,
+                last_played: false,
+            })
             .collect()
     }
 
@@ -562,6 +570,17 @@ mod tests {
             Some(0)
         );
         assert_eq!(choose_session(&[], None), None);
+    }
+
+    #[test]
+    fn pausing_keeps_the_last_played_session() {
+        // YouTube Music was playing, then paused; Spotify was paused earlier.
+        let mut all = sessions(&[("Spotify.exe", false), ("Firefox", false)]);
+        all[1].last_played = true;
+        assert_eq!(choose_session(&all, Some(0)), Some(1));
+        // Anything actually playing still wins.
+        all[0].playing = true;
+        assert_eq!(choose_session(&all, None), Some(0));
     }
 
     #[test]

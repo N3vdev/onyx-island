@@ -233,6 +233,7 @@ impl IslandHost {
             warned_disconnected: false,
         });
 
+        host.state.media_paused_ms = config.media.pause_hide_seconds.saturating_mul(1_000);
         host.register_appbar();
         host.send_snapshot();
         host.update_poll_timer();
@@ -287,6 +288,9 @@ impl IslandHost {
         self.follow_cursor = config.general.monitor == MonitorChoice::FollowCursor;
         self.idle_style = config.general.idle_style;
         self.dispatch(IslandEvent::SetIdleStyle(self.idle_style));
+        self.dispatch(IslandEvent::SetMediaPauseDelay(
+            config.media.pause_hide_seconds.saturating_mul(1_000),
+        ));
         if self.demo.is_none() {
             match (config.media.enabled, self.media.is_some()) {
                 (true, false) => self.start_media(),

@@ -31,6 +31,17 @@ impl SpringParams {
         response: 0.36,
         damping: 0.90,
     };
+    /// Closing to hidden, horizontal axis: contracts quickly...
+    pub const DISMISS_WIDTH: Self = Self {
+        response: 0.34,
+        damping: 0.92,
+    };
+    /// ...while the vertical axis lags, so the pill gathers into a round
+    /// droplet before it shrinks away.
+    pub const DISMISS_HEIGHT: Self = Self {
+        response: 0.52,
+        damping: 1.0,
+    };
     /// A snappy pulse for arriving notifications.
     pub const PULSE: Self = Self {
         response: 0.25,

@@ -508,38 +508,49 @@ impl Animator {
         } else {
             SpringParams::COLLAPSE
         };
+        // Closing to hidden is its own fluid motion (see DISMISS_*).
+        let (width_params, height_params) = if target.visible {
+            (params, params)
+        } else {
+            (SpringParams::DISMISS_WIDTH, SpringParams::DISMISS_HEIGHT)
+        };
 
         retarget(
             &mut self.main_width,
             f64::from(target.main.width),
-            params,
+            width_params,
             now,
         );
         retarget(
             &mut self.main_height,
             f64::from(target.main.height),
-            params,
+            height_params,
             now,
         );
         retarget(
             &mut self.main_corner,
             f64::from(target.main.corner),
-            params,
+            height_params,
             now,
         );
 
         let bubble = target.bubble.unwrap_or(PillSize::new(0.0, 0.0, 0.0));
-        retarget(&mut self.bubble_width, f64::from(bubble.width), params, now);
+        retarget(
+            &mut self.bubble_width,
+            f64::from(bubble.width),
+            width_params,
+            now,
+        );
         retarget(
             &mut self.bubble_height,
             f64::from(bubble.height),
-            params,
+            height_params,
             now,
         );
         retarget(
             &mut self.bubble_corner,
             f64::from(bubble.corner),
-            params,
+            height_params,
             now,
         );
         retarget(&mut self.gap, f64::from(target.gap), params, now);
@@ -806,10 +817,18 @@ impl Gfx {
         self.dc.Clear(Some(&TRANSPARENT));
 
         if geometry.main.width >= 0.5 && geometry.main.height >= 0.5 {
-            self.draw_pill(geometry.main, geometry.main_corner, target.visible)?;
+            self.draw_pill(
+                geometry.main,
+                geometry.main_corner,
+                pill_alpha(geometry.main, target.visible),
+            )?;
             if let Some(bubble) = geometry.bubble {
                 if bubble.width >= 0.5 && bubble.height >= 0.5 {
-                    self.draw_pill(bubble, geometry.bubble_corner, true)?;
+                    self.draw_pill(
+                        bubble,
+                        geometry.bubble_corner,
+                        pill_alpha(bubble, target.visible),
+                    )?;
                 }
             }
 
@@ -965,8 +984,8 @@ impl Gfx {
         Ok(())
     }
 
-    unsafe fn draw_pill(&mut self, rect: Rect, corner: f32, visible: bool) -> RenderResult<()> {
-        if !visible {
+    unsafe fn draw_pill(&mut self, rect: Rect, corner: f32, alpha: f32) -> RenderResult<()> {
+        if alpha <= 0.001 {
             return Ok(());
         }
         let geometry = self.geometries.get(
@@ -977,10 +996,16 @@ impl Gfx {
         )?;
         self.dc
             .SetTransform(&Matrix3x2::translation(rect.x, rect.y));
-        self.set_color(FRAME_COLOR);
+        self.set_color(D2D1_COLOR_F {
+            a: FRAME_COLOR.a * alpha,
+            ..FRAME_COLOR
+        });
         self.dc
             .FillGeometry(&geometry, &self.brush, None::<&ID2D1Brush>);
-        self.set_color(HAIRLINE_COLOR);
+        self.set_color(D2D1_COLOR_F {
+            a: HAIRLINE_COLOR.a * alpha,
+            ..HAIRLINE_COLOR
+        });
         self.dc
             .DrawGeometry(&geometry, &self.brush, 0.75, None::<&ID2D1StrokeStyle>);
         self.dc.SetTransform(&Matrix3x2::identity());
@@ -2317,6 +2342,16 @@ fn color(rgb: [u8; 3], alpha: f32) -> D2D1_COLOR_F {
     }
 }
 
+/// Pill opacity. Visible targets are opaque; while closing to hidden the
+/// droplet melts away as its short side drops below 28 dp.
+fn pill_alpha(rect: Rect, target_visible: bool) -> f32 {
+    if target_visible {
+        return 1.0;
+    }
+    let t = (rect.width.min(rect.height) / 28.0).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
 fn ease_out(value: f32) -> f32 {
     let value = value.clamp(0.0, 1.0);
     1.0 - (1.0 - value).powi(3)
@@ -2353,6 +2388,17 @@ mod tests {
     #[test]
     fn formatting_helpers_are_stable() {
         assert_eq!(format_elapsed(7_400), "0:07");
+    }
+
+    #[test]
+    fn closing_pill_fades_as_it_shrinks() {
+        let big = Rect::new(0.0, 0.0, 220.0, 36.0);
+        let small = Rect::new(0.0, 0.0, 10.0, 10.0);
+        assert_eq!(pill_alpha(small, true), 1.0);
+        assert_eq!(pill_alpha(big, false), 1.0);
+        let fading = pill_alpha(small, false);
+        assert!(fading > 0.0 && fading < 0.5, "{fading}");
+        assert_eq!(pill_alpha(Rect::new(0.0, 0.0, 0.0, 30.0), false), 0.0);
     }
 
     #[test]

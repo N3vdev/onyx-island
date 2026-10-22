@@ -5,6 +5,7 @@ mod icon;
 mod island_window;
 mod logging;
 mod paths;
+mod settings;
 mod tray;
 
 use std::process::ExitCode;
@@ -78,6 +79,9 @@ fn run(paths: Paths) -> Result<(), Box<dyn std::error::Error>> {
     if !existed {
         config.save_atomic(&paths.config_file)?;
         tracing::info!(path = %paths.config_file.display(), "wrote default config");
+        // First run after install: show the settings so the user can set
+        // things up.
+        settings::open(None);
     }
 
     let shared = Arc::new(RwLock::new(config));

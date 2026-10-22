@@ -12,8 +12,8 @@ use crate::media::{ArtImage, Timeline};
 pub const HOVER_EXPAND_MS: u32 = 250;
 pub const HOVER_COLLAPSE_MS: u32 = 400;
 pub const DONE_VISIBLE_MS: u32 = 4_000;
-/// Paused media drops off the island after this long (PLAN §8.2).
-pub const MEDIA_PAUSED_MS: u32 = 5 * 60 * 1_000;
+/// Default delay before paused media closes (`media.pause_hide_seconds`).
+pub const MEDIA_PAUSED_MS: u32 = 5 * 1_000;
 pub const SPLIT_GAP_DP: f32 = 6.0;
 
 /// Sizes from PLAN.md §4.4, in logical pixels (DIPs).
@@ -314,9 +314,11 @@ pub struct IslandState {
     pub done: Option<NotificationCard>,
     pub running: Option<AgentCard>,
     pub media: Option<MediaCard>,
-    /// The paused track was dropped after `MEDIA_PAUSED_MS`; ignore paused
+    /// The paused track was closed after the pause delay; ignore paused
     /// updates until something plays again.
     pub media_dismissed: bool,
+    /// How long paused media stays before closing.
+    pub media_paused_ms: u32,
     pub idle_style: IdleStyle,
     pub expanded: bool,
     pub pointer_inside: bool,
@@ -332,6 +334,7 @@ impl Default for IslandState {
             running: None,
             media: None,
             media_dismissed: false,
+            media_paused_ms: MEDIA_PAUSED_MS,
             idle_style: IdleStyle::Hidden,
             expanded: false,
             pointer_inside: false,
@@ -483,6 +486,7 @@ pub enum IslandEvent {
     HoverExpandElapsed,
     HoverCollapseElapsed,
     MediaPausedElapsed,
+    SetMediaPauseDelay(u32),
     Click,
     Tick { now: f64 },
     SetExpanded(bool),
@@ -599,7 +603,9 @@ pub fn reduce(state: &mut IslandState, event: IslandEvent, now: f64) -> Vec<Effe
                     state.media_dismissed = false;
                     Some(card)
                 }
-                Some(_) if state.media_dismissed => None,
+                // Paused media only stays if it was already on the island
+                // (it was playing); a stale paused session never pops up.
+                Some(_) if state.media_dismissed || state.media.is_none() => None,
                 Some(card) => Some(card),
                 None => {
                     state.media_dismissed = false;
@@ -611,7 +617,7 @@ pub fn reduce(state: &mut IslandState, event: IslandEvent, now: f64) -> Vec<Effe
                 Some(media) if !media.playing && !was_paused => {
                     effects.push(Effect::ArmTimer {
                         kind: TimerKind::MediaPaused,
-                        after_ms: MEDIA_PAUSED_MS,
+                        after_ms: state.media_paused_ms,
                     });
                 }
                 Some(media) if !media.playing => {}
@@ -624,7 +630,15 @@ pub fn reduce(state: &mut IslandState, event: IslandEvent, now: f64) -> Vec<Effe
             effects
         }
         IslandEvent::MediaPausedElapsed => {
-            if state.media.as_ref().is_some_and(|media| !media.playing) {
+            let paused = state.media.as_ref().is_some_and(|media| !media.playing);
+            if paused && state.pointer_inside {
+                // The user is looking at it (maybe about to press play).
+                return vec![Effect::ArmTimer {
+                    kind: TimerKind::MediaPaused,
+                    after_ms: state.media_paused_ms,
+                }];
+            }
+            if paused {
                 state.media = None;
                 state.media_dismissed = true;
                 if !state.has_activity() {
@@ -634,6 +648,10 @@ pub fn reduce(state: &mut IslandState, event: IslandEvent, now: f64) -> Vec<Effe
             } else {
                 Vec::new()
             }
+        }
+        IslandEvent::SetMediaPauseDelay(ms) => {
+            state.media_paused_ms = ms.max(1);
+            Vec::new()
         }
         IslandEvent::SetNeedsInput(card) => {
             if state.needs_input != card {
@@ -734,7 +752,7 @@ mod tests {
     }
 
     #[test]
-    fn paused_media_drops_off_after_five_minutes_until_it_plays_again() {
+    fn paused_media_closes_after_the_delay_until_it_plays_again() {
         let mut state = IslandState::default();
         reduce(&mut state, IslandEvent::SetMedia(Some(media())), 0.0);
         let effects = reduce(&mut state, IslandEvent::SetMedia(Some(paused())), 1.0);
@@ -742,6 +760,8 @@ mod tests {
             kind: TimerKind::MediaPaused,
             after_ms: MEDIA_PAUSED_MS,
         }));
+        // Still shown while paused.
+        assert!(state.media.as_ref().is_some_and(|media| !media.playing));
 
         // A further paused update (e.g. a timeline change) does not re-arm.
         let mut later = paused();
@@ -756,18 +776,48 @@ mod tests {
             .iter()
             .any(|effect| matches!(effect, Effect::ArmTimer { .. })));
 
-        reduce(&mut state, IslandEvent::MediaPausedElapsed, 301.0);
+        reduce(&mut state, IslandEvent::MediaPausedElapsed, 6.0);
         assert!(state.media.is_none());
         assert_eq!(state.layout(), LayoutTarget::HIDDEN);
 
         // Still paused: stays hidden.
-        reduce(&mut state, IslandEvent::SetMedia(Some(paused())), 302.0);
+        reduce(&mut state, IslandEvent::SetMedia(Some(paused())), 7.0);
         assert!(state.media.is_none());
 
         // Playing again brings it back.
-        let effects = reduce(&mut state, IslandEvent::SetMedia(Some(media())), 303.0);
+        let effects = reduce(&mut state, IslandEvent::SetMedia(Some(media())), 8.0);
         assert!(effects.contains(&Effect::CancelTimer(TimerKind::MediaPaused)));
         assert!(state.media.is_some());
+    }
+
+    #[test]
+    fn stale_paused_media_never_pops_up() {
+        let mut state = IslandState::default();
+        reduce(&mut state, IslandEvent::SetMedia(Some(paused())), 0.0);
+        assert!(state.media.is_none());
+        assert_eq!(state.layout(), LayoutTarget::HIDDEN);
+    }
+
+    #[test]
+    fn hovering_keeps_paused_media_open_and_the_delay_is_configurable() {
+        let mut state = IslandState::default();
+        reduce(&mut state, IslandEvent::SetMediaPauseDelay(12_000), 0.0);
+        reduce(&mut state, IslandEvent::SetMedia(Some(media())), 0.0);
+        let effects = reduce(&mut state, IslandEvent::SetMedia(Some(paused())), 1.0);
+        assert!(effects.contains(&Effect::ArmTimer {
+            kind: TimerKind::MediaPaused,
+            after_ms: 12_000,
+        }));
+        reduce(&mut state, IslandEvent::HoverEnter, 2.0);
+        let effects = reduce(&mut state, IslandEvent::MediaPausedElapsed, 13.0);
+        assert!(state.media.is_some());
+        assert_eq!(
+            effects,
+            vec![Effect::ArmTimer {
+                kind: TimerKind::MediaPaused,
+                after_ms: 12_000,
+            }]
+        );
     }
 
     #[test]

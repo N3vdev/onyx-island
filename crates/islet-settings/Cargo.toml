@@ -1,0 +1,21 @@
+[package]
+name = "islet-settings"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "islet-settings"
+path = "src/main.rs"
+
+[dependencies]
+islet-core = { path = "../islet-core" }
+eframe = { version = "0.32", default-features = false, features = ["default_fonts", "glow"] }
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+] }

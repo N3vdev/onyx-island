@@ -25,6 +25,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::config_watch;
 use crate::icon;
 use crate::island_window;
+use crate::settings;
 
 pub const WM_APP_TRAY: u32 = WM_APP + 1;
 pub const WM_APP_CONFIG_CHANGED: u32 = WM_APP + 2;
@@ -34,6 +35,7 @@ const MENU_OPEN_CONFIG: usize = 1;
 const MENU_OPEN_LOGS: usize = 2;
 const MENU_RELOAD_CONFIG: usize = 3;
 const MENU_QUIT: usize = 4;
+const MENU_SETTINGS: usize = 5;
 
 struct AppState {
     hwnd: HWND,
@@ -113,6 +115,8 @@ impl AppState {
             }
         };
 
+        let _ = unsafe { AppendMenuW(menu, MF_STRING, MENU_SETTINGS, w!("Settings…")) };
+        let _ = unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()) };
         let _ = unsafe { AppendMenuW(menu, MF_STRING, MENU_OPEN_CONFIG, w!("Open config")) };
         let _ = unsafe { AppendMenuW(menu, MF_STRING, MENU_OPEN_LOGS, w!("Open logs")) };
         let _ = unsafe { AppendMenuW(menu, MF_STRING, MENU_RELOAD_CONFIG, w!("Reload config")) };
@@ -144,6 +148,7 @@ impl AppState {
 
     fn handle_command(&self, command: usize) {
         match command {
+            MENU_SETTINGS => settings::open(None),
             MENU_OPEN_CONFIG => open_path(&self.config_file),
             MENU_OPEN_LOGS => open_path(&self.log_dir),
             MENU_RELOAD_CONFIG => self.reload_config(),
@@ -388,11 +393,7 @@ unsafe extern "system" fn window_proc(
         WM_APP_TRAY => {
             let event = (lparam.0 & 0xFFFF) as u32;
             with_state(hwnd, |state| match event {
-                WM_LBUTTONUP => {
-                    // Until the settings process exists, left click opens the
-                    // config file: the only interactive surface in P0.
-                    open_path(&state.config_file);
-                }
+                WM_LBUTTONUP => settings::open(None),
                 WM_RBUTTONUP => state.show_menu(),
                 _ => {}
             });

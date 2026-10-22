@@ -411,3 +411,38 @@ with Firefox here.
 - The track-change "scale bounce" on the art is the generic content morph,
   not an art-specific spring.
 - Source-app icon in the expanded view is text only (no icon extraction).
+
+## Pause behaviour, close animation, and settings app (user requests, 2026-10-22)
+
+Pulled forward from P6 at the user's request; the rest of P6 (dictation,
+agents, keyboard sounds pages; control frames) still follows its phase.
+
+- **Last played stays on pause.** `SessionCandidate::last_played`: when
+  nothing plays, the session most recently seen playing wins over Spotify
+  and the system's current session.
+- **Close after pausing.** `media.pause_hide_seconds` (default 5, clamped
+  1-300) replaces the fixed 5-minute drop-off. Hovering the island when the
+  delay elapses re-arms it. Paused media that was never playing in this run
+  never pops up (no stale Spotify at startup).
+- **Fluid close.** Closing previously did not animate at all: `draw_pill`
+  skipped the pill as soon as the target was hidden. Now hidden targets use
+  `DISMISS_WIDTH` (0.34 s, zeta 0.92) and the slower `DISMISS_HEIGHT` (0.52 s,
+  zeta 1.0), so the pill gathers into a droplet, while its opacity melts out
+  below a 28 dp short side and the content blurs out. Verified with a frame
+  burst capture: about 300 ms from full pill to gone.
+- **`islet-settings`** (new crate, eframe/egui 0.32.3, glow renderer): a
+  separate process, single instance (focuses the open window), dark
+  island-styled UI with General, Now Playing (incl. music-site list editor),
+  and About pages. Saves atomically on every change; the island hot-reloads.
+  "Start with Windows" writes the HKCU Run key. `--page media|about`.
+  Opened from the tray ("Settings..." and left click) and automatically on
+  first run (no config file yet).
+
+New dependency: `eframe` (default features off; `glow`, `default_fonts`).
+Chosen in PLAN §1; it lives only in the settings exe.
+
+| | |
+|---|---|
+| `islet.exe` | 1.81 MB |
+| `islet-settings.exe` | 3.95 MB |
+| settings window open (release) | 28.2 MiB private, 0 ms CPU over 5 s idle |

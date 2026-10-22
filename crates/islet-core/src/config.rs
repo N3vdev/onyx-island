@@ -102,6 +102,8 @@ pub struct MediaConfig {
     pub enabled: bool,
     pub real_bars: bool,
     pub color_tint: bool,
+    /// Seconds paused media stays on the island before closing (1-300).
+    pub pause_hide_seconds: u32,
     /// Only show music: music apps, music sites, and music on youtube.com.
     pub music_only: bool,
     /// Sites whose browser playback counts as music. Names or URLs, matched
@@ -164,6 +166,7 @@ impl Default for MediaConfig {
             enabled: true,
             real_bars: true,
             color_tint: true,
+            pause_hide_seconds: 5,
             music_only: true,
             music_sites: crate::music::DEFAULT_MUSIC_SITES
                 .iter()
@@ -254,6 +257,10 @@ impl Config {
         self.dictation.unload_after_minutes = self.dictation.unload_after_minutes.clamp(1, 240);
         self.dictation.push_to_talk = self.dictation.push_to_talk.trim().to_owned();
         self.dictation.hands_free = self.dictation.hands_free.trim().to_owned();
+        self.media.pause_hide_seconds = self.media.pause_hide_seconds.clamp(1, 300);
+        self.media
+            .music_sites
+            .retain(|site| !site.trim().is_empty());
     }
 }
 
