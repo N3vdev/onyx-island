@@ -12,7 +12,9 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crossbeam_channel::{unbounded, Receiver, RecvTimeoutError, Sender};
-use islet_core::media::{choose_session, dominant_color, source_display_name, ArtImage};
+use islet_core::media::{
+    choose_session, dominant_color, source_display_name, ArtImage, SessionCandidate,
+};
 use windows::core::{Ref, Result as WinResult, HSTRING};
 use windows::Foundation::TypedEventHandler;
 use windows::Media::Control::{
@@ -28,9 +30,13 @@ use windows::Win32::Graphics::Imaging::{
     WICBitmapDitherTypeNone, WICBitmapInterpolationModeHighQualityCubic,
     WICBitmapPaletteTypeCustom, WICDecodeMetadataCacheOnDemand, WICRect,
 };
-use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
+use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_INPROC_SERVER};
 use windows::Win32::System::SystemInformation::GetSystemTimePreciseAsFileTime;
 use windows::Win32::System::WinRT::{RoInitialize, RoUninitialize, RO_INIT_MULTITHREADED};
+use windows::Win32::UI::Shell::{
+    FOLDERID_AppsFolder, IShellItem, SHCreateItemInKnownFolder, KF_FLAG_DEFAULT,
+    SIGDN_NORMALDISPLAY,
+};
 
 /// Album art edge length in pixels. Drawn at up to 78 dp, so this covers
 /// 150% scaling crisply; larger displays get a mild upscale.
@@ -191,6 +197,35 @@ impl Subscription {
     }
 }
 
+/// Watches play/pause on a session we are *not* showing, so a browser that
+/// starts playing replaces a paused Spotify (and vice versa).
+struct Watcher {
+    session: Session,
+    token: i64,
+}
+
+impl Watcher {
+    fn new(session: Session, tx: &Sender<Message>) -> WinResult<Self> {
+        let tx = tx.clone();
+        let token = session.PlaybackInfoChanged(&TypedEventHandler::new(
+            move |_: Ref<Session>, _: Ref<PlaybackInfoChangedEventArgs>| {
+                let _ = tx.send(Message::Refresh(Refresh {
+                    sessions: true,
+                    ..Refresh::default()
+                }));
+                Ok(())
+            },
+        ))?;
+        Ok(Self { session, token })
+    }
+}
+
+impl Drop for Watcher {
+    fn drop(&mut self) {
+        let _ = self.session.RemovePlaybackInfoChanged(self.token);
+    }
+}
+
 impl Drop for Subscription {
     fn drop(&mut self) {
         let _ = self.session.RemoveMediaPropertiesChanged(self.properties);
@@ -266,6 +301,8 @@ fn run(
 
     let mut state = State {
         subscription: None,
+        source_name: String::new(),
+        watchers: Vec::new(),
         cache: TrackCache::default(),
         playback: None,
         timeline: None,
@@ -318,6 +355,9 @@ fn cleanup(manager: &Manager, sessions: i64, current: i64) -> WinResult<()> {
 
 struct State {
     subscription: Option<Subscription>,
+    /// Display name of the subscribed session's app, resolved once.
+    source_name: String,
+    watchers: Vec<Watcher>,
     cache: TrackCache,
     playback: Option<Playback>,
     timeline: Option<TimelineSample>,
@@ -339,7 +379,14 @@ impl State {
         wic: Option<&IWICImagingFactory>,
     ) -> WinResult<()> {
         if flags.sessions || self.subscription.is_none() {
-            let chosen = pick_session(manager)?;
+            let (chosen, all) = pick_session(manager)?;
+            self.watchers.clear();
+            for session in all {
+                match Watcher::new(session, tx) {
+                    Ok(watcher) => self.watchers.push(watcher),
+                    Err(error) => tracing::debug!(%error, "could not watch a media session"),
+                }
+            }
             let current_id = self
                 .session()
                 .and_then(|session| session.SourceAppUserModelId().ok());
@@ -352,6 +399,11 @@ impl State {
                 self.playback = None;
                 self.timeline = None;
                 if let Some(session) = chosen {
+                    let app_id = session
+                        .SourceAppUserModelId()
+                        .map(|id| id.to_string_lossy())
+                        .unwrap_or_default();
+                    self.source_name = app_display_name(&app_id);
                     self.subscription = Some(Subscription::new(session, tx)?);
                     flags = Refresh::ALL;
                 }
@@ -451,7 +503,7 @@ impl State {
             (position, timeline.duration)
         });
         Some(MediaInfo {
-            source: source_display_name(&app_id),
+            source: self.source_name.clone(),
             app_id,
             title: self.cache.title.clone(),
             artist: self.cache.artist.clone(),
@@ -497,11 +549,13 @@ impl State {
     }
 }
 
-fn pick_session(manager: &Manager) -> WinResult<Option<Session>> {
+/// Returns the session to show and every session (for watching).
+fn pick_session(manager: &Manager) -> WinResult<(Option<Session>, Vec<Session>)> {
     let sessions = manager.GetSessions()?;
     let count = sessions.Size()?;
     let mut all = Vec::with_capacity(count as usize);
     let mut ids = Vec::with_capacity(count as usize);
+    let mut playing = Vec::with_capacity(count as usize);
     for index in 0..count {
         let session = sessions.GetAt(index)?;
         ids.push(
@@ -509,6 +563,12 @@ fn pick_session(manager: &Manager) -> WinResult<Option<Session>> {
                 .SourceAppUserModelId()
                 .map(|id| id.to_string_lossy())
                 .unwrap_or_default(),
+        );
+        playing.push(
+            session
+                .GetPlaybackInfo()
+                .and_then(|info| info.PlaybackStatus())
+                .is_ok_and(|status| status == PlaybackStatus::Playing),
         );
         all.push(session);
     }
@@ -520,8 +580,46 @@ fn pick_session(manager: &Manager) -> WinResult<Option<Session>> {
         let current = current.to_string_lossy();
         ids.iter().position(|id| *id == current)
     });
-    let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
-    Ok(choose_session(&id_refs, current).map(|index| all.swap_remove(index)))
+    let candidates: Vec<SessionCandidate<'_>> = ids
+        .iter()
+        .zip(&playing)
+        .map(|(id, &playing)| SessionCandidate {
+            app_id: id,
+            playing,
+        })
+        .collect();
+    let chosen = choose_session(&candidates, current).map(|index| all[index].clone());
+    Ok((chosen, all))
+}
+
+/// The app's own name from the shell's Apps folder (e.g. "Google Chrome"
+/// for Chromium's hashed AUMIDs), falling back to a heuristic.
+fn app_display_name(app_id: &str) -> String {
+    let fallback = source_display_name(app_id);
+    if fallback != "Browser" && !app_id.contains('!') {
+        // Known exe-style ids already have a good short name.
+        return fallback;
+    }
+    // SAFETY: COM is initialised on this thread; the returned string is
+    // freed with CoTaskMemFree exactly once.
+    let resolved = unsafe {
+        SHCreateItemInKnownFolder::<_, IShellItem>(
+            &FOLDERID_AppsFolder,
+            KF_FLAG_DEFAULT,
+            &HSTRING::from(app_id),
+        )
+        .and_then(|item| item.GetDisplayName(SIGDN_NORMALDISPLAY))
+        .map(|name| {
+            let text = name.to_string().unwrap_or_default();
+            CoTaskMemFree(Some(name.0.cast()));
+            text
+        })
+    };
+    match resolved {
+        // "Mozilla Firefox" -> "Firefox"; unknown names pass through.
+        Ok(name) if !name.trim().is_empty() && name != app_id => source_display_name(&name),
+        _ => fallback,
+    }
 }
 
 fn read_stream(reference: &IRandomAccessStreamReference) -> WinResult<Vec<u8>> {

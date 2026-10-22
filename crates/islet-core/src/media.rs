@@ -74,15 +74,34 @@ pub fn format_clock(seconds: f64) -> String {
     }
 }
 
-/// Picks the session to show: Spotify if present, otherwise the system's
-/// current session, otherwise the first one.
+/// One GSMTC session as seen by [`choose_session`].
+#[derive(Clone, Copy, Debug)]
+pub struct SessionCandidate<'a> {
+    pub app_id: &'a str,
+    pub playing: bool,
+}
+
+/// Picks the session to show. Something playing always beats something
+/// paused; within the same play state Spotify wins, then the system's
+/// current session, then the first one.
 #[must_use]
-pub fn choose_session(app_ids: &[&str], current: Option<usize>) -> Option<usize> {
-    app_ids
-        .iter()
-        .position(|id| id.to_ascii_lowercase().contains("spotify"))
-        .or(current.filter(|&index| index < app_ids.len()))
-        .or((!app_ids.is_empty()).then_some(0))
+pub fn choose_session(sessions: &[SessionCandidate<'_>], current: Option<usize>) -> Option<usize> {
+    let is_spotify = |index: usize| {
+        sessions[index]
+            .app_id
+            .to_ascii_lowercase()
+            .contains("spotify")
+    };
+    let current = current.filter(|&index| index < sessions.len());
+    (0..sessions.len()).max_by_key(|&index| {
+        (
+            sessions[index].playing,
+            is_spotify(index),
+            current == Some(index),
+            // max_by_key keeps the last maximum; prefer earlier sessions.
+            std::cmp::Reverse(index),
+        )
+    })
 }
 
 /// A short human name for a GSMTC source app id (an AUMID or exe name).
@@ -112,6 +131,10 @@ pub fn source_display_name(app_id: &str) -> String {
     let base = base.split('_').next().unwrap_or(base);
     let base = base.strip_suffix(".exe").unwrap_or(base);
     let base = base.rsplit('.').next().unwrap_or(base);
+    // Chromium-based browsers register under a hashed AUMID.
+    if base.len() >= 12 && base.chars().all(|c| c.is_ascii_hexdigit()) {
+        return "Browser".to_owned();
+    }
     if base.is_empty() {
         "Media".to_owned()
     } else {
@@ -521,14 +544,35 @@ mod tests {
         assert_eq!(format_clock(-4.0), "0:00");
     }
 
+    fn sessions<'a>(list: &[(&'a str, bool)]) -> Vec<SessionCandidate<'a>> {
+        list.iter()
+            .map(|&(app_id, playing)| SessionCandidate { app_id, playing })
+            .collect()
+    }
+
     #[test]
-    fn spotify_is_preferred_over_the_current_session() {
-        let ids = ["MSEdge", "Spotify.exe", "Chrome"];
-        assert_eq!(choose_session(&ids, Some(0)), Some(1));
-        assert_eq!(choose_session(&["MSEdge", "Chrome"], Some(1)), Some(1));
-        assert_eq!(choose_session(&["MSEdge", "Chrome"], None), Some(0));
-        assert_eq!(choose_session(&["MSEdge"], Some(4)), Some(0));
+    fn spotify_is_preferred_among_equally_playing_sessions() {
+        let all = sessions(&[("MSEdge", true), ("Spotify.exe", true), ("Chrome", true)]);
+        assert_eq!(choose_session(&all, Some(0)), Some(1));
+        let paused = sessions(&[("MSEdge", false), ("Chrome", false)]);
+        assert_eq!(choose_session(&paused, Some(1)), Some(1));
+        assert_eq!(choose_session(&paused, None), Some(0));
+        assert_eq!(
+            choose_session(&sessions(&[("MSEdge", false)]), Some(4)),
+            Some(0)
+        );
         assert_eq!(choose_session(&[], None), None);
+    }
+
+    #[test]
+    fn a_playing_browser_beats_paused_spotify() {
+        // The real report: Spotify paused, YouTube in Chrome playing.
+        let all = sessions(&[
+            ("SpotifyAB.SpotifyMusic_zpdnekdrzrea0!Spotify", false),
+            ("308046B0AF4A39CB", true),
+        ]);
+        assert_eq!(choose_session(&all, Some(1)), Some(1));
+        assert_eq!(choose_session(&all, None), Some(1));
     }
 
     #[test]
@@ -539,6 +583,7 @@ mod tests {
             "Spotify"
         );
         assert_eq!(source_display_name("MSEdge"), "Edge");
+        assert_eq!(source_display_name("308046B0AF4A39CB"), "Browser");
         assert_eq!(
             source_display_name("Microsoft.ZuneMusic_8wekyb3d8bbwe!Microsoft.ZuneMusic"),
             "Media Player"

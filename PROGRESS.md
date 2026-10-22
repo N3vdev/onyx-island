@@ -344,6 +344,18 @@ No new third-party crates: only additional `windows` features.
 | GSMTC read of live Spotify | title, artist, 128x128 art, accent `[188, 78, 81]`, timeline 9.3/135.6 s |
 | loopback probe, nothing playing | 20/20 fresh level samples at 100 ms checks, all zero |
 
+### Fix: browser media ignored when Spotify was paused (user report)
+
+`choose_session` preferred Spotify whenever its session existed, so a paused
+Spotify hid a playing YouTube tab. It now ranks playing > paused first, then
+Spotify, then the system's current session. The media thread also watches
+`PlaybackInfoChanged` on every session (not just the shown one), so starting
+or pausing another app re-picks immediately. Chromium/Firefox register hashed
+AUMIDs (e.g. `308046B0AF4A39CB`); the display name is now resolved through
+the shell Apps folder ("Firefox"). Verified live: paused Spotify + playing
+YouTube in Firefox shows the Firefox track. YouTube in Firefox reports no
+track length, so the scrubber is hidden for it (controls still apply).
+
 ### Pending (needs audio; please verify)
 
 - [ ] Spotify: play/pause, next, previous, and dragging the scrubber from the
