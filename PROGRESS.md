@@ -515,3 +515,52 @@ window region, extended style, and screen pixels every 30 ms):
 | click-through | on for the travel only, cleared the moment the shape settles |
 | region | union box during travel (e.g. `-4..1084`), exact pill after (e.g. `7..45` top, `1035..1073` bottom), empty while hidden |
 | window | 440x1080 at `716,0` constant throughout, so nothing moves the HWND |
+
+## Dock trigger: the island's exact footprint, and invisible overlays (user request, 2026-10-22)
+
+The user restated the rule: move the pill down only while an app window
+actually covers the spot the island occupies at the top (about the top 3-4% of
+the screen); with only the desktop showing it must stay at the top; and none of
+it may cost resources.
+
+Two defects were behind "it docks even when the desktop is showing":
+
+- **The NVIDIA GeForce Overlay pinned it down permanently.** That window
+  (`CEF-OSC-WIDGET`) spans the whole screen and the OS reports it as visible,
+  yet it is fully transparent (`WS_EX_LAYERED` with alpha 0), which every
+  existing filter missed. Layered windows whose `SetLayeredWindowAttributes`
+  alpha is 0 are now ignored, next to the already ignored click-through,
+  cloaked (other virtual desktop), minimised, desktop and taskbar windows.
+  The decision is a pure function (`is_drawn_window`) with unit tests.
+- **The zone was a taller strip** (screen edge through the bottom of the pill).
+  It is now exactly the island's own footprint: the resting compact pill's
+  rectangle, 220x36 dp inset 8 dp from the configured edge, i.e. the top ~4%
+  of a 1080p screen. Everywhere else on screen, a window leaves it alone.
+
+Verified live, music playing with the pill forced visible:
+
+| step | window region |
+|---|---|
+| Firefox + Vibeforge open over the band | `109,1035,331,1073` (docked at the bottom) |
+| those two minimised, desktop showing | `109,7,331,45` (glided back to the top) |
+| restored | `109,1035,331,1073` (docked again) |
+
+The probe that lists counted windows now reports exactly the two real ones;
+the NVIDIA overlay, the shell's cloaked edge window, the widget board, and the
+OneDrive/Start helpers no longer appear.
+
+Cost, measured on the release build (per-second and per-thread sampling):
+
+| state | CPU |
+|---|---|
+| idle, nothing playing (island hidden) | **0.000%** of one core: 0 ms over 60 s |
+| music playing, compact pill with live bars | ~5% of one core = ~0.4% of the machine, the same as P2's 0.52%-of-machine figure |
+| 194 window moves in 6 s (a WinEvent storm) | +0.5% of one core across those 6 s, so the detection itself is free |
+| full-work-area window (docked design) vs 200 dp window at the bottom | 5.47% vs 5.16% of one core: the tall window costs nothing measurable |
+
+Nothing polls. The hooks are out-of-context WinEvent hooks; a burst of events
+is debounced by one one-shot 120 ms timer that is killed when it fires, and the
+check runs only when a top-level window moves, resizes, shows, hides, cloaks or
+takes the foreground. Turning the music filter's UI Automation tab reading off
+did not change the numbers (6.05% vs 4.88% of one core), so the tab scans are
+not a factor.

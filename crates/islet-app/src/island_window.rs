@@ -566,8 +566,9 @@ impl IslandHost {
         let Some(home) = self.home_layout else {
             return false;
         };
-        // The strip between the screen edge and the far side of the normal
-        // compact island, at the configured edge, in screen pixels.
+        // The island's own footprint at the configured edge, in screen
+        // pixels: exactly where the resting pill is drawn, nothing more. A
+        // window may be anywhere else on the screen without disturbing it.
         let scale = home.dpi as f32 / 96.0;
         let compact = arrange(
             islet_core::island::COMPACT,
@@ -579,16 +580,11 @@ impl IslandHost {
             home.anchor_top,
         )
         .main;
-        let (top, bottom) = if home.anchor_top {
-            (0.0, compact.bottom())
-        } else {
-            (compact.y, self.logical_height)
-        };
         let zone = Rect::new(
             home.x as f32 + compact.x * scale,
-            home.y as f32 + top * scale,
+            home.y as f32 + compact.y * scale,
             compact.width * scale,
-            (bottom - top) * scale,
+            compact.height * scale,
         );
         occlusion::window_behind(zone)
     }
