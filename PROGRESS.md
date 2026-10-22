@@ -656,3 +656,20 @@ state without flights is 3.7% of one core, so a flight is roughly 0.2 s of CPU
 spread over 0.9 s (and the demo's flights also relayout a card that changes
 size). Idle remains 0.000% of one core, and the mask layer only exists while
 the shell is tapered.
+
+## A rounded voice
+
+All island text now uses **Arial Rounded MT Bold**. It is the only genuinely
+rounded family installed, and it ships a single Bold face, so DirectWrite maps
+every requested weight to Bold and the hierarchy rests on size and colour; when
+the family is missing, `create_format` retries with Segoe UI. Compact titles are
+a little wider than before, but the 116 dp text slot still fits the demo track
+and ellipsises normally.
+
+The compact media tile is now a **circle**: its radius is `art * 0.5` (12 dp on
+the 24 dp tile), which is the pill's 18 dp corner clamped to the tile, so the
+art sits concentric with the pill's rounded ends. Window-only captures of the
+compact pill and the expanded card confirm the new face and the circular art;
+the expanded card keeps its 12 dp squircle so the album cover still reads as
+cover art.
+

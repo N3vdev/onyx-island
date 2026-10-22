@@ -1372,9 +1372,11 @@ impl Gfx {
     ) -> RenderResult<()> {
         let art = 24.0;
         let art_y = (height - art) * 0.5;
+        // The compact pill is a stadium; clamping the art's corners to its
+        // half-size keeps the tile concentric with the pill's rounded ends.
         self.draw_art(
             Rect::new(8.0, art_y, art, art),
-            6.0,
+            art * 0.5,
             media.art.as_ref(),
             accent,
             alpha,
@@ -2444,6 +2446,24 @@ impl TextFormats {
     }
 }
 
+unsafe fn create_text_format(
+    factory: &IDWriteFactory,
+    family: &str,
+    size: f32,
+    weight: DWRITE_FONT_WEIGHT,
+) -> windows::core::Result<IDWriteTextFormat> {
+    let family: Vec<u16> = family.encode_utf16().chain([0]).collect();
+    factory.CreateTextFormat(
+        PCWSTR(family.as_ptr()),
+        None::<&IDWriteFontCollection>,
+        weight,
+        DWRITE_FONT_STYLE_NORMAL,
+        DWRITE_FONT_STRETCH_NORMAL,
+        size,
+        w!("en-us"),
+    )
+}
+
 unsafe fn create_format(
     factory: &IDWriteFactory,
     size: f32,
@@ -2451,18 +2471,14 @@ unsafe fn create_format(
     alignment: windows::Win32::Graphics::DirectWrite::DWRITE_TEXT_ALIGNMENT,
     paragraph: windows::Win32::Graphics::DirectWrite::DWRITE_PARAGRAPH_ALIGNMENT,
 ) -> RenderResult<IDWriteTextFormat> {
-    let family: Vec<u16> = "Segoe UI\0".encode_utf16().collect();
+    // A rounded face softens the pill's voice. This family ships a single
+    // Bold face, so DirectWrite maps every requested weight to it and the
+    // hierarchy comes from size and colour. Keep the stock look when the
+    // family is not installed.
     let format = stage(
         "CreateTextFormat",
-        factory.CreateTextFormat(
-            PCWSTR(family.as_ptr()),
-            None::<&IDWriteFontCollection>,
-            weight,
-            DWRITE_FONT_STYLE_NORMAL,
-            DWRITE_FONT_STRETCH_NORMAL,
-            size,
-            w!("en-us"),
-        ),
+        create_text_format(factory, "Arial Rounded MT Bold", size, weight)
+            .or_else(|_| create_text_format(factory, "Segoe UI", size, weight)),
     )?;
     stage("SetTextAlignment", format.SetTextAlignment(alignment))?;
     stage(
