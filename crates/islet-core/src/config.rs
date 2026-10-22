@@ -102,6 +102,13 @@ pub struct MediaConfig {
     pub enabled: bool,
     pub real_bars: bool,
     pub color_tint: bool,
+    /// Only show music: music apps, music sites, and music on youtube.com.
+    pub music_only: bool,
+    /// Sites whose browser playback counts as music. Names or URLs, matched
+    /// against the site name in the tab title ("https://www.jiosaavn.com"
+    /// and "JioSaavn" both work). youtube.com is handled separately: only
+    /// music videos count, unless "youtube" itself is listed here.
+    pub music_sites: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -157,6 +164,11 @@ impl Default for MediaConfig {
             enabled: true,
             real_bars: true,
             color_tint: true,
+            music_only: true,
+            music_sites: crate::music::DEFAULT_MUSIC_SITES
+                .iter()
+                .map(|site| (*site).to_owned())
+                .collect(),
         }
     }
 }

@@ -13,6 +13,7 @@ use islet_core::island::{
     TimerKind,
 };
 use islet_core::media::{expanded_action_at, scrub_fraction, BarLevels, MediaAction, Timeline};
+use islet_core::music::MusicFilter;
 use islet_core::{Config, Rect};
 use islet_media::{MediaCommand, MediaInfo, MediaService};
 use islet_render::{HitRegion, Renderer, RendererConfig};
@@ -156,6 +157,7 @@ pub struct IslandHost {
     loopback: Option<Loopback>,
     real_bars: bool,
     color_tint: bool,
+    music_filter: MusicFilter,
     scrubbing: bool,
     warned_disconnected: bool,
 }
@@ -226,6 +228,7 @@ impl IslandHost {
             loopback: None,
             real_bars: config.media.real_bars,
             color_tint: config.media.color_tint,
+            music_filter: music_filter(&config),
             scrubbing: false,
             warned_disconnected: false,
         });
@@ -294,6 +297,13 @@ impl IslandHost {
                 }
                 _ => {}
             }
+        }
+        let filter = music_filter(&config);
+        if filter != self.music_filter {
+            if let Some(service) = &self.media {
+                service.set_filter(filter.clone());
+            }
+            self.music_filter = filter;
         }
         let tint_changed = self.color_tint != config.media.color_tint;
         self.real_bars = config.media.real_bars;
@@ -451,7 +461,7 @@ impl IslandHost {
     fn start_media(&mut self) {
         let tx = self.media_tx.clone();
         let hwnd = self.hwnd.0 as isize;
-        let service = MediaService::start(move |info| {
+        let service = MediaService::start(self.music_filter.clone(), move |info| {
             if tx.send(info).is_ok() {
                 // SAFETY: non-blocking post to the island window.
                 unsafe {
@@ -1249,6 +1259,10 @@ fn clock_now() -> f64 {
 /// The island clock in milliseconds, for [`BarLevels`] freshness.
 fn clock_now_ms() -> u64 {
     (clock_now() * 1000.0) as u64
+}
+
+fn music_filter(config: &Config) -> MusicFilter {
+    MusicFilter::new(config.media.music_only, &config.media.music_sites)
 }
 
 fn read_config(shared: &Arc<RwLock<Config>>) -> Config {

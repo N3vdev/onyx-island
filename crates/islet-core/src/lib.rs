@@ -7,6 +7,7 @@ pub mod config;
 pub mod geometry;
 pub mod island;
 pub mod media;
+pub mod music;
 pub mod spring;
 
 pub use config::Config;

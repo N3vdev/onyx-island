@@ -356,6 +356,45 @@ the shell Apps folder ("Firefox"). Verified live: paused Spotify + playing
 YouTube in Firefox shows the Firefox track. YouTube in Firefox reports no
 track length, so the scrubber is hidden for it (controls still apply).
 
+### Music-only filter (user request)
+
+The island shows music only, never videos. GSMTC cannot tell: Firefox
+reported an X video as `PlaybackType = Music` with title "Home / X" and no
+URL. So:
+
+- **Apps** (Spotify, Apple Music, foobar2000, ...) are trusted unless they
+  set `PlaybackType = Video` themselves.
+- **Browsers** (any whose process is in `BROWSER_PROCESSES`: Chrome, Edge,
+  Firefox, Brave, Opera, Vivaldi, Arc, Zen, ...): `islet-media::tabs` reads
+  every tab title through UI Automation (background tabs included; titles
+  stay in memory, never logged). The tab whose title contains the track
+  names the site. Listed music sites count; youtube.com counts only when
+  `looks_like_music` says so ("- Topic"/VEVO channels, Official
+  Audio/Video/Visualizer, Lyrics, feat./ft., "Artist - Song" matching the
+  channel; rejects trailers, podcasts, vlogs, reactions, #shorts, ...);
+  everything else is hidden. If no tab names the track (sites that keep
+  their own name as the title, e.g. Deezer), a session counts when a listed
+  music site tab is open.
+- Config: `media.music_only` (default true) and `media.music_sites`
+  (defaults: YouTube Music, SoundCloud, Deezer, Spotify, Apple Music, TIDAL,
+  Bandcamp, Amazon Music, Audiomack, Mixcloud, JioSaavn, Gaana, Pandora,
+  Qobuz, Napster). Entries may be names or URLs; URLs reduce to the site
+  name ("https://www.jiosaavn.com/x" -> "jiosaavn", "music.apple.com" ->
+  "apple music") and match on word boundaries in tab titles. Listing
+  "youtube" trusts all of youtube.com. Hot-reloaded.
+- Classification runs at session pick time, which now also happens on any
+  session's track change, so YouTube autoplaying into a non-music video
+  hides it. A rejected browser track is re-checked once after 1.5 s in case
+  the tab title lagged the track change.
+- Verified live: X video playing in Firefox is rejected; the island falls
+  back to paused Spotify. 11 classifier tests include the real tab titles
+  from that session.
+
+Limits: matching relies on the site name appearing in the tab title (true
+for the listed sites). The YouTube heuristic will misjudge some videos.
+Chrome/Edge tab reading is implemented the same way but was only exercised
+with Firefox here.
+
 ### Pending (needs audio; please verify)
 
 - [ ] Spotify: play/pause, next, previous, and dragging the scrubber from the

@@ -1,10 +1,14 @@
 //! Prints now-playing updates until Enter is pressed. Used to verify GSMTC
 //! against real apps (Spotify, browsers, Media Player).
 
+use islet_core::music::MusicFilter;
 use islet_media::{MediaCommand, MediaService};
 
 fn main() {
-    let service = MediaService::start(|info| match info {
+    // Same defaults as the app's config.
+    let config = islet_core::Config::default();
+    let filter = MusicFilter::new(config.media.music_only, &config.media.music_sites);
+    let service = MediaService::start(filter, |info| match info {
         Some(info) => println!(
             "[{}] {} - {} | playing={} {:.1}/{:.1}s rate={} art={} accent={:?}",
             info.source,
