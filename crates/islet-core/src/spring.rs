@@ -47,6 +47,12 @@ impl SpringParams {
         response: 0.25,
         damping: 0.55,
     };
+    /// Travelling between the top and bottom screen edges. Smooth and only
+    /// very slightly springy, so it never looks like it bounces off an edge.
+    pub const DOCK: Self = Self {
+        response: 0.50,
+        damping: 0.92,
+    };
 
     #[must_use]
     pub const fn new(response: f64, damping: f64) -> Self {

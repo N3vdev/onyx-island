@@ -473,3 +473,45 @@ When the spot is clear again it returns to its configured edge.
 - Config `general.tuck_behind_windows` (default on) with a Settings toggle.
 - Verified live: Position = Top, Firefox maximised, Spotify playing: tabs
   clear, slim bar at the bottom edge with art, title, and live bars.
+
+## Dock over apps: the whole pill glides to the bottom edge (user request, 2026-10-22)
+
+Replaces the slim bar above. The user asked for the pill itself to move:
+while an app window sits behind the island, the pill glides down to the
+bottom edge; when the spot is clear it glides back. Nothing changes shape
+any more, so the island is the same pill at all times.
+
+- Core: `arrange_at` takes a continuous edge `anchor` (0 = top, 1 = bottom)
+  and places the pill anywhere along the line between the two edges;
+  `arrange` is the discrete form used elsewhere. `TUCKED`, `TUCKED_BUBBLE`,
+  and `LayoutTarget::docked` are gone: tucked now means "normal shape, other
+  edge". Dictation still never docks.
+- Renderer: a normalised `anchor` spring (`SpringParams::DOCK`, response
+  0.50 s, damping 0.92) drives the position every frame, so the travel is the
+  same spring-eased motion as every other transition and can be retargeted
+  mid-flight without a jump. Its settle thresholds are scaled by the window
+  height, so "settled" still means sub-pixel.
+- Window: with `position = "top"` the island window now spans the whole work
+  area, so the pill glides between the edges inside one window instead of a
+  small window teleporting between them. At the bottom it stays 200 dp tall.
+  Detection still asks about the configured edge, so it cannot flap.
+- While travelling, the window is click-through (`WS_EX_TRANSPARENT`) and its
+  region is the union box of the old and new pill positions, so no frame of the
+  glide is clipped and the tall transparent window never swallows a click.
+  `WM_APP_SETTLED` clears both and pins the region to the exact pill.
+- Disabling the setting drops the WinEvent hooks before the reposition, so the
+  last occlusion check cannot re-dock the island mid-return.
+- Settings: toggle renamed to "Dock over apps" with a matching description.
+- Debug: `--demo` with `ISLET_DEMO_DOCK=1` alternates the edges every step, so
+  the glide can be watched without opening an app window.
+
+Verified live (release build, `--demo` + `ISLET_DEMO_DOCK=1`, sampling the
+window region, extended style, and screen pixels every 30 ms):
+
+| | |
+|---|---|
+| glide | ~0.55 s edge to edge, ease-out, arrives within 1 px; tracked 13 distinct positions per travel |
+| frames | one morph frame per vblank: 1436 morph frames / 30 s, median 5.6 ms, one 27.8 ms outlier at process start |
+| click-through | on for the travel only, cleared the moment the shape settles |
+| region | union box during travel (e.g. `-4..1084`), exact pill after (e.g. `7..45` top, `1035..1073` bottom), empty while hidden |
+| window | 440x1080 at `716,0` constant throughout, so nothing moves the HWND |

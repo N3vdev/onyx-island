@@ -47,8 +47,8 @@ pub struct GeneralConfig {
     pub idle_style: IdleStyle,
     pub hide_in_fullscreen: bool,
     pub start_with_windows: bool,
-    /// Slim down and dock to the screen edge while an app window is behind
-    /// the island.
+    /// Glide to the bottom edge while an app window is behind the island,
+    /// then glide back to the configured edge when it clears.
     pub tuck_behind_windows: bool,
 }
 

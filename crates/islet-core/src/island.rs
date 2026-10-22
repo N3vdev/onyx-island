@@ -24,10 +24,6 @@ pub const SPLIT_BUBBLE: PillSize = PillSize::new(36.0, 36.0, 18.0);
 pub const NOTIFICATION: PillSize = PillSize::new(380.0, 76.0, 30.0);
 pub const MEDIA: PillSize = PillSize::new(400.0, 168.0, 38.0);
 pub const DICTATION: PillSize = PillSize::new(260.0, 44.0, 22.0);
-/// Slim form docked to the screen edge while an app window is behind the
-/// island: still shows art, "Title · Artist", and bars on one line.
-pub const TUCKED: PillSize = PillSize::new(300.0, 26.0, 13.0);
-pub const TUCKED_BUBBLE: PillSize = PillSize::new(26.0, 26.0, 13.0);
 pub const SLIVER: PillSize = PillSize::new(120.0, 6.0, 3.0);
 pub const HIDDEN: PillSize = PillSize::new(0.0, 0.0, 0.0);
 
@@ -91,12 +87,6 @@ impl LayoutTarget {
         }
     }
 
-    /// The same target docked flush against the screen edge.
-    #[must_use]
-    pub const fn docked(self) -> Self {
-        Self { inset: 0.0, ..self }
-    }
-
     #[must_use]
     pub fn idle(style: IdleStyle) -> Self {
         match style {
@@ -148,6 +138,31 @@ pub fn arrange(
     window_height: f32,
     anchor_top: bool,
 ) -> PillFrame {
+    arrange_at(
+        main,
+        bubble,
+        gap,
+        inset,
+        window_width,
+        window_height,
+        if anchor_top { 0.0 } else { 1.0 },
+    )
+}
+
+/// Like [`arrange`], but with a continuous edge anchor: `0` is the top edge
+/// and `1` is the bottom edge. The renderer animates this so the island can
+/// glide between edges instead of teleporting.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn arrange_at(
+    main: PillSize,
+    bubble: Option<PillSize>,
+    gap: f32,
+    inset: f32,
+    window_width: f32,
+    window_height: f32,
+    anchor: f32,
+) -> PillFrame {
     let main_w = main.width.max(0.0);
     let main_h = main.height.max(0.0);
     let bubble = bubble.filter(|bubble| bubble.width > 0.5);
@@ -162,11 +177,10 @@ pub fn arrange(
         };
     let main_x = (window_width - group_w) * 0.5;
     let inset = inset.max(0.0);
-    let main_y = if anchor_top {
-        inset
-    } else {
-        window_height - main_h - inset
-    };
+    let top_y = inset;
+    let bottom_y = window_height - main_h - inset;
+    let anchor = anchor.clamp(0.0, 1.0);
+    let main_y = top_y + (bottom_y - top_y) * anchor;
     PillFrame {
         main: Rect::new(main_x, main_y, main_w, main_h),
         main_corner: main.corner.max(0.0),
@@ -341,7 +355,7 @@ pub struct IslandState {
     /// How long paused media stays before closing.
     pub media_paused_ms: u32,
     pub idle_style: IdleStyle,
-    /// An app window is behind the island: use the slim docked form.
+    /// An app window is behind the island: dock at the bottom edge.
     pub tucked: bool,
     pub expanded: bool,
     pub pointer_inside: bool,
@@ -438,15 +452,15 @@ impl IslandState {
         }
 
         // Out of the way of the window behind; hovering expands as usual.
+        // The pill keeps its normal shape and just docks at the other edge.
         if self.tucked && !self.expanded {
-            let target = if self.persistent_count() >= 2 {
-                LayoutTarget::split(TUCKED, TUCKED_BUBBLE)
-            } else if self.primary_kind().is_some() {
-                LayoutTarget::single(TUCKED)
-            } else {
-                LayoutTarget::idle(self.idle_style)
-            };
-            return target.docked();
+            if self.persistent_count() >= 2 {
+                return LayoutTarget::split(COMPACT, SPLIT_BUBBLE);
+            }
+            if self.primary_kind().is_some() {
+                return LayoutTarget::single(COMPACT);
+            }
+            return LayoutTarget::idle(self.idle_style);
         }
 
         if self.expanded {
@@ -1093,15 +1107,41 @@ mod tests {
     }
 
     #[test]
-    fn tucked_island_is_slim_and_docked_until_hovered() {
+    fn arrange_at_interpolates_between_edges() {
+        // A full-height island window (for the dock animation) places the
+        // pill at the top, bottom, or anywhere in between.
+        let top = arrange_at(COMPACT, None, 0.0, EDGE_GAP_DP, 440.0, 1040.0, 0.0);
+        let bottom = arrange_at(COMPACT, None, 0.0, EDGE_GAP_DP, 440.0, 1040.0, 1.0);
+        let middle = arrange_at(COMPACT, None, 0.0, EDGE_GAP_DP, 440.0, 1040.0, 0.5);
+        assert_eq!(top.main.y, EDGE_GAP_DP);
+        assert_eq!(bottom.main.y, 1040.0 - COMPACT.height - EDGE_GAP_DP);
+        assert_eq!(
+            middle.main.y,
+            (top.main.y + bottom.main.y) * 0.5,
+            "the pill should travel linearly between the two edges"
+        );
+        // Out-of-range anchors are clamped, never off screen.
+        assert_eq!(
+            arrange_at(COMPACT, None, 0.0, EDGE_GAP_DP, 440.0, 1040.0, -3.0),
+            top
+        );
+        assert_eq!(
+            arrange_at(COMPACT, None, 0.0, EDGE_GAP_DP, 440.0, 1040.0, 3.0),
+            bottom
+        );
+    }
+
+    #[test]
+    fn tucked_island_keeps_its_shape_and_docks_until_hovered() {
         let mut state = IslandState::default();
         reduce(&mut state, IslandEvent::SetMedia(Some(media())), 0.0);
-        assert_eq!(state.layout().inset, EDGE_GAP_DP);
+        assert_eq!(state.layout(), LayoutTarget::single(COMPACT));
 
         let effects = reduce(&mut state, IslandEvent::SetTucked(true), 0.0);
         assert_eq!(effects, vec![Effect::LayoutChanged]);
-        assert_eq!(state.layout(), LayoutTarget::single(TUCKED).docked());
-        // Content is unchanged: the renderer draws it in one line.
+        // The pill itself glides to the bottom; it does not shrink into a
+        // different shape.
+        assert_eq!(state.layout(), LayoutTarget::single(COMPACT));
         assert!(matches!(
             state.content().primary,
             Some(ContentCard::Media(_))
@@ -1113,10 +1153,7 @@ mod tests {
 
         reduce(&mut state, IslandEvent::SetExpanded(false), 0.0);
         reduce(&mut state, IslandEvent::SetRunning(Some(agent())), 0.0);
-        assert_eq!(
-            state.layout(),
-            LayoutTarget::split(TUCKED, TUCKED_BUBBLE).docked()
-        );
+        assert_eq!(state.layout(), LayoutTarget::split(COMPACT, SPLIT_BUBBLE));
 
         reduce(&mut state, IslandEvent::SetTucked(false), 0.0);
         assert_eq!(state.layout(), LayoutTarget::split(COMPACT, SPLIT_BUBBLE));

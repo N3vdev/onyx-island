@@ -306,8 +306,8 @@ fn general(app: &mut SettingsApp, ui: &mut egui::Ui) {
         divider(ui);
         row(
             ui,
-            "Slim down over apps",
-            "When a window is behind the island, shrink to a slim bar at the bottom edge, out of the way of tabs and title bars. Hover to expand.",
+            "Dock over apps",
+            "When a window is behind the island, glide it to the bottom edge, out of the way of tabs and title bars. It glides back when the spot is clear. Hover to expand.",
             |ui| {
                 toggle(ui, &mut general.tuck_behind_windows);
             },

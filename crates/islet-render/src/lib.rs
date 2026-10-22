@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 
 use islet_core::geometry::{point_in_rounded_rect, Rect};
 use islet_core::island::{
-    arrange, AgentCard, AgentState, AlertLevel, ContentCard, ContentSnapshot, DictationCard,
+    arrange_at, AgentCard, AgentState, AlertLevel, ContentCard, ContentSnapshot, DictationCard,
     LayoutTarget, MediaCard, NotificationCard, PillSize,
 };
 use islet_core::media::{expanded, format_clock, ArtImage, BarLevels, BAR_COUNT};
@@ -206,7 +206,8 @@ impl Renderer {
         if config.pixel_width == 0 || config.pixel_height == 0 {
             return Err(RenderError::InvalidSize);
         }
-        let animator = Animator::new(LayoutTarget::HIDDEN, now);
+        let anchor = if config.anchor_top { 0.0 } else { 1.0 };
+        let animator = Animator::new(LayoutTarget::HIDDEN, anchor, now);
         Ok(Self {
             hwnd: config.hwnd,
             gfx: None,
@@ -253,8 +254,12 @@ impl Renderer {
         }
     }
 
-    pub fn set_anchor(&mut self, anchor_top: bool) {
+    pub fn set_anchor(&mut self, anchor_top: bool, now: f64) {
+        if self.anchor_top == anchor_top {
+            return;
+        }
         self.anchor_top = anchor_top;
+        self.animator.set_anchor(anchor_top, now);
     }
 
     pub fn resize(&mut self, pixel_width: u32, pixel_height: u32, dpi: f32) -> RenderResult<()> {
@@ -285,7 +290,9 @@ impl Renderer {
 
     #[must_use]
     pub fn needs_frame(&self, now: f64) -> bool {
-        !self.animator.is_settled(now)
+        !self
+            .animator
+            .is_settled(now, f64::from(self.logical_height))
             || self.transition_progress(now).is_some()
             || self.content.animates()
             || self
@@ -298,7 +305,10 @@ impl Renderer {
     /// These need every vblank; content-only animation can be throttled.
     #[must_use]
     pub fn is_morphing(&self, now: f64) -> bool {
-        !self.animator.is_settled(now) || self.transition_progress(now).is_some()
+        !self
+            .animator
+            .is_settled(now, f64::from(self.logical_height))
+            || self.transition_progress(now).is_some()
     }
 
     #[must_use]
@@ -311,7 +321,9 @@ impl Renderer {
             && !self.target.visible
             && self.content.is_empty()
             && self.previous_content.is_none()
-            && self.animator.is_settled(now)
+            && self
+                .animator
+                .is_settled(now, f64::from(self.logical_height))
         {
             self.clear_hit_region();
             return Ok(());
@@ -336,7 +348,8 @@ impl Renderer {
             // hidden and settled, so restart the motion from hidden at the
             // post-creation time instead of skipping its first frames.
             now += started.elapsed().as_secs_f64();
-            self.animator = Animator::new(LayoutTarget::HIDDEN, now);
+            let anchor = if self.anchor_top { 0.0 } else { 1.0 };
+            self.animator = Animator::new(LayoutTarget::HIDDEN, anchor, now);
             self.animator.set_target(self.target, now);
             if self.transition_start.is_some() {
                 self.transition_start = Some(now);
@@ -387,7 +400,9 @@ impl Renderer {
         (self.gfx.is_some()
             && self.previous_content.is_none()
             && self.transition_progress(now).is_none()
-            && self.animator.is_settled(now))
+            && self
+                .animator
+                .is_settled(now, f64::from(self.logical_height)))
         .then(|| (hidden_since + GRAPHICS_RELEASE_DELAY - now).max(0.0))
     }
 
@@ -409,7 +424,7 @@ impl Renderer {
     }
 
     fn frame_geometry(&self, sample: &Sample) -> FrameGeometry {
-        let frame = arrange(
+        let frame = arrange_at(
             PillSize::new(sample.main_width, sample.main_height, sample.main_corner),
             Some(PillSize::new(
                 sample.bubble_width,
@@ -420,7 +435,7 @@ impl Renderer {
             sample.inset,
             self.logical_width,
             self.logical_height,
-            self.anchor_top,
+            sample.anchor,
         );
         FrameGeometry {
             main: frame.main,
@@ -468,6 +483,8 @@ struct Sample {
     bubble_corner: f32,
     gap: f32,
     inset: f32,
+    /// 0 = top edge, 1 = bottom edge. Animated when the island docks.
+    anchor: f32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -486,10 +503,11 @@ struct Animator {
     bubble_corner: Spring,
     gap: Spring,
     inset: Spring,
+    anchor: Spring,
 }
 
 impl Animator {
-    fn new(target: LayoutTarget, now: f64) -> Self {
+    fn new(target: LayoutTarget, anchor: f64, now: f64) -> Self {
         let mut animator = Self {
             main_width: Spring::new(0.0, 0.0, SpringParams::EXPAND, now),
             main_height: Spring::new(0.0, 0.0, SpringParams::EXPAND, now),
@@ -505,9 +523,20 @@ impl Animator {
                 SpringParams::EXPAND,
                 now,
             ),
+            // Also starts at rest: a fresh window should already be at the
+            // configured edge, not fly there from the other one.
+            anchor: Spring::new(anchor, anchor, SpringParams::DOCK, now),
         };
         animator.set_target(target, now);
         animator
+    }
+
+    fn set_anchor(&mut self, anchor_top: bool, now: f64) {
+        let target = if anchor_top { 0.0 } else { 1.0 };
+        if (self.anchor.target() - target).abs() < f64::EPSILON {
+            return;
+        }
+        retarget(&mut self.anchor, target, SpringParams::DOCK, now);
     }
 
     fn set_target(&mut self, target: LayoutTarget, now: f64) {
@@ -582,10 +611,15 @@ impl Animator {
             bubble_corner: self.bubble_corner.position(now).max(0.0) as f32,
             gap: self.gap.position(now).max(0.0) as f32,
             inset: self.inset.position(now).max(0.0) as f32,
+            anchor: self.anchor.position(now).clamp(0.0, 1.0) as f32,
         }
     }
 
-    fn is_settled(&self, now: f64) -> bool {
+    /// The anchor is normalized, so its settle threshold is scaled back into
+    /// logical pixels; otherwise 0.25 (25% of the screen) would settle the
+    /// travel while it was still visibly moving.
+    fn is_settled(&self, now: f64, logical_height: f64) -> bool {
+        let travel = logical_height.max(1.0);
         self.main_width.is_settled(now)
             && self.main_height.is_settled(now)
             && self.main_corner.is_settled(now)
@@ -594,6 +628,9 @@ impl Animator {
             && self.bubble_corner.is_settled(now)
             && self.gap.is_settled(now)
             && self.inset.is_settled(now)
+            && self
+                .anchor
+                .is_settled_with(now, 0.25 / travel, 1.0 / travel)
     }
 }
 
@@ -2523,5 +2560,43 @@ mod tests {
         assert_eq!(ease_out(0.0), 0.0);
         assert_eq!(ease_out(1.0), 1.0);
         assert_eq!(ease_out(2.0), 1.0);
+    }
+
+    #[test]
+    fn anchor_spring_glides_between_edges_and_settles_at_the_target() {
+        // Created hidden, like the renderer does: everything starts at rest,
+        // docked at the top edge.
+        let mut animator = Animator::new(LayoutTarget::HIDDEN, 0.0, 0.0);
+        assert!(animator.is_settled(0.0, 1000.0), "starts settled");
+        assert_eq!(animator.sample(0.0).anchor, 0.0, "starts at the top edge");
+
+        // Show the pill and let the shape finish before testing the glide.
+        animator.set_target(LayoutTarget::single(islet_core::island::COMPACT), 0.0);
+        assert!(animator.is_settled(2.0, 1000.0));
+
+        // Dock at the bottom.
+        animator.set_anchor(false, 2.0);
+        let early = animator.sample(2.10).anchor;
+        let middle = animator.sample(2.30).anchor;
+        let late = animator.sample(2.60).anchor;
+        assert!(
+            early > 0.0 && early < middle && middle < late,
+            "the anchor should move steadily: {early} {middle} {late}"
+        );
+        assert!(
+            !animator.is_settled(2.30, 1000.0),
+            "mid-travel must not report settled"
+        );
+        assert!(animator.is_settled(4.0, 1000.0));
+        assert!(
+            (animator.sample(4.0).anchor - 1.0).abs() < 0.01,
+            "the anchor should arrive at the bottom edge"
+        );
+
+        // And back to the top, preserving the motion.
+        animator.set_anchor(true, 4.0);
+        assert!(!animator.is_settled(4.05, 1000.0));
+        assert!(animator.is_settled(6.0, 1000.0));
+        assert!((animator.sample(6.0).anchor).abs() < 0.01);
     }
 }

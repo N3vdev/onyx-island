@@ -38,11 +38,12 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     DefWindowProcW, GetCursorPos, GetForegroundWindow, GetWindowLongPtrW, GetWindowRect, KillTimer,
-    PostMessageW, SetTimer, SetWindowPos, ShowWindow, GWLP_USERDATA, HTCLIENT, HTTRANSPARENT,
-    HWND_TOPMOST, MA_NOACTIVATE, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOZORDER, SW_HIDE,
-    SW_SHOWNOACTIVATE, WINDOWPOS, WM_APP, WM_CAPTURECHANGED, WM_DISPLAYCHANGE, WM_DPICHANGED,
-    WM_ERASEBKGND, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_NCHITTEST,
-    WM_SETTINGCHANGE, WM_TIMER, WM_WINDOWPOSCHANGING,
+    PostMessageW, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, GWLP_USERDATA,
+    GWL_EXSTYLE, HTCLIENT, HTTRANSPARENT, HWND_TOPMOST, MA_NOACTIVATE, SWP_NOACTIVATE,
+    SWP_NOOWNERZORDER, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE, WINDOWPOS, WM_APP,
+    WM_CAPTURECHANGED, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_NCHITTEST, WM_SETTINGCHANGE, WM_TIMER,
+    WM_WINDOWPOSCHANGING, WS_EX_TRANSPARENT,
 };
 
 pub const WINDOW_LOGICAL_WIDTH: f32 = 440.0;
@@ -91,6 +92,9 @@ struct WindowLayout {
     height: i32,
     dpi: u32,
     anchor_top: bool,
+    /// Logical height of the window. At the top the window spans the whole
+    /// work area so the renderer can spring the pill between both edges.
+    logical_height: f32,
 }
 
 /// The window region, in physical pixels. `HTTRANSPARENT` only passes
@@ -120,6 +124,8 @@ enum RenderCommand {
         width: u32,
         height: u32,
         dpi: f32,
+        logical_width: f32,
+        logical_height: f32,
     },
     Suspend(bool),
     Stop,
@@ -145,11 +151,16 @@ pub struct IslandHost {
     dpi: u32,
     pixel_width: u32,
     pixel_height: u32,
+    logical_height: f32,
     last_layout: Option<WindowLayout>,
     /// Layout at the configured edge. The slim bar may sit elsewhere, but
     /// "is a window behind the island?" is always asked about this spot.
     home_layout: Option<WindowLayout>,
     demo: Option<Demo>,
+    /// Debug only: with `--demo`, alternate between the top and bottom edges
+    /// (set `ISLET_DEMO_DOCK=1`) so the dock animation can be watched
+    /// without opening an app window.
+    demo_dock: bool,
     poll_interval: Option<u32>,
     appbar: bool,
     generation: usize,
@@ -157,6 +168,13 @@ pub struct IslandHost {
     /// confirms it has settled.
     morph_box: Option<Rect>,
     last_target: Option<LayoutTarget>,
+    /// Effective edge of the last snapshot, kept separately because a dock
+    /// flips edges before the target itself is recomputed.
+    last_target_anchor_top: Option<bool>,
+    last_sent_anchor_top: Option<bool>,
+    /// The pill is between the top and bottom edges; the window is
+    /// click-through until it arrives.
+    traveling: bool,
     region: Option<WindowRegion>,
     bars: Arc<BarLevels>,
     media: Option<MediaService>,
@@ -194,7 +212,7 @@ impl IslandHost {
             pixel_height: layout.height as u32,
             dpi: layout.dpi as f32,
             logical_width: WINDOW_LOGICAL_WIDTH,
-            logical_height: WINDOW_LOGICAL_HEIGHT,
+            logical_height: layout.logical_height,
             anchor_top: layout.anchor_top,
         };
         let render_hit = Arc::clone(&hit);
@@ -225,14 +243,19 @@ impl IslandHost {
             dpi: layout.dpi,
             pixel_width: layout.width as u32,
             pixel_height: layout.height as u32,
+            logical_height: layout.logical_height,
             last_layout: Some(layout),
             home_layout: Some(layout),
             demo: None,
+            demo_dock: std::env::var_os("ISLET_DEMO_DOCK").is_some_and(|value| value != "0"),
             poll_interval: None,
             appbar: false,
             generation: 0,
             morph_box: None,
             last_target: None,
+            last_target_anchor_top: None,
+            last_sent_anchor_top: Some(layout.anchor_top),
+            traveling: false,
             region: None,
             bars,
             media: None,
@@ -331,15 +354,20 @@ impl IslandHost {
             self.music_filter = filter;
         }
         self.tuck_enabled = config.general.tuck_behind_windows;
+        if !self.tuck_enabled {
+            // Drop the hooks before the window starts moving so the last
+            // occlusion check cannot re-tuck it mid-reposition.
+            self.window_events = None;
+        }
+        if let Err(error) = self.reposition() {
+            tracing::warn!(%error, "could not reposition island window");
+        }
         self.update_window_events();
         let tint_changed = self.color_tint != config.media.color_tint;
         self.real_bars = config.media.real_bars;
         self.color_tint = config.media.color_tint;
         if tint_changed {
             self.apply_media();
-        }
-        if let Err(error) = self.reposition() {
-            tracing::warn!(%error, "could not reposition island window");
         }
         if self.hide_in_fullscreen && self.demo.is_none() {
             let hide = self.should_hide_for_fullscreen();
@@ -462,6 +490,10 @@ impl IslandHost {
             WM_APP_SETTLED => {
                 if wparam.0 == self.generation {
                     self.morph_box = None;
+                    if self.traveling {
+                        self.traveling = false;
+                        self.set_click_through(false);
+                    }
                     self.update_region();
                 }
                 Some(LRESULT(0))
@@ -516,15 +548,16 @@ impl IslandHost {
     }
 
     /// Slims the island while an app window overlaps where it normally sits.
+    /// The window already spans the work area, so the renderer simply springs
+    /// the same pill to the other edge.
     fn update_tucked(&mut self) {
+        // The demo drives docking itself; real occlusion is not monitored.
+        if self.demo.is_some() {
+            return;
+        }
         let tucked = self.window_events.is_some() && self.window_behind_island();
         if tucked == self.state.tucked {
             return;
-        }
-        // Move the window first (the bar may change edge), then send the
-        // snapshot, so no frame is drawn at the old edge.
-        if let Err(error) = self.reposition_for(tucked) {
-            tracing::warn!(%error, "could not move the island");
         }
         self.dispatch(IslandEvent::SetTucked(tucked));
     }
@@ -542,14 +575,14 @@ impl IslandHost {
             0.0,
             islet_core::island::EDGE_GAP_DP,
             WINDOW_LOGICAL_WIDTH,
-            WINDOW_LOGICAL_HEIGHT,
+            self.logical_height,
             home.anchor_top,
         )
         .main;
         let (top, bottom) = if home.anchor_top {
             (0.0, compact.bottom())
         } else {
-            (compact.y, WINDOW_LOGICAL_HEIGHT)
+            (compact.y, self.logical_height)
         };
         let zone = Rect::new(
             home.x as f32 + compact.x * scale,
@@ -647,7 +680,7 @@ impl IslandHost {
         let scale = self.dpi as f32 / 96.0;
         // Client-area mouse messages carry client coordinates.
         let point = point_from_lparam(lparam);
-        let main = self.target_frame(layout).main;
+        let main = self.target_frame(layout, self.effective_anchor_top()).main;
         Some((
             point.x as f32 / scale - main.x,
             point.y as f32 / scale - main.y,
@@ -787,25 +820,42 @@ impl IslandHost {
 
     fn send_snapshot(&mut self) {
         let target = self.state.layout();
+        let anchor_top = self.effective_anchor_top();
+        if self
+            .last_sent_anchor_top
+            .is_some_and(|last| last != anchor_top)
+        {
+            // The region will grow to cover the whole path between the two
+            // edges. Make the moving pill click-through until it arrives, so
+            // that a tall transparent window never swallows clicks.
+            self.set_click_through(true);
+            self.traveling = true;
+        }
+        self.last_sent_anchor_top = Some(anchor_top);
         self.generation = self.generation.wrapping_add(1);
         // Grow the region before the render thread starts moving, so no
         // frame of the morph is clipped. It shrinks again on WM_APP_SETTLED.
-        if self.last_target != Some(target) || self.morph_box.is_some() {
+        if self.last_target != Some(target)
+            || self.morph_box.is_some()
+            || self.last_target_anchor_top != Some(anchor_top)
+        {
+            let previous_anchor = self.last_target_anchor_top.unwrap_or(anchor_top);
             let previous = self.morph_box.or_else(|| {
                 self.last_target
-                    .and_then(|last| self.target_frame(last).bounds())
+                    .and_then(|last| self.target_frame(last, previous_anchor).bounds())
             });
-            self.morph_box = match (previous, self.target_frame(target).bounds()) {
+            self.morph_box = match (previous, self.target_frame(target, anchor_top).bounds()) {
                 (Some(previous), Some(next)) => Some(previous.union(next)),
                 (previous, next) => previous.or(next),
             };
             self.last_target = Some(target);
+            self.last_target_anchor_top = Some(anchor_top);
             self.update_region();
         }
         let command = RenderCommand::Snapshot {
             target,
             content: Box::new(self.state.content()),
-            anchor_top: self.effective_anchor_top(),
+            anchor_top,
             generation: self.generation,
         };
         if self.tx.send(command).is_err() && !self.warned_disconnected {
@@ -814,15 +864,19 @@ impl IslandHost {
         }
     }
 
-    fn target_frame(&self, target: LayoutTarget) -> islet_core::island::PillFrame {
+    fn target_frame(
+        &self,
+        target: LayoutTarget,
+        anchor_top: bool,
+    ) -> islet_core::island::PillFrame {
         arrange(
             target.main,
             target.bubble,
             target.gap,
             target.inset,
             WINDOW_LOGICAL_WIDTH,
-            WINDOW_LOGICAL_HEIGHT,
-            self.effective_anchor_top(),
+            self.logical_height,
+            anchor_top,
         )
     }
 
@@ -838,7 +892,10 @@ impl IslandHost {
             WindowRegion::Box(scale_rect(morph.inflate(REGION_MORPH_MARGIN_DP), scale))
         } else {
             let target = self.last_target.unwrap_or(LayoutTarget::HIDDEN);
-            let frame = self.target_frame(target);
+            let anchor_top = self
+                .last_target_anchor_top
+                .unwrap_or_else(|| self.effective_anchor_top());
+            let frame = self.target_frame(target, anchor_top);
             match frame.bounds() {
                 None => WindowRegion::Empty,
                 Some(_) => WindowRegion::Exact {
@@ -1002,22 +1059,18 @@ impl IslandHost {
     }
 
     fn reposition(&mut self) -> WinResult<()> {
-        self.reposition_for(self.state.tucked)?;
+        self.reposition_layout()?;
         self.update_tucked();
         Ok(())
     }
 
-    /// Places the window at the configured edge, or at the bottom while the
-    /// slim bar is shown.
-    fn reposition_for(&mut self, tucked: bool) -> WinResult<()> {
+    /// Places and sizes the window for the configured edge. At the top the
+    /// window spans the whole work area, giving the renderer room to spring
+    /// the pill to the bottom and back.
+    fn reposition_layout(&mut self) -> WinResult<()> {
         let config = read_config(&self.shared);
-        let home = compute_window_layout(&config, self.anchor_top)?;
-        self.home_layout = Some(home);
-        let layout = if tucked && home.anchor_top {
-            compute_window_layout(&config, false)?
-        } else {
-            home
-        };
+        let layout = compute_window_layout(&config, self.anchor_top)?;
+        self.home_layout = Some(layout);
         if self.last_layout == Some(layout) {
             return Ok(());
         }
@@ -1026,14 +1079,35 @@ impl IslandHost {
         self.dpi = layout.dpi;
         self.pixel_width = layout.width as u32;
         self.pixel_height = layout.height as u32;
+        self.logical_height = layout.logical_height;
         let _ = self.tx.send(RenderCommand::Resize {
             width: self.pixel_width,
             height: self.pixel_height,
             dpi: layout.dpi as f32,
+            logical_width: WINDOW_LOGICAL_WIDTH,
+            logical_height: self.logical_height,
         });
         self.region = None;
         self.update_region();
         Ok(())
+    }
+
+    /// Extended style bit that makes the window invisible to the mouse.
+    fn set_click_through(&self, click_through: bool) {
+        // SAFETY: reading and writing this window's own extended style from
+        // the thread that owns it.
+        unsafe {
+            let current = GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE);
+            let flag = WS_EX_TRANSPARENT.0 as isize;
+            let updated = if click_through {
+                current | flag
+            } else {
+                current & !flag
+            };
+            if updated != current {
+                SetWindowLongPtrW(self.hwnd, GWL_EXSTYLE, updated);
+            }
+        }
     }
 
     fn set_fullscreen_hidden(&mut self, hidden: bool) {
@@ -1114,6 +1188,8 @@ impl IslandHost {
             7 => state.done = Some(demo_done()),
             _ => unreachable!(),
         }
+        // Debug: every other step, glides down to the bottom edge.
+        state.tucked = self.demo_dock && step % 2 == 1;
         self.state = state;
         if let Some(demo) = &mut self.demo {
             demo.step = demo.step.wrapping_add(1);
@@ -1329,15 +1405,23 @@ fn apply_command(
             generation: snapshot_generation,
         } => {
             *generation = snapshot_generation;
-            renderer.set_anchor(anchor_top);
-            renderer.set_snapshot(target, *content, clock_now());
+            let now = clock_now();
+            renderer.set_anchor(anchor_top, now);
+            renderer.set_snapshot(target, *content, now);
             *dirty = true;
             false
         }
-        RenderCommand::Resize { width, height, dpi } => {
+        RenderCommand::Resize {
+            width,
+            height,
+            dpi,
+            logical_width,
+            logical_height,
+        } => {
             if let Err(error) = renderer.resize(width, height, dpi) {
                 tracing::error!(%error, "island renderer resize failed");
             }
+            renderer.set_logical_size(logical_width, logical_height);
             *dirty = true;
             false
         }
@@ -1424,16 +1508,19 @@ fn compute_window_layout(config: &Config, anchor_top: bool) -> WinResult<WindowL
     let dpi = dpi_x.max(96);
 
     let width = (WINDOW_LOGICAL_WIDTH * dpi as f32 / 96.0).round() as i32;
-    let height = (WINDOW_LOGICAL_HEIGHT * dpi as f32 / 96.0).round() as i32;
     let work = info.rcWork;
-    let x = work.left + ((work.right - work.left) - width) / 2;
-    // Flush with the work area: the edge gap is drawn by the renderer as an
-    // animatable inset, so the island can dock against the edge.
-    let y = if anchor_top {
-        work.top
+    // At the top the window covers the full work area: the island can then
+    // glide between the top and bottom edges inside one window instead of
+    // teleporting a small window between them. At the bottom there is nowhere
+    // to glide to, so keep the window compact.
+    let (height, y, logical_height) = if anchor_top {
+        let height = (work.bottom - work.top).max(1);
+        (height, work.top, height as f32 * 96.0 / dpi as f32)
     } else {
-        work.bottom - height
+        let height = (WINDOW_LOGICAL_HEIGHT * dpi as f32 / 96.0).round() as i32;
+        (height.max(1), work.bottom - height, WINDOW_LOGICAL_HEIGHT)
     };
+    let x = work.left + ((work.right - work.left) - width) / 2;
 
     Ok(WindowLayout {
         x,
@@ -1442,6 +1529,7 @@ fn compute_window_layout(config: &Config, anchor_top: bool) -> WinResult<WindowL
         height: height.max(1),
         dpi,
         anchor_top,
+        logical_height,
     })
 }
 
