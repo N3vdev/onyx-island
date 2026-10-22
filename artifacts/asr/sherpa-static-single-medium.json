@@ -1,0 +1,19 @@
+﻿{
+  "engine": "sherpa-onnx 1.13.8 + Parakeet TDT v3 INT8 (nemo_transducer)",
+  "load_seconds": 2.041,
+  "model_dir": "C:\\Users\\nevin\\AppData\\Local\\Islet\\models\\sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8",
+  "peak_rss_mib": 807.3,
+  "results": [
+    {
+      "audio_seconds": 15.475,
+      "file": "medium-15s",
+      "inference_seconds": 1.041,
+      "rtf": 0.067,
+      "speedup": 14.87,
+      "text": "Local speech recognition keeps every word on this computer. No audio leaves the device, and the little island above the taskbar shows a live waveform while I speak. When I release the keys, the text appears wherever my cursor is.",
+      "wer": null
+    }
+  ],
+  "threads": 4,
+  "working_set_mib": 804.8
+}

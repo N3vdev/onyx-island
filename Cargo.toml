@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/islet-core",
+    "crates/islet-app",
+    "crates/islet-asr",
+    "crates/asr-bench-sherpa",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://example.invalid/islet"
+
+[workspace.dependencies]
+crossbeam-channel = "0.5"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+tracing = "0.1"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = 3
+panic = "abort"
+strip = true

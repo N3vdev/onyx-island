@@ -1,0 +1,26 @@
+[package]
+name = "islet-asr"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name = "islet_asr"
+path = "src/lib.rs"
+
+[[bin]]
+name = "asr-bench"
+path = "src/bin/asr-bench.rs"
+
+[dependencies]
+ort = "=2.0.0-rc.15"
+hound = "3.5"
+serde = { workspace = true, features = ["derive"] }
+serde_json = "1"
+tracing.workspace = true
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+] }

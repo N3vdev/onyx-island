@@ -1,0 +1,19 @@
+﻿{
+  "engine": "sherpa-onnx 1.13.8 + Parakeet TDT v3 INT8 (nemo_transducer)",
+  "load_seconds": 2.019,
+  "model_dir": "C:\\Users\\nevin\\AppData\\Local\\Islet\\models\\sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8",
+  "peak_rss_mib": 729.8,
+  "results": [
+    {
+      "audio_seconds": 4.38,
+      "file": "short-5s",
+      "inference_seconds": 0.366,
+      "rtf": 0.083,
+      "speedup": 11.98,
+      "text": "The quick brown fox jumps over the lazy dog near the river bank.",
+      "wer": null
+    }
+  ],
+  "threads": 4,
+  "working_set_mib": 729.8
+}

@@ -1,0 +1,37 @@
+﻿{
+  "engine": "sherpa-onnx 1.13.8 + Parakeet TDT v3 INT8 (nemo_transducer)",
+  "load_seconds": 1.775,
+  "model_dir": "C:\\Users\\nevin\\AppData\\Local\\Islet\\models\\sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8",
+  "peak_rss_mib": 1224.7,
+  "results": [
+    {
+      "audio_seconds": 4.38,
+      "file": "short-5s",
+      "inference_seconds": 0.596,
+      "rtf": 0.136,
+      "speedup": 7.35,
+      "text": "The quick brown fox jumps over the lazy dog near the river bank.",
+      "wer": 0.0
+    },
+    {
+      "audio_seconds": 15.475,
+      "file": "medium-15s",
+      "inference_seconds": 2.123,
+      "rtf": 0.137,
+      "speedup": 7.29,
+      "text": "Local speech recognition keeps every word on this computer. No audio leaves the device, and the little island above the taskbar shows a live waveform while I speak. When I release the keys, the text appears wherever my cursor is.",
+      "wer": 0.0
+    },
+    {
+      "audio_seconds": 55.3,
+      "file": "long-60s",
+      "inference_seconds": 8.574,
+      "rtf": 0.155,
+      "speedup": 6.45,
+      "text": "Dorothy lived in the midst of the great Kansas Prairies, with Uncle Henry, who was a farmer, and Aunt M, who was the farmer's wife. Their house was small, for the lumber to build it had to be carried by wagon many miles. There were four walls, a floor, and a roof, which made one room, and this room contained a rusty looking cook stove, a cupboard for the dishes, a table, three or four chair, and the beds. Uncle Henry and Aunt M had a big bed in one corner, and Dorothy a little bed in another. There was no garret at all, and no cellar except a small hole dug in the ground, called a cyclone cellar, where the family could go in case one of those great whirlwinds arose, mighty enough to crush any building in its path. It was reached by a trapdoor in the middle of the floor, from which a ladder led down into the small, dark hole.",
+      "wer": 0.0427
+    }
+  ],
+  "threads": 1,
+  "working_set_mib": 1214.9
+}

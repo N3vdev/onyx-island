@@ -1,0 +1,19 @@
+﻿{
+  "engine": "ort 2.0.0-rc.15 + Parakeet TDT v3 INT8 (greedy TDT)",
+  "load_seconds": 2.688,
+  "model_dir": "C:\\Users\\nevin\\AppData\\Local\\Islet\\models\\parakeet-tdt-0.6b-v3-int8",
+  "peak_rss_mib": 732.5,
+  "results": [
+    {
+      "audio_seconds": 4.38,
+      "file": "short-5s",
+      "inference_seconds": 0.232,
+      "rtf": 0.053,
+      "speedup": 18.88,
+      "text": "The quick brown fox jumps over the lazy dog near the river bank.",
+      "wer": null
+    }
+  ],
+  "threads": 4,
+  "working_set_mib": 732.5
+}
