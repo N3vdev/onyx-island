@@ -47,11 +47,13 @@ impl SpringParams {
         response: 0.25,
         damping: 0.55,
     };
-    /// Travelling between the top and bottom screen edges. Smooth and only
-    /// very slightly springy, so it never looks like it bounces off an edge.
+    /// Travelling between the top and bottom screen edges. The island spends
+    /// the first half of the travel gathering into a leaf and slipping through
+    /// the edge it leaves, and the second half growing back out of the other
+    /// edge, so this is slower than a straight glide would be.
     pub const DOCK: Self = Self {
-        response: 0.50,
-        damping: 0.92,
+        response: 0.85,
+        damping: 0.90,
     };
 
     #[must_use]

@@ -564,3 +564,95 @@ check runs only when a top-level window moves, resizes, shows, hides, cloaks or
 takes the foreground. Turning the music filter's UI Automation tab reading off
 did not change the numbers (6.05% vs 4.88% of one core), so the tab scans are
 not a factor.
+
+## Docking as a droplet, not a glide (user request, 2026-10-22)
+
+The user rejected the straight top-to-bottom slide. The island must gather into
+a leaf, slip through the edge it is leaving, and grow back out of the other
+edge in the same shape, mirrored, and it has to feel premium without costing
+anything at rest. Still the native Rust/Win32/D2D/DComp stack, no new
+dependencies.
+
+**One phase, two edges.** The travel is the existing normalized `anchor` spring
+(0 = top, 1 = bottom) read as a phase rather than a position. `t < 0.5` draws
+the pill at the top edge with `fullness = 1 - t/0.5`; `t > 0.5` draws it at the
+bottom edge with `fullness = (t - 0.5)/0.5`. At `t = 0.5` both copies are
+invisible, so the handoff cannot pop - and retargeting mid-flight simply runs
+the same curve backwards, mirrored, so an interrupted dock reverses instead of
+jumping.
+
+**The shape.** Every outline point of the squircle is pulled toward the centre
+line by `1 - taper * reach^1.15`, where `reach` is the distance from the edge
+the island is leaving (0 at that edge, 1 at the far end). `taper` and the two
+size factors come from `droplet_shape(fullness)`:
+
+- a **gather** (`smoothstep(0, 0.42, 1 - fullness)`) narrows the width to 34%
+  and the height to 78% while `taper` goes 0 -> 0.97: the pill becomes a leaf;
+- a **press** (`smoothstep(0.30, 1.0, 1 - fullness)`) then flattens the height
+  to 0 and narrows the width by a further 46%, so the tail disappears into the
+  edge.
+
+The power profile was chosen after comparing 1.0 / 1.15 / 1.35 / 1.6 and an
+elliptical profile at real travel sizes (`droplet/profiles.png`): 1.0 reads as
+a guitar pick, 1.6 as a shield with a keel, 1.15 as a plump droplet whose sides
+leave the round end tangentially and keep bending to a point. The squircle's
+straight sides are sampled into 12 segments before warping - warping only the
+corners would leave a trapezoid - and the resulting path is cached by (size,
+corner, taper, edge) with 128 entries, so a dock never evicts the resting
+pills.
+
+**Flush with the surface.** While it is being pressed through, the island sits
+exactly on the screen edge; the resting 8 dp inset only returns at the very end
+of the re-form:
+
+`gap = inset * smoothstep(0.70, 1.0, fullness)`
+
+An earlier version scaled the gap with the shape's *fraction*, which let the
+drop detach from the edge mid-flight whenever the target size differed (an
+expanded card docking into a compact pill). Tying it to the phase keeps the
+whole flight flush and lifts the pill onto its inset as it settles; sampled
+window frames show `y = 0` at the top and `y + h = 1080` at the bottom for the
+entire press.
+
+**Alpha.** The shell and the card dissolve on separate windows:
+
+`shell_alpha = smoothstep(0.05, 0.45, fullness)`
+`content_alpha = smoothstep(0.50, 0.92, fullness)`
+
+so the card's content is gone before the leaf is fully pressed, and it comes
+back only as the pill re-forms.
+
+**Content clipped to the droplet.** A rectangular clip let album art and text
+peek outside the tapered silhouette for ~100 ms per half. The content is now
+drawn through a D2D layer whose geometric mask is the same path the shell is
+filled with (`PushLayer` + `D2D1_LAYER_PARAMETERS1.geometricMask`, one reusable
+`ID2D1Layer`, only while `taper > 0`). Window-only PrintWindow frames confirm
+the artwork ends exactly on the leaf's edge (`droplet/pw-absorb.png`,
+`droplet/pw-emerge.png`).
+
+**Pacing.** `SpringParams::DOCK` moved from response 0.50 / damping 0.92 to
+0.85 / 0.90: a 0.55 s straight glide had no room for a gather and a re-form.
+Measured from the animator at 120 Hz:
+
+| | |
+|---|---|
+| visible gather (leaf 71x25 at 117 ms) | 0 - 210 ms |
+| handoff, both edges invisible | ~208 ms |
+| visible re-form | 225 - 700 ms |
+| geometry back to a full pill | ~825 ms |
+| click-through released as the anchor settles | ~880 ms |
+
+The asymmetry is deliberate: a quick suck into the edge, a slower and gentler
+re-form. Both directions play the same shape; the 9 s demo flight
+(top-to-bottom, shrinking) was captured to confirm the mirrored half.
+
+**Verification.** 13 renderer unit tests (including the mirror and the flush
+edge), `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt
+--check`, and window-only PrintWindow captures of four demo flights.
+
+Cost, release build on a 12-core machine: the demo cycle - live bars plus four
+flights in 12 s - averages 10.2% of one core (0.85% of the machine); the same
+state without flights is 3.7% of one core, so a flight is roughly 0.2 s of CPU
+spread over 0.9 s (and the demo's flights also relayout a card that changes
+size). Idle remains 0.000% of one core, and the mask layer only exists while
+the shell is tapered.

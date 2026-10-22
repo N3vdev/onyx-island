@@ -9,6 +9,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
+use std::mem::ManuallyDrop;
 use std::sync::{Arc, Mutex};
 
 use islet_core::geometry::{point_in_rounded_rect, Rect};
@@ -27,14 +28,15 @@ use windows::Win32::Graphics::Direct2D::Common::{
 };
 use windows::Win32::Graphics::Direct2D::{
     CLSID_D2D1GaussianBlur, D2D1CreateDevice, ID2D1Bitmap1, ID2D1BitmapBrush1, ID2D1Brush,
-    ID2D1Device, ID2D1DeviceContext, ID2D1Effect, ID2D1Factory1, ID2D1Image, ID2D1PathGeometry1,
-    ID2D1SolidColorBrush, ID2D1StrokeStyle, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
-    D2D1_BITMAP_BRUSH_PROPERTIES1, D2D1_BITMAP_OPTIONS, D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
-    D2D1_BITMAP_OPTIONS_NONE, D2D1_BITMAP_OPTIONS_TARGET, D2D1_BITMAP_PROPERTIES1,
-    D2D1_DEVICE_CONTEXT_OPTIONS_NONE, D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_ELLIPSE,
-    D2D1_EXTEND_MODE_CLAMP, D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION,
+    ID2D1Device, ID2D1DeviceContext, ID2D1Effect, ID2D1Factory1, ID2D1Geometry, ID2D1Image,
+    ID2D1Layer, ID2D1PathGeometry1, ID2D1SolidColorBrush, ID2D1StrokeStyle,
+    D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_BITMAP_BRUSH_PROPERTIES1, D2D1_BITMAP_OPTIONS,
+    D2D1_BITMAP_OPTIONS_CANNOT_DRAW, D2D1_BITMAP_OPTIONS_NONE, D2D1_BITMAP_OPTIONS_TARGET,
+    D2D1_BITMAP_PROPERTIES1, D2D1_DEVICE_CONTEXT_OPTIONS_NONE, D2D1_DRAW_TEXT_OPTIONS_CLIP,
+    D2D1_ELLIPSE, D2D1_EXTEND_MODE_CLAMP, D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION,
     D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, D2D1_INTERPOLATION_MODE_LINEAR,
-    D2D1_PROPERTY_TYPE_FLOAT, D2D1_ROUNDED_RECT, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
+    D2D1_LAYER_OPTIONS1_NONE, D2D1_LAYER_PARAMETERS1, D2D1_PROPERTY_TYPE_FLOAT, D2D1_ROUNDED_RECT,
+    D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
 };
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0};
 use windows::Win32::Graphics::Direct3D11::{
@@ -290,9 +292,7 @@ impl Renderer {
 
     #[must_use]
     pub fn needs_frame(&self, now: f64) -> bool {
-        !self
-            .animator
-            .is_settled(now, f64::from(self.logical_height))
+        !self.animator.is_settled(now)
             || self.transition_progress(now).is_some()
             || self.content.animates()
             || self
@@ -305,10 +305,7 @@ impl Renderer {
     /// These need every vblank; content-only animation can be throttled.
     #[must_use]
     pub fn is_morphing(&self, now: f64) -> bool {
-        !self
-            .animator
-            .is_settled(now, f64::from(self.logical_height))
-            || self.transition_progress(now).is_some()
+        !self.animator.is_settled(now) || self.transition_progress(now).is_some()
     }
 
     #[must_use]
@@ -321,9 +318,7 @@ impl Renderer {
             && !self.target.visible
             && self.content.is_empty()
             && self.previous_content.is_none()
-            && self
-                .animator
-                .is_settled(now, f64::from(self.logical_height))
+            && self.animator.is_settled(now)
         {
             self.clear_hit_region();
             return Ok(());
@@ -400,9 +395,7 @@ impl Renderer {
         (self.gfx.is_some()
             && self.previous_content.is_none()
             && self.transition_progress(now).is_none()
-            && self
-                .animator
-                .is_settled(now, f64::from(self.logical_height)))
+            && self.animator.is_settled(now))
         .then(|| (hidden_since + GRAPHICS_RELEASE_DELAY - now).max(0.0))
     }
 
@@ -424,25 +417,7 @@ impl Renderer {
     }
 
     fn frame_geometry(&self, sample: &Sample) -> FrameGeometry {
-        let frame = arrange_at(
-            PillSize::new(sample.main_width, sample.main_height, sample.main_corner),
-            Some(PillSize::new(
-                sample.bubble_width,
-                sample.bubble_height,
-                sample.bubble_corner,
-            )),
-            sample.gap,
-            sample.inset,
-            self.logical_width,
-            self.logical_height,
-            sample.anchor,
-        );
-        FrameGeometry {
-            main: frame.main,
-            main_corner: frame.main_corner,
-            bubble: frame.bubble,
-            bubble_corner: frame.bubble_corner,
-        }
+        droplet_geometry(sample, self.logical_width, self.logical_height)
     }
 
     fn publish_hit(&self, geometry: &FrameGeometry) {
@@ -615,11 +590,10 @@ impl Animator {
         }
     }
 
-    /// The anchor is normalized, so its settle threshold is scaled back into
-    /// logical pixels; otherwise 0.25 (25% of the screen) would settle the
-    /// travel while it was still visibly moving.
-    fn is_settled(&self, now: f64, logical_height: f64) -> bool {
-        let travel = logical_height.max(1.0);
+    /// The anchor is the droplet phase, so it settles on the *visual* scale:
+    /// a hundredth of the phase is only a few tenths of a pixel of shape once
+    /// the pill is back at an edge.
+    fn is_settled(&self, now: f64) -> bool {
         self.main_width.is_settled(now)
             && self.main_height.is_settled(now)
             && self.main_corner.is_settled(now)
@@ -630,9 +604,15 @@ impl Animator {
             && self.inset.is_settled(now)
             && self
                 .anchor
-                .is_settled_with(now, 0.25 / travel, 1.0 / travel)
+                .is_settled_with(now, TRAVEL_SETTLE_PHASE, TRAVEL_SETTLE_VELOCITY)
     }
 }
+
+/// Within a hundredth of an edge, the pill is less than half a pixel short of
+/// its resting shape.
+const TRAVEL_SETTLE_PHASE: f64 = 0.012;
+/// ...and moving slowly enough that another frame would not change a pixel.
+const TRAVEL_SETTLE_VELOCITY: f64 = 0.012;
 
 fn retarget(spring: &mut Spring, target: f64, params: SpringParams, now: f64) {
     spring.set_params(params, now);
@@ -655,6 +635,146 @@ struct FrameGeometry {
     main_corner: f32,
     bubble: Option<Rect>,
     bubble_corner: f32,
+    /// 0 for the plain squircle, 1 for a leaf whose inner end has drawn to a
+    /// point. Both pills share it: the whole group narrows into one shape.
+    taper: f32,
+    /// Which window edge the leaf's round end sits against (true = the top).
+    taper_top: bool,
+    /// Shell and content opacity. Both are 1 at rest; a traveling island
+    /// dissolves its content first and its shell last.
+    shell_alpha: f32,
+    content_alpha: f32,
+}
+
+/// The island's flight between the two edges.
+///
+/// The anchor is the phase, not a position: from `0` to `0.5` the pill is
+/// drawn at the top edge, being absorbed as the anchor moves away from that
+/// edge; from `0.5` to `1` it grows back out of the bottom edge. Exactly at
+/// `0.5` both are invisible, so the handoff cannot be seen - and running the
+/// anchor backwards plays the whole thing mirrored, which is what makes an
+/// interrupted docking reverse smoothly.
+///
+/// `fullness` is 1 for the resting pill at an edge and 0 for a pill that has
+/// completely slipped through it.
+fn droplet_geometry(sample: &Sample, window_width: f32, window_height: f32) -> FrameGeometry {
+    let anchor = sample.anchor.clamp(0.0, 1.0);
+    let (top, fullness) = if anchor <= 0.5 {
+        (true, 1.0 - anchor / 0.5)
+    } else {
+        (false, (anchor - 0.5) / 0.5)
+    };
+    let frame = arrange_at(
+        PillSize::new(sample.main_width, sample.main_height, sample.main_corner),
+        Some(PillSize::new(
+            sample.bubble_width,
+            sample.bubble_height,
+            sample.bubble_corner,
+        )),
+        sample.gap,
+        sample.inset,
+        window_width,
+        window_height,
+        if top { 0.0 } else { 1.0 },
+    );
+    if fullness >= 1.0 {
+        return FrameGeometry {
+            main: frame.main,
+            main_corner: frame.main_corner,
+            bubble: frame.bubble,
+            bubble_corner: frame.bubble_corner,
+            taper: 0.0,
+            taper_top: top,
+            shell_alpha: 1.0,
+            content_alpha: 1.0,
+        };
+    }
+    let (height, width, taper) = droplet_shape(fullness);
+    // At rest the island sits on its inset. As soon as it starts to gather it
+    // presses onto the screen edge, and it only lifts back onto the inset at
+    // the very end of the re-form, so the whole flight is flush with the
+    // surface it passes through.
+    let gap_scale = smoothstep(0.70, 1.0, fullness);
+    let main = squeeze(
+        frame.main,
+        height,
+        width,
+        top,
+        window_width,
+        window_height,
+        gap_scale,
+    );
+    let bubble = frame.bubble.map(|bubble| {
+        squeeze(
+            bubble,
+            height,
+            width,
+            top,
+            window_width,
+            window_height,
+            gap_scale,
+        )
+    });
+    FrameGeometry {
+        main,
+        main_corner: frame.main_corner,
+        bubble,
+        bubble_corner: frame.bubble_corner,
+        taper,
+        taper_top: top,
+        shell_alpha: smoothstep(0.05, 0.45, fullness),
+        content_alpha: smoothstep(0.50, 0.92, fullness),
+    }
+}
+
+/// Height, width and leaf taper of the traveling pill, as fractions of its
+/// resting size. It first gathers into a leaf (mostly losing width), then is
+/// pressed flat into the edge, so it slips through as a droplet rather than a
+/// shrunken pill.
+fn droplet_shape(fullness: f32) -> (f32, f32, f32) {
+    let absorbed = 1.0 - fullness.clamp(0.0, 1.0);
+    let gather = smoothstep(0.0, 0.42, absorbed);
+    let press = smoothstep(0.30, 1.0, absorbed);
+    let width = (1.0 - 0.66 * gather) * (1.0 - 0.46 * press);
+    let height = (1.0 - 0.22 * gather) * (1.0 - press);
+    (height, width, 0.97 * gather)
+}
+
+/// Squeezes a frame toward `window_edge` (the top or bottom of the window), so
+/// the pill's inner edge sweeps into that edge while its outer edge stays put.
+/// `gap_scale` collapses the resting inset; it is 0 for the whole flight and
+/// only returns to 1 as the pill settles back onto its inset.
+fn squeeze(
+    rect: Rect,
+    height: f32,
+    width: f32,
+    top: bool,
+    window_width: f32,
+    window_height: f32,
+    gap_scale: f32,
+) -> Rect {
+    let center = window_width * 0.5;
+    let gap = if top {
+        rect.y
+    } else {
+        window_height - rect.y - rect.height
+    } * gap_scale;
+    let y = if top {
+        gap
+    } else {
+        window_height - rect.height * height - gap
+    };
+    Rect::new(
+        center + (rect.x - center) * width,
+        y,
+        rect.width * width,
+        rect.height * height,
+    )
+}
+
+fn smoothstep(edge0: f32, edge1: f32, value: f32) -> f32 {
+    let t = ((value - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
 }
 
 struct Gfx {
@@ -674,6 +794,7 @@ struct Gfx {
     text_cache: TextCache,
     geometries: GeometryCache,
     content_layers: Option<[ContentLayer; 2]>,
+    mask_layer: Option<ID2D1Layer>,
     art: Vec<(u64, ID2D1BitmapBrush1)>,
     bar_levels: Option<[f32; BAR_COUNT]>,
     pixel_width: u32,
@@ -826,6 +947,7 @@ impl Gfx {
             text_cache: TextCache::new(),
             geometries: GeometryCache::new(),
             content_layers: None,
+            mask_layer: None,
             art: Vec::with_capacity(ART_CACHE_SIZE),
             bar_levels: None,
             pixel_width: config.pixel_width,
@@ -838,6 +960,7 @@ impl Gfx {
         // ResizeBuffers fails while any reference to a back buffer remains.
         // Clear the D2D target and release our bitmap first.
         self.content_layers = None;
+        self.mask_layer = None;
         self.dc.SetTarget(None::<&ID2D1Image>);
         self._bitmap = None;
         self.swap_chain.ResizeBuffers(
@@ -875,20 +998,24 @@ impl Gfx {
             self.draw_pill(
                 geometry.main,
                 geometry.main_corner,
-                pill_alpha(geometry.main, target.visible),
+                pill_alpha(geometry.main, target.visible) * geometry.shell_alpha,
+                geometry.taper,
+                geometry.taper_top,
             )?;
             if let Some(bubble) = geometry.bubble {
                 if bubble.width >= 0.5 && bubble.height >= 0.5 {
                     self.draw_pill(
                         bubble,
                         geometry.bubble_corner,
-                        pill_alpha(bubble, target.visible),
+                        pill_alpha(bubble, target.visible) * geometry.shell_alpha,
+                        geometry.taper,
+                        geometry.taper_top,
                     )?;
                 }
             }
 
             if !transitioning {
-                self.draw_snapshot(now, geometry, content, 1.0, 1.0)?;
+                self.draw_snapshot(now, geometry, content, geometry.content_alpha, 1.0)?;
             }
         }
 
@@ -944,12 +1071,13 @@ impl Gfx {
 
         let old_ease = ease_out(progress);
         let new_ease = ease_out(((progress - 0.08) / 0.92).clamp(0.0, 1.0));
+        let content_alpha = geometry.content_alpha;
         self.render_content_layer(
             &old_bitmap,
             now,
             geometry,
             previous,
-            1.0 - old_ease,
+            (1.0 - old_ease) * content_alpha,
             1.0 - 0.055 * old_ease,
         )?;
         self.render_content_layer(
@@ -957,7 +1085,7 @@ impl Gfx {
             now,
             geometry,
             content,
-            new_ease,
+            new_ease * content_alpha,
             0.945 + 0.055 * new_ease,
         )?;
 
@@ -1039,7 +1167,14 @@ impl Gfx {
         Ok(())
     }
 
-    unsafe fn draw_pill(&mut self, rect: Rect, corner: f32, alpha: f32) -> RenderResult<()> {
+    unsafe fn draw_pill(
+        &mut self,
+        rect: Rect,
+        corner: f32,
+        alpha: f32,
+        taper: f32,
+        taper_top: bool,
+    ) -> RenderResult<()> {
         if alpha <= 0.001 {
             return Ok(());
         }
@@ -1048,6 +1183,8 @@ impl Gfx {
             rect.width,
             rect.height,
             corner.min(rect.width * 0.5).min(rect.height * 0.5),
+            taper,
+            taper_top,
         )?;
         self.dc
             .SetTransform(&Matrix3x2::translation(rect.x, rect.y));
@@ -1085,6 +1222,8 @@ impl Gfx {
                 accent,
                 alpha,
                 scale,
+                geometry.taper,
+                geometry.taper_top,
             )?;
         }
         if let (Some(bubble), Some(card)) = (geometry.bubble, &content.secondary) {
@@ -1096,6 +1235,8 @@ impl Gfx {
                 accent,
                 alpha,
                 scale,
+                geometry.taper,
+                geometry.taper_top,
             )?;
         }
         Ok(())
@@ -1111,6 +1252,8 @@ impl Gfx {
         accent: [u8; 3],
         alpha: f32,
         scale: f32,
+        taper: f32,
+        taper_top: bool,
     ) -> RenderResult<()> {
         if rect.width < 1.0 || rect.height < 1.0 || alpha <= 0.001 {
             return Ok(());
@@ -1121,8 +1264,42 @@ impl Gfx {
             right: rect.right(),
             bottom: rect.bottom(),
         };
-        self.dc
-            .PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+        // While the pill is gathered into a droplet, a rectangle clip would let
+        // the card peek outside the tapered silhouette. Mask the content with
+        // the same outline the shell is drawn with, so text and artwork end
+        // exactly at the leaf's edge.
+        let mut mask = None;
+        if taper > 0.001 {
+            let outline: ID2D1Geometry = self
+                .geometries
+                .get(
+                    &self.factory,
+                    rect.width,
+                    rect.height,
+                    corner.min(rect.width * 0.5).min(rect.height * 0.5),
+                    taper,
+                    taper_top,
+                )?
+                .cast()?;
+            if self.mask_layer.is_none() {
+                self.mask_layer = Some(self.dc.CreateLayer(None)?);
+            }
+            mask = Some(D2D1_LAYER_PARAMETERS1 {
+                contentBounds: clip,
+                geometricMask: ManuallyDrop::new(Some(outline)),
+                maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                maskTransform: Matrix3x2::translation(rect.x, rect.y),
+                opacity: 1.0,
+                layerOptions: D2D1_LAYER_OPTIONS1_NONE,
+                ..Default::default()
+            });
+        }
+        if let (Some(params), Some(layer)) = (&mask, &self.mask_layer) {
+            self.dc.PushLayer(params, layer);
+        } else {
+            self.dc
+                .PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+        }
         let center = Vector2 {
             X: rect.width * 0.5,
             Y: rect.height * 0.5,
@@ -1130,10 +1307,17 @@ impl Gfx {
         let transform =
             Matrix3x2::scale_around(scale, scale, center) * Matrix3x2::translation(rect.x, rect.y);
         self.dc.SetTransform(&transform);
-        self.draw_card(now, rect.width, rect.height, corner, card, accent, alpha)?;
+        let drawn = self.draw_card(now, rect.width, rect.height, corner, card, accent, alpha);
         self.dc.SetTransform(&Matrix3x2::identity());
-        self.dc.PopAxisAlignedClip();
-        Ok(())
+        if let Some(params) = &mut mask {
+            self.dc.PopLayer();
+            // `PushLayer` wraps the interfaces in `ManuallyDrop`; release the
+            // reference we handed it now that the layer has been popped.
+            ManuallyDrop::drop(&mut params.geometricMask);
+        } else {
+            self.dc.PopAxisAlignedClip();
+        }
+        drawn
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2362,9 +2546,18 @@ impl TextCache {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct GeometryKey {
+    width: u32,
+    height: u32,
+    corner: u32,
+    taper: u32,
+    top: bool,
+}
+
 struct GeometryCache {
-    entries: HashMap<(u32, u32, u32), ID2D1PathGeometry1>,
-    order: VecDeque<(u32, u32, u32)>,
+    entries: HashMap<GeometryKey, ID2D1PathGeometry1>,
+    order: VecDeque<GeometryKey>,
 }
 
 impl GeometryCache {
@@ -2375,22 +2568,41 @@ impl GeometryCache {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     unsafe fn get(
         &mut self,
         factory: &ID2D1Factory1,
         width: f32,
         height: f32,
         corner: f32,
+        taper: f32,
+        taper_top: bool,
     ) -> RenderResult<ID2D1PathGeometry1> {
         let qw = ((width * 4.0).round() as u32).max(1);
         let qh = ((height * 4.0).round() as u32).max(1);
-        let qr = (corner * 4.0).round() as u32;
-        let key = (qw, qh, qr);
+        let qr = ((corner.max(0.0).min(width * 0.5).min(height * 0.5) * 4.0).round()) as u32;
+        let qt = (taper.clamp(0.0, 1.0) * 512.0).round() as u32;
+        let key = GeometryKey {
+            width: qw,
+            height: qh,
+            corner: qr,
+            taper: qt,
+            top: taper_top && qt > 0,
+        };
         if let Some(geometry) = self.entries.get(&key) {
             return Ok(geometry.clone());
         }
-        let geometry = create_squircle(factory, qw as f32 / 4.0, qh as f32 / 4.0, qr as f32 / 4.0)?;
-        if self.entries.len() >= 64 {
+        let geometry = create_squircle(
+            factory,
+            qw as f32 / 4.0,
+            qh as f32 / 4.0,
+            qr as f32 / 4.0,
+            qt as f32 / 512.0,
+            key.top,
+        )?;
+        // The travel animates through dozens of distinct sizes, so keep enough
+        // entries that a dock does not evict every resting pill.
+        if self.entries.len() >= 128 {
             if let Some(oldest) = self.order.pop_front() {
                 self.entries.remove(&oldest);
             }
@@ -2401,85 +2613,80 @@ impl GeometryCache {
     }
 }
 
+/// The island's outline: a squircle that can also draw itself together into a
+/// leaf. With `taper` at 0 it is the plain rounded pill. As `taper` approaches
+/// 1 every point is pulled toward the centre line in proportion to how far it
+/// is from the `top` edge, so the end against that edge stays full and round
+/// while the far end narrows into a droplet's tail.
 unsafe fn create_squircle(
     factory: &ID2D1Factory1,
     width: f32,
     height: f32,
     corner: f32,
+    taper: f32,
+    top: bool,
 ) -> RenderResult<ID2D1PathGeometry1> {
     let width = width.max(1.0);
     let height = height.max(1.0);
     let radius = corner.max(0.0).min(width * 0.5).min(height * 0.5);
     let control = radius * 0.48;
+    let warp = |point: Vector2| {
+        if taper <= 0.0 {
+            return point;
+        }
+        let reach = if top {
+            point.Y / height
+        } else {
+            (height - point.Y) / height
+        }
+        .clamp(0.0, 1.0);
+        // A gentle power curve: the sides leave the round end tangentially and
+        // keep bending all the way to the tail, so the silhouette is a plump
+        // droplet instead of a shield with a keel.
+        let scale = 1.0 - taper * reach.powf(1.15);
+        Vector2 {
+            X: width * 0.5 + (point.X - width * 0.5) * scale,
+            Y: point.Y,
+        }
+    };
+    let point = |x: f32, y: f32| warp(Vector2 { X: x, Y: y });
+    // The sides must be sampled: warping a straight line's endpoints alone
+    // would leave a trapezoid instead of a droplet's curve.
+    let side = |x: f32, from_y: f32, to_y: f32| {
+        let mut points = Vec::with_capacity(12);
+        for step in 1..=12 {
+            let t = step as f32 / 12.0;
+            points.push(point(x, from_y + (to_y - from_y) * t));
+        }
+        points
+    };
     let geometry = factory.CreatePathGeometry()?;
     let sink = geometry.Open()?;
     sink.SetFillMode(D2D1_FILL_MODE_WINDING);
-    sink.BeginFigure(Vector2 { X: radius, Y: 0.0 }, D2D1_FIGURE_BEGIN_FILLED);
-    sink.AddLines(&[Vector2 {
-        X: width - radius,
-        Y: 0.0,
-    }]);
+    sink.BeginFigure(point(radius, 0.0), D2D1_FIGURE_BEGIN_FILLED);
+    sink.AddLines(&[point(width - radius, 0.0)]);
     sink.AddBeziers(&[D2D1_BEZIER_SEGMENT {
-        point1: Vector2 {
-            X: width - radius + control,
-            Y: 0.0,
-        },
-        point2: Vector2 {
-            X: width,
-            Y: radius - control,
-        },
-        point3: Vector2 {
-            X: width,
-            Y: radius,
-        },
+        point1: point(width - radius + control, 0.0),
+        point2: point(width, radius - control),
+        point3: point(width, radius),
     }]);
-    sink.AddLines(&[Vector2 {
-        X: width,
-        Y: height - radius,
-    }]);
+    sink.AddLines(&side(width, radius, height - radius));
     sink.AddBeziers(&[D2D1_BEZIER_SEGMENT {
-        point1: Vector2 {
-            X: width,
-            Y: height - radius + control,
-        },
-        point2: Vector2 {
-            X: width - radius + control,
-            Y: height,
-        },
-        point3: Vector2 {
-            X: width - radius,
-            Y: height,
-        },
+        point1: point(width, height - radius + control),
+        point2: point(width - radius + control, height),
+        point3: point(width - radius, height),
     }]);
-    sink.AddLines(&[Vector2 {
-        X: radius,
-        Y: height,
-    }]);
+    sink.AddLines(&[point(radius, height)]);
     sink.AddBeziers(&[D2D1_BEZIER_SEGMENT {
-        point1: Vector2 {
-            X: radius - control,
-            Y: height,
-        },
-        point2: Vector2 {
-            X: 0.0,
-            Y: height - radius + control,
-        },
-        point3: Vector2 {
-            X: 0.0,
-            Y: height - radius,
-        },
+        point1: point(radius - control, height),
+        point2: point(0.0, height - radius + control),
+        point3: point(0.0, height - radius),
     }]);
-    sink.AddLines(&[Vector2 { X: 0.0, Y: radius }]);
+    sink.AddLines(&side(0.0, height - radius, radius));
     sink.AddBeziers(&[D2D1_BEZIER_SEGMENT {
-        point1: Vector2 {
-            X: 0.0,
-            Y: radius - control,
-        },
-        point2: Vector2 {
-            X: radius - control,
-            Y: 0.0,
-        },
-        point3: Vector2 { X: radius, Y: 0.0 },
+        point1: point(0.0, radius - control),
+        point2: point(radius - control, 0.0),
+        point3: point(radius, 0.0),
     }]);
     sink.EndFigure(D2D1_FIGURE_END_CLOSED);
     sink.Close()?;
@@ -2563,16 +2770,16 @@ mod tests {
     }
 
     #[test]
-    fn anchor_spring_glides_between_edges_and_settles_at_the_target() {
+    fn anchor_spring_carries_the_pill_between_edges_and_settles() {
         // Created hidden, like the renderer does: everything starts at rest,
         // docked at the top edge.
         let mut animator = Animator::new(LayoutTarget::HIDDEN, 0.0, 0.0);
-        assert!(animator.is_settled(0.0, 1000.0), "starts settled");
+        assert!(animator.is_settled(0.0), "starts settled");
         assert_eq!(animator.sample(0.0).anchor, 0.0, "starts at the top edge");
 
-        // Show the pill and let the shape finish before testing the glide.
+        // Show the pill and let the shape finish before testing the travel.
         animator.set_target(LayoutTarget::single(islet_core::island::COMPACT), 0.0);
-        assert!(animator.is_settled(2.0, 1000.0));
+        assert!(animator.is_settled(2.0));
 
         // Dock at the bottom.
         animator.set_anchor(false, 2.0);
@@ -2581,22 +2788,160 @@ mod tests {
         let late = animator.sample(2.60).anchor;
         assert!(
             early > 0.0 && early < middle && middle < late,
-            "the anchor should move steadily: {early} {middle} {late}"
+            "the phase should move steadily: {early} {middle} {late}"
         );
         assert!(
-            !animator.is_settled(2.30, 1000.0),
+            !animator.is_settled(2.30),
             "mid-travel must not report settled"
         );
-        assert!(animator.is_settled(4.0, 1000.0));
+        assert!(animator.is_settled(3.2), "travel settles in about a second");
         assert!(
-            (animator.sample(4.0).anchor - 1.0).abs() < 0.01,
-            "the anchor should arrive at the bottom edge"
+            (animator.sample(3.2).anchor - 1.0).abs() < 0.012,
+            "the phase should arrive at the bottom edge"
         );
 
         // And back to the top, preserving the motion.
-        animator.set_anchor(true, 4.0);
-        assert!(!animator.is_settled(4.05, 1000.0));
-        assert!(animator.is_settled(6.0, 1000.0));
-        assert!((animator.sample(6.0).anchor).abs() < 0.01);
+        animator.set_anchor(true, 3.2);
+        assert!(!animator.is_settled(3.25));
+        assert!(animator.is_settled(4.4));
+        assert!((animator.sample(4.4).anchor).abs() < 0.012);
+    }
+
+    fn sample_at(anchor: f32) -> Sample {
+        Sample {
+            main_width: 220.0,
+            main_height: 36.0,
+            main_corner: 18.0,
+            bubble_width: 0.0,
+            bubble_height: 0.0,
+            bubble_corner: 0.0,
+            gap: 0.0,
+            inset: 8.0,
+            anchor,
+        }
+    }
+
+    fn geometry_at(anchor: f32) -> FrameGeometry {
+        droplet_geometry(&sample_at(anchor), 440.0, 1080.0)
+    }
+
+    #[test]
+    fn the_pill_is_untouched_at_both_edges() {
+        let top = geometry_at(0.0);
+        assert_eq!(top.main, Rect::new(110.0, 8.0, 220.0, 36.0));
+        assert_eq!(top.main_corner, 18.0);
+        assert_eq!(top.taper, 0.0);
+        assert_eq!(top.shell_alpha, 1.0);
+        assert_eq!(top.content_alpha, 1.0);
+
+        let bottom = geometry_at(1.0);
+        assert_eq!(bottom.main, Rect::new(110.0, 1036.0, 220.0, 36.0));
+        assert_eq!(bottom.main_corner, 18.0);
+        assert_eq!(bottom.taper, 0.0);
+        assert_eq!(bottom.shell_alpha, 1.0);
+        assert_eq!(bottom.content_alpha, 1.0);
+    }
+
+    #[test]
+    fn half_way_the_island_has_slipped_through_an_edge_invisibly() {
+        let half = geometry_at(0.5);
+        assert!(half.main.height < 0.5, "{:?}", half.main);
+        assert_eq!(half.shell_alpha, 0.0);
+        assert_eq!(half.content_alpha, 0.0);
+    }
+
+    #[test]
+    fn the_absorb_sweeps_into_the_edge_and_never_overshoots_the_screen() {
+        let mut previous = f32::MAX;
+        for step in 0..=50 {
+            let geometry = geometry_at(step as f32 / 100.0);
+            // The inner edge only ever moves up toward the top of the window.
+            assert!(
+                geometry.main.bottom() <= previous + 1e-3,
+                "inner edge moved back down at step {step}: {previous} -> {}",
+                geometry.main.bottom()
+            );
+            assert!(geometry.main.y >= -1e-3, "left the window at step {step}");
+            assert!(
+                geometry.main.width <= 220.0 + 1e-3 && geometry.main.height <= 36.0 + 1e-3,
+                "the pill should only shrink while leaving"
+            );
+            previous = geometry.main.bottom();
+        }
+    }
+
+    #[test]
+    fn the_emerge_grows_out_of_the_bottom_edge() {
+        let mut previous = f32::MAX;
+        for step in 51..=100 {
+            let geometry = geometry_at(step as f32 / 100.0);
+            // Growing back up out of the bottom edge: both edges move up.
+            assert!(
+                geometry.main.y <= previous + 1e-3,
+                "top edge moved back down at step {step}: {previous} -> {}",
+                geometry.main.y
+            );
+            assert!(
+                geometry.main.bottom() <= 1080.0 + 1e-3,
+                "left the window at step {step}"
+            );
+            previous = geometry.main.y;
+        }
+    }
+
+    #[test]
+    fn both_halves_are_the_same_shape_mirrored() {
+        // The exact handoff is on the top half of the curve; compare from one
+        // step inside the emerge, where both sides are visible.
+        for step in 1..=40 {
+            let fullness = step as f32 / 40.0;
+            let leaving = geometry_at(0.5 * (1.0 - fullness));
+            let arriving = geometry_at(0.5 + 0.5 * fullness);
+            assert!((leaving.main.width - arriving.main.width).abs() < 1e-3);
+            assert!((leaving.main.height - arriving.main.height).abs() < 1e-3);
+            assert!(
+                (leaving.main.y - (1080.0 - arriving.main.bottom())).abs() < 1e-3,
+                "positions should mirror at fullness {fullness}"
+            );
+            // The taper is mirrored between the two edges: the same leaf, the
+            // round end against a different screen edge.
+            assert!((leaving.taper - arriving.taper).abs() < 1e-6);
+            assert_ne!(leaving.taper_top, arriving.taper_top);
+            assert!((leaving.shell_alpha - arriving.shell_alpha).abs() < 1e-6);
+            assert!((leaving.content_alpha - arriving.content_alpha).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn the_travelling_shape_tapers_to_a_leaf_tip() {
+        // A quarter of the way out of the top edge: it has gathered into a
+        // leaf whose tail points away from the edge.
+        let leaf = geometry_at(0.21);
+        assert!(leaf.taper_top);
+        assert!(leaf.taper > 0.85, "expected a full leaf: {leaf:?}");
+        assert!(
+            leaf.main.width < 220.0 * 0.45,
+            "should have gathered: {leaf:?}"
+        );
+        assert!(leaf.main.height > 12.0, "should still be a leaf: {leaf:?}");
+        // The content is already dissolving while the shell is solid.
+        assert!(leaf.content_alpha < 0.5, "{leaf:?}");
+        assert_eq!(leaf.shell_alpha, 1.0);
+    }
+
+    #[test]
+    fn the_pressed_leaf_is_flush_with_the_edge() {
+        // While it is being pressed through, the island sits on the screen
+        // edge with no gap, as if pulled through a surface.
+        let leaving = geometry_at(0.38);
+        assert!(leaving.taper_top);
+        assert_eq!(leaving.main.y, 0.0, "expected a flush leaf: {leaving:?}");
+        assert!(leaving.main.height > 2.0, "{leaving:?}");
+
+        // The arriving half mirrors it against the bottom edge.
+        let arriving = geometry_at(0.62);
+        assert!(!arriving.taper_top);
+        let bottom = arriving.main.y + arriving.main.height;
+        assert!((bottom - 1080.0).abs() < 1e-3, "{arriving:?}");
     }
 }
