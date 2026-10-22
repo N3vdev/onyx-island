@@ -657,14 +657,11 @@ spread over 0.9 s (and the demo's flights also relayout a card that changes
 size). Idle remains 0.000% of one core, and the mask layer only exists while
 the shell is tapered.
 
-## A rounded voice
+## A Helvetica-like voice
 
-All island text now uses **Arial Rounded MT Bold**. It is the only genuinely
-rounded family installed, and it ships a single Bold face, so DirectWrite maps
-every requested weight to Bold and the hierarchy rests on size and colour; when
-the family is missing, `create_format` retries with Segoe UI. Compact titles are
-a little wider than before, but the 116 dp text slot still fits the demo track
-and ellipsises normally.
+All island text now uses **Inter**, a Helvetica-style grotesque with the full
+weight range, so the title/sub/tiny hierarchy is preserved. `create_format`
+falls back to Segoe UI when the family is missing.
 
 The compact media tile is now a **circle**: its radius is `art * 0.5` (12 dp on
 the 24 dp tile), which is the pill's 18 dp corner clamped to the tile, so the

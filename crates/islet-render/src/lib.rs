@@ -2471,13 +2471,12 @@ unsafe fn create_format(
     alignment: windows::Win32::Graphics::DirectWrite::DWRITE_TEXT_ALIGNMENT,
     paragraph: windows::Win32::Graphics::DirectWrite::DWRITE_PARAGRAPH_ALIGNMENT,
 ) -> RenderResult<IDWriteTextFormat> {
-    // A rounded face softens the pill's voice. This family ships a single
-    // Bold face, so DirectWrite maps every requested weight to it and the
-    // hierarchy comes from size and colour. Keep the stock look when the
-    // family is not installed.
+    // A Helvetica-like grotesque with a full weight range, so title and
+    // caption weights stay distinct. Inter is installed here; keep Segoe UI
+    // on machines that lack it.
     let format = stage(
         "CreateTextFormat",
-        create_text_format(factory, "Arial Rounded MT Bold", size, weight)
+        create_text_format(factory, "Inter", size, weight)
             .or_else(|_| create_text_format(factory, "Segoe UI", size, weight)),
     )?;
     stage("SetTextAlignment", format.SetTextAlignment(alignment))?;
