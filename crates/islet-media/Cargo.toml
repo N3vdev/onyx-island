@@ -1,0 +1,26 @@
+[package]
+name = "islet-media"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+islet-core = { path = "../islet-core" }
+crossbeam-channel.workspace = true
+tracing.workspace = true
+windows = { version = "0.62", features = [
+    "Foundation",
+    "Foundation_Collections",
+    "Media_Control",
+    "Storage_Streams",
+    "Win32_Foundation",
+    "Win32_Graphics_Imaging",
+    "Win32_System_Com",
+    "Win32_System_SystemInformation",
+    "Win32_System_WinRT",
+] }
+
+[[example]]
+name = "media-probe"
+path = "examples/media_probe.rs"

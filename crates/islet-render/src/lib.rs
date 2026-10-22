@@ -16,6 +16,7 @@ use islet_core::island::{
     arrange, AgentCard, AgentState, AlertLevel, ContentCard, ContentSnapshot, DictationCard,
     LayoutTarget, MediaCard, NotificationCard, PillSize,
 };
+use islet_core::media::{expanded, format_clock, ArtImage, BarLevels, BAR_COUNT};
 use islet_core::{Spring, SpringParams};
 use windows::core::{w, Interface, PCWSTR};
 use windows::Win32::Foundation::{HMODULE, HWND};
@@ -25,12 +26,14 @@ use windows::Win32::Graphics::Direct2D::Common::{
     D2D1_FILL_MODE_WINDING, D2D1_PIXEL_FORMAT, D2D_RECT_F, D2D_SIZE_U,
 };
 use windows::Win32::Graphics::Direct2D::{
-    CLSID_D2D1GaussianBlur, D2D1CreateDevice, ID2D1Bitmap1, ID2D1Brush, ID2D1Device,
-    ID2D1DeviceContext, ID2D1Effect, ID2D1Factory1, ID2D1Image, ID2D1PathGeometry1,
-    ID2D1SolidColorBrush, ID2D1StrokeStyle, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_BITMAP_OPTIONS,
-    D2D1_BITMAP_OPTIONS_CANNOT_DRAW, D2D1_BITMAP_OPTIONS_TARGET, D2D1_BITMAP_PROPERTIES1,
+    CLSID_D2D1GaussianBlur, D2D1CreateDevice, ID2D1Bitmap1, ID2D1BitmapBrush1, ID2D1Brush,
+    ID2D1Device, ID2D1DeviceContext, ID2D1Effect, ID2D1Factory1, ID2D1Image, ID2D1PathGeometry1,
+    ID2D1SolidColorBrush, ID2D1StrokeStyle, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+    D2D1_BITMAP_BRUSH_PROPERTIES1, D2D1_BITMAP_OPTIONS, D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+    D2D1_BITMAP_OPTIONS_NONE, D2D1_BITMAP_OPTIONS_TARGET, D2D1_BITMAP_PROPERTIES1,
     D2D1_DEVICE_CONTEXT_OPTIONS_NONE, D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_ELLIPSE,
-    D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION, D2D1_INTERPOLATION_MODE_LINEAR,
+    D2D1_EXTEND_MODE_CLAMP, D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION,
+    D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, D2D1_INTERPOLATION_MODE_LINEAR,
     D2D1_PROPERTY_TYPE_FLOAT, D2D1_ROUNDED_RECT, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
 };
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0};
@@ -47,6 +50,7 @@ use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT, DWRITE_FONT_WEIGHT_BOLD,
     DWRITE_FONT_WEIGHT_DEMI_BOLD, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
     DWRITE_PARAGRAPH_ALIGNMENT_NEAR, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING,
+    DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_CHARACTER,
     DWRITE_WORD_WRAPPING_NO_WRAP,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
@@ -72,6 +76,12 @@ const HAIRLINE_COLOR: D2D1_COLOR_F = D2D1_COLOR_F {
     b: 1.0,
     a: 0.075,
 };
+/// Real visualizer levels older than this fall back to procedural bars.
+const BAR_LEVELS_MAX_AGE_MS: u64 = 250;
+/// Album-art brushes kept around (current track plus a transition partner).
+const ART_CACHE_SIZE: usize = 3;
+const DEFAULT_ACCENT_TEXT: [u8; 3] = [146, 153, 172];
+
 /// How long a hidden island keeps its D3D/D2D device before releasing it.
 const GRAPHICS_RELEASE_DELAY: f64 = 15.0;
 
@@ -177,6 +187,7 @@ pub struct Renderer {
     transition_start: Option<f64>,
     hidden_since: Option<f64>,
     hit_region: Arc<Mutex<HitRegion>>,
+    bars: Arc<BarLevels>,
     anchor_top: bool,
     logical_width: f32,
     logical_height: f32,
@@ -189,6 +200,7 @@ impl Renderer {
     pub fn new(
         config: RendererConfig,
         hit_region: Arc<Mutex<HitRegion>>,
+        bars: Arc<BarLevels>,
         now: f64,
     ) -> RenderResult<Self> {
         if config.pixel_width == 0 || config.pixel_height == 0 {
@@ -205,6 +217,7 @@ impl Renderer {
             transition_start: None,
             hidden_since: Some(now),
             hit_region,
+            bars,
             anchor_top: config.anchor_top,
             logical_width: config.logical_width,
             logical_height: config.logical_height,
@@ -221,12 +234,17 @@ impl Renderer {
             self.target = target;
         }
         if content != self.content {
-            let previous = std::mem::take(&mut self.content);
-            if !previous.is_empty() || !content.is_empty() {
-                self.previous_content = Some(previous);
-                self.transition_start = Some(now);
+            if self.content.updates_in_place(&content) {
+                // Timeline ticks, levels, play/pause: no morph.
+                self.content = content;
+            } else {
+                let previous = std::mem::take(&mut self.content);
+                if !previous.is_empty() || !content.is_empty() {
+                    self.previous_content = Some(previous);
+                    self.transition_start = Some(now);
+                }
+                self.content = content;
             }
-            self.content = content;
         }
         if self.target.visible || !self.content.is_empty() {
             self.hidden_since = None;
@@ -338,6 +356,9 @@ impl Renderer {
         // the render thread that created it.
         unsafe {
             let gfx = self.gfx.as_mut().ok_or(RenderError::InvalidSize)?;
+            gfx.bar_levels = self
+                .bars
+                .load_fresh((now * 1000.0) as u64, BAR_LEVELS_MAX_AGE_MS);
             gfx.draw(
                 now,
                 &geometry,
@@ -587,6 +608,8 @@ struct Gfx {
     text_cache: TextCache,
     geometries: GeometryCache,
     content_layers: Option<[ContentLayer; 2]>,
+    art: Vec<(u64, ID2D1BitmapBrush1)>,
+    bar_levels: Option<[f32; BAR_COUNT]>,
     pixel_width: u32,
     pixel_height: u32,
     dpi: f32,
@@ -737,6 +760,8 @@ impl Gfx {
             text_cache: TextCache::new(),
             geometries: GeometryCache::new(),
             content_layers: None,
+            art: Vec::with_capacity(ART_CACHE_SIZE),
+            bar_levels: None,
             pixel_width: config.pixel_width,
             pixel_height: config.pixel_height,
             dpi: config.dpi,
@@ -1080,21 +1105,21 @@ impl Gfx {
     ) -> RenderResult<()> {
         let art = 24.0;
         let art_y = (height - art) * 0.5;
-        self.fill_round_rect(8.0, art_y, art, art, 7.0, color(accent, 0.92 * alpha))?;
-        self.fill_round_rect(8.0, art_y, art, art, 7.0, color([12, 14, 20], 0.35 * alpha))?;
-        self.fill_circle(
-            20.0,
-            art_y + 12.0,
-            4.0,
-            color([255, 255, 255], 0.72 * alpha),
+        self.draw_art(
+            Rect::new(8.0, art_y, art, art),
+            6.0,
+            media.art.as_ref(),
+            accent,
+            alpha,
         )?;
 
+        let text_w = (width - 104.0).max(10.0);
         self.draw_text(
             &media.title,
             FormatId::CompactTitle,
             40.0,
             3.0,
-            (width - 104.0).max(10.0),
+            text_w,
             15.0,
             color([255, 255, 255], 0.96 * alpha),
         )?;
@@ -1103,30 +1128,31 @@ impl Gfx {
             FormatId::CompactSub,
             40.0,
             19.0,
-            (width - 104.0).max(10.0),
+            text_w,
             13.0,
             color([173, 180, 199], 0.88 * alpha),
         )?;
 
-        let bars = 5;
-        let bar_area = 46.0;
-        let start = width - bar_area - 10.0;
+        let levels = self.bar_levels.filter(|_| media.playing);
+        let start = width - 46.0 - 10.0;
         let mid = height * 0.5;
-        for index in 0..bars {
-            let phase = now * if media.playing { 7.2 } else { 0.0 } + f64::from(index) * 0.85;
-            let wave = if media.playing {
-                ((phase.sin() * 0.5 + 0.5) as f32) * 0.65 + 0.35
-            } else {
-                0.45 + index as f32 * 0.09
+        for index in 0..BAR_COUNT {
+            let level = match levels {
+                Some(levels) => levels[index],
+                None if media.playing => {
+                    let phase = now * 7.2 + index as f64 * 0.85;
+                    (phase.sin() * 0.5 + 0.5) as f32 * 0.65 + 0.35
+                }
+                None => 0.12,
             };
-            let bar_h = 4.0 + wave * 10.0;
+            let bar_h = 3.0 + level.clamp(0.0, 1.0) * 15.0;
             self.fill_round_rect(
                 start + index as f32 * 8.0,
                 mid - bar_h * 0.5,
                 2.8,
                 bar_h,
                 1.4,
-                color(accent, 0.92 * alpha),
+                color(accent, if media.playing { 0.92 } else { 0.5 } * alpha),
             )?;
         }
         Ok(())
@@ -1141,19 +1167,21 @@ impl Gfx {
         accent: [u8; 3],
         alpha: f32,
     ) -> RenderResult<()> {
-        let art = 78.0;
-        self.fill_round_rect(18.0, 18.0, art, art, 22.0, color(accent, 0.95 * alpha))?;
-        self.fill_round_rect(18.0, 18.0, art, art, 22.0, color([8, 10, 16], 0.30 * alpha))?;
-        self.fill_circle(57.0, 54.0, 14.0, color([255, 255, 255], 0.22 * alpha))?;
-        self.fill_circle(57.0, 54.0, 5.0, color([255, 255, 255], 0.78 * alpha))?;
+        self.draw_art(
+            expanded::ART,
+            expanded::ART_RADIUS,
+            media.art.as_ref(),
+            accent,
+            alpha,
+        )?;
 
-        let text_x = 112.0;
+        let text_x = expanded::TEXT_X;
         let text_w = (width - text_x - 20.0).max(40.0);
         self.draw_text(
             &media.title,
             FormatId::Title,
             text_x,
-            18.0,
+            20.0,
             text_w,
             24.0,
             color([255, 255, 255], 0.98 * alpha),
@@ -1162,84 +1190,191 @@ impl Gfx {
             &media.artist,
             FormatId::Sub,
             text_x,
-            44.0,
+            45.0,
             text_w,
             18.0,
             color([177, 185, 204], 0.92 * alpha),
         )?;
         self.draw_text(
-            if media.playing { "PLAYING" } else { "PAUSED" },
+            &media.source.to_uppercase(),
             FormatId::Tiny,
             text_x,
-            64.0,
+            66.0,
             text_w,
             14.0,
-            color(accent, 0.95 * alpha),
+            color(
+                if media.accent.is_some() {
+                    accent
+                } else {
+                    DEFAULT_ACCENT_TEXT
+                },
+                0.95 * alpha,
+            ),
         )?;
 
-        let progress_x = text_x;
-        let progress_w = (width - progress_x - 22.0).max(30.0);
-        let progress_y = 92.0;
-        self.fill_round_rect(
-            progress_x,
-            progress_y,
-            progress_w,
-            4.0,
-            2.0,
-            color([255, 255, 255], 0.13 * alpha),
-        )?;
-        self.fill_round_rect(
-            progress_x,
-            progress_y,
-            (progress_w * media.progress.clamp(0.0, 1.0)).max(3.0),
-            4.0,
-            2.0,
-            color(accent, 0.98 * alpha),
-        )?;
-        self.draw_text(
-            &format_time(media.progress * 218.0),
-            FormatId::Tiny,
-            progress_x,
-            progress_y + 9.0,
-            50.0,
-            12.0,
-            color([146, 153, 172], 0.9 * alpha),
-        )?;
-        self.draw_text(
-            "3:38",
-            FormatId::Tiny,
-            progress_x + progress_w - 30.0,
-            progress_y + 9.0,
-            30.0,
-            12.0,
-            color([146, 153, 172], 0.9 * alpha),
-        )?;
+        if let Some(timeline) = media.timeline.filter(|timeline| timeline.duration > 0.0) {
+            let bar = expanded::scrubber(width);
+            let progress = media
+                .scrub
+                .unwrap_or_else(|| timeline.progress_at(now, media.playing))
+                .clamp(0.0, 1.0);
+            let position = f64::from(progress) * timeline.duration;
+            self.fill_round_rect(
+                bar.x,
+                bar.y,
+                bar.width,
+                bar.height,
+                bar.height * 0.5,
+                color([255, 255, 255], 0.16 * alpha),
+            )?;
+            self.fill_round_rect(
+                bar.x,
+                bar.y,
+                (bar.width * progress).max(bar.height),
+                bar.height,
+                bar.height * 0.5,
+                color(accent, 0.98 * alpha),
+            )?;
+            if media.scrub.is_some() {
+                self.fill_circle(
+                    bar.x + bar.width * progress,
+                    bar.y + bar.height * 0.5,
+                    6.0,
+                    color([255, 255, 255], alpha),
+                )?;
+            }
+            let label = color([146, 153, 172], 0.9 * alpha);
+            self.draw_text(
+                &format_clock(position),
+                FormatId::Tiny,
+                bar.x,
+                bar.bottom() + 5.0,
+                60.0,
+                12.0,
+                label,
+            )?;
+            self.draw_text(
+                &format!("-{}", format_clock(timeline.duration - position)),
+                FormatId::TinyRight,
+                bar.right() - 60.0,
+                bar.bottom() + 5.0,
+                60.0,
+                12.0,
+                label,
+            )?;
+        }
 
-        let controls_y = 132.0;
-        let center = width * 0.5;
+        let [previous, play, next] = expanded::controls(width);
         self.draw_transport(
-            center - 48.0,
-            controls_y,
+            previous.0,
+            previous.1,
             TransportIcon::Previous,
             accent,
             alpha,
         )?;
         self.draw_transport(
-            center,
-            controls_y,
+            play.0,
+            play.1,
             TransportIcon::PlayPause(media.playing),
             accent,
             alpha,
         )?;
-        self.draw_transport(
-            center + 48.0,
-            controls_y,
-            TransportIcon::Next,
-            accent,
-            alpha,
-        )?;
-        let _ = now;
+        self.draw_transport(next.0, next.1, TransportIcon::Next, accent, alpha)?;
         Ok(())
+    }
+
+    /// Album art clipped to a rounded rect, or a tinted placeholder.
+    unsafe fn draw_art(
+        &mut self,
+        rect: Rect,
+        radius: f32,
+        art: Option<&ArtImage>,
+        accent: [u8; 3],
+        alpha: f32,
+    ) -> RenderResult<()> {
+        let rounded = D2D1_ROUNDED_RECT {
+            rect: D2D_RECT_F {
+                left: rect.x,
+                top: rect.y,
+                right: rect.right(),
+                bottom: rect.bottom(),
+            },
+            radiusX: radius,
+            radiusY: radius,
+        };
+        if let Some(art) = art {
+            let brush = self.art_brush(art)?;
+            brush.SetOpacity(alpha.clamp(0.0, 1.0));
+            brush.SetTransform(
+                &(Matrix3x2::scale(
+                    rect.width / art.width.max(1) as f32,
+                    rect.height / art.height.max(1) as f32,
+                ) * Matrix3x2::translation(rect.x, rect.y)),
+            );
+            self.dc.FillRoundedRectangle(&rounded, &brush);
+            return Ok(());
+        }
+        self.fill_round_rect(
+            rect.x,
+            rect.y,
+            rect.width,
+            rect.height,
+            radius,
+            color(accent, 0.55 * alpha),
+        )?;
+        let (cx, cy) = rect.center();
+        let disc = rect.width.min(rect.height);
+        self.fill_circle(cx, cy, disc * 0.2, color([255, 255, 255], 0.22 * alpha))?;
+        self.fill_circle(cx, cy, disc * 0.07, color([255, 255, 255], 0.8 * alpha))
+    }
+
+    unsafe fn art_brush(&mut self, art: &ArtImage) -> RenderResult<ID2D1BitmapBrush1> {
+        if let Some((_, brush)) = self.art.iter().find(|(id, _)| *id == art.id) {
+            return Ok(brush.clone());
+        }
+        let expected = (art.width as usize) * (art.height as usize) * 4;
+        if art.width == 0 || art.height == 0 || art.pixels.len() < expected {
+            return Err(RenderError::InvalidSize);
+        }
+        let properties = D2D1_BITMAP_PROPERTIES1 {
+            pixelFormat: D2D1_PIXEL_FORMAT {
+                format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+            },
+            dpiX: 96.0,
+            dpiY: 96.0,
+            bitmapOptions: D2D1_BITMAP_OPTIONS_NONE,
+            colorContext: std::mem::ManuallyDrop::new(None),
+        };
+        let bitmap = stage(
+            "Create album art bitmap",
+            self.dc.CreateBitmap(
+                D2D_SIZE_U {
+                    width: art.width,
+                    height: art.height,
+                },
+                Some(art.pixels.as_ptr().cast()),
+                art.width * 4,
+                &properties,
+            ),
+        )?;
+        let brush = stage(
+            "Create album art brush",
+            self.dc.CreateBitmapBrush(
+                &bitmap,
+                Some(&D2D1_BITMAP_BRUSH_PROPERTIES1 {
+                    extendModeX: D2D1_EXTEND_MODE_CLAMP,
+                    extendModeY: D2D1_EXTEND_MODE_CLAMP,
+                    interpolationMode: D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,
+                }),
+                None,
+            ),
+        )?;
+        if self.art.len() >= ART_CACHE_SIZE {
+            self.art.remove(0);
+        }
+        self.art.push((art.id, brush.clone()));
+        Ok(brush)
     }
 
     unsafe fn draw_transport(
@@ -1855,6 +1990,7 @@ enum FormatId {
     Title,
     Sub,
     Tiny,
+    TinyRight,
     Bubble,
     Timer,
 }
@@ -1865,6 +2001,7 @@ struct TextFormats {
     title: IDWriteTextFormat,
     sub: IDWriteTextFormat,
     tiny: IDWriteTextFormat,
+    tiny_right: IDWriteTextFormat,
     bubble: IDWriteTextFormat,
     timer: IDWriteTextFormat,
 }
@@ -1907,6 +2044,13 @@ impl TextFormats {
                 DWRITE_TEXT_ALIGNMENT_LEADING,
                 DWRITE_PARAGRAPH_ALIGNMENT_NEAR,
             )?,
+            tiny_right: create_format(
+                factory,
+                9.0,
+                DWRITE_FONT_WEIGHT_NORMAL,
+                DWRITE_TEXT_ALIGNMENT_TRAILING,
+                DWRITE_PARAGRAPH_ALIGNMENT_NEAR,
+            )?,
             bubble: create_format(
                 factory,
                 14.0,
@@ -1931,6 +2075,7 @@ impl TextFormats {
             FormatId::Title => &self.title,
             FormatId::Sub => &self.sub,
             FormatId::Tiny => &self.tiny,
+            FormatId::TinyRight => &self.tiny_right,
             FormatId::Bubble => &self.bubble,
             FormatId::Timer => &self.timer,
         }
@@ -1965,6 +2110,22 @@ unsafe fn create_format(
     stage(
         "SetWordWrapping",
         format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP),
+    )?;
+    // Long titles end in "..." instead of being cut mid-glyph.
+    let ellipsis = stage(
+        "CreateEllipsisTrimmingSign",
+        factory.CreateEllipsisTrimmingSign(&format),
+    )?;
+    stage(
+        "SetTrimming",
+        format.SetTrimming(
+            &DWRITE_TRIMMING {
+                granularity: DWRITE_TRIMMING_GRANULARITY_CHARACTER,
+                delimiter: 0,
+                delimiterCount: 0,
+            },
+            &ellipsis,
+        ),
     )?;
     Ok(format)
 }
@@ -2161,11 +2322,6 @@ fn ease_out(value: f32) -> f32 {
     1.0 - (1.0 - value).powi(3)
 }
 
-fn format_time(seconds: f32) -> String {
-    let seconds = seconds.max(0.0) as u32;
-    format!("{}:{:02}", seconds / 60, seconds % 60)
-}
-
 fn format_elapsed(milliseconds: u32) -> String {
     let seconds = milliseconds / 1000;
     format!("{}:{:02}", seconds / 60, seconds % 60)
@@ -2196,8 +2352,6 @@ mod tests {
 
     #[test]
     fn formatting_helpers_are_stable() {
-        assert_eq!(format_time(0.0), "0:00");
-        assert_eq!(format_time(218.0), "3:38");
         assert_eq!(format_elapsed(7_400), "0:07");
     }
 

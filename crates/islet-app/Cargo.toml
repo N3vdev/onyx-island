@@ -12,6 +12,8 @@ path = "src/main.rs"
 [dependencies]
 islet-core = { path = "../islet-core" }
 islet-render = { path = "../islet-render" }
+islet-media = { path = "../islet-media" }
+islet-audio = { path = "../islet-audio" }
 crossbeam-channel.workspace = true
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

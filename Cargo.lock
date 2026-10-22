@@ -616,7 +616,9 @@ name = "islet-app"
 version = "0.1.0"
 dependencies = [
  "crossbeam-channel",
+ "islet-audio",
  "islet-core",
+ "islet-media",
  "islet-render",
  "notify",
  "tracing",
@@ -638,11 +640,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "islet-audio"
+version = "0.1.0"
+dependencies = [
+ "islet-core",
+ "tracing",
+ "windows",
+]
+
+[[package]]
 name = "islet-core"
 version = "0.1.0"
 dependencies = [
  "serde",
  "toml",
+]
+
+[[package]]
+name = "islet-media"
+version = "0.1.0"
+dependencies = [
+ "crossbeam-channel",
+ "islet-core",
+ "tracing",
+ "windows",
 ]
 
 [[package]]

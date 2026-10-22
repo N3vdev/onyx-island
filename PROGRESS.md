@@ -287,3 +287,76 @@ compact pill expands it and moving away collapses it.
 - [x] Clicks pass through outside the pill; no focus stealing.
 - [x] Tests green (36 core, 4 render, 7 ASR/bench), clippy `-D warnings`
   clean, `cargo fmt --check` clean.
+
+## P2 - Now playing (implemented, 2026-10-22; hands-on checks pending)
+
+**Status:** Built and verified against a live (paused) Spotify session.
+The checks that need audio playing are listed under "Pending" below; they
+were not run automatically because they would play sound on the user's
+machine.
+
+### What was built
+
+- `islet-core::media` (pure, 17 tests): `Timeline` extrapolation,
+  `format_clock`, Spotify-first `choose_session`, `source_display_name` for
+  AUMIDs/exe names, `dominant_color` (16x16 downsample, k-means k=5, scored
+  by population x saturation, lifted to 52-70% lightness for contrast on
+  black, `None` for greyscale art), expanded-view layout constants and
+  `expanded_action_at` / `scrub_fraction` hit-testing (shared by renderer and
+  UI thread), lock-free `BarLevels`, and a 512-point FFT `Spectrum` (5
+  log-spaced bands 60 Hz-8 kHz, fast attack / slow release).
+- `islet-core::island`: `MediaCard` now carries source, timeline, art,
+  accent, and scrub. Paused media arms a 5-minute timer and then drops off
+  until something plays again. `ContentSnapshot::updates_in_place` stops
+  timeline ticks, play/pause, and level changes from running the content
+  morph; only a new track (or new art) cross-fades.
+- `islet-media` (new crate): one MTA thread. GSMTC `SessionsChanged`,
+  `CurrentSessionChanged`, and per-session properties/playback/timeline
+  events post refresh flags; bursts coalesce for 40 ms. Thumbnails decode via
+  WIC to a 128 px centre-cropped premultiplied BGRA square, deduplicated by
+  hash (browsers re-send identical art). Transport: play/pause, next,
+  previous, seek. `media-probe` example for manual testing.
+- `islet-audio` (new crate): WASAPI loopback on the default render device,
+  30 Hz high-resolution waitable timer, f32/i16 mix formats, no allocation in
+  the loop, reopens after device loss. Runs only while playing media is on
+  screen and `media.real_bars` is on; otherwise bars are procedural.
+  `loopback_probe` example.
+- Renderer: album art through a cached `ID2D1BitmapBrush1` in a rounded
+  rect (placeholder when absent), real timeline scrubber with elapsed and
+  remaining time, source name in the art colour, drag knob, ellipsis
+  trimming for long titles, real bar levels when fresh (<250 ms).
+- App: media and loopback lifecycle follow config hot-reload
+  (`enabled`, `real_bars`, `color_tint`). In the expanded media pill:
+  prev / play-pause / next buttons and click-or-drag seeking (mouse capture;
+  hover-collapse suppressed mid-drag). Commands update the card
+  optimistically. While media plays the render thread now reports "settled"
+  when the shape stops moving, not when it parks, so the window region still
+  shrinks to the exact pill.
+
+No new third-party crates: only additional `windows` features.
+
+### Measurements (release, static CRT)
+
+| | |
+|---|---|
+| `islet.exe` | 1.68 MB |
+| live, Spotify paused, compact media shown, 30 s after 10 s warm-up | 0 ms CPU, 21.0 MiB private, 63.6 MiB working set |
+| GSMTC read of live Spotify | title, artist, 128x128 art, accent `[188, 78, 81]`, timeline 9.3/135.6 s |
+| loopback probe, nothing playing | 20/20 fresh level samples at 100 ms checks, all zero |
+
+### Pending (needs audio; please verify)
+
+- [ ] Spotify: play/pause, next, previous, and dragging the scrubber from the
+  expanded island control playback.
+- [ ] YouTube in Edge/Chrome shows title/art and responds to controls.
+- [ ] Real bars move with the music; switching `media.real_bars = false`
+  falls back to procedural bars live.
+- [ ] Track change cross-fades the content.
+- [x] Idle with music paused adds no wakeups (0 ms CPU / 30 s).
+
+### Open issues
+
+- No marquee for long titles yet (ellipsis instead); PLAN §4.2 lists marquee.
+- The track-change "scale bounce" on the art is the generic content morph,
+  not an art-specific spring.
+- Source-app icon in the expanded view is text only (no icon extraction).

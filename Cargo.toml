@@ -3,6 +3,8 @@ resolver = "2"
 members = [
     "crates/islet-core",
     "crates/islet-render",
+    "crates/islet-media",
+    "crates/islet-audio",
     "crates/islet-app",
     "crates/islet-asr",
     "crates/asr-bench-sherpa",

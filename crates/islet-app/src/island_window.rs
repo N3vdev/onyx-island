@@ -5,13 +5,16 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 
 use crossbeam_channel::{unbounded, Receiver, RecvTimeoutError, Sender};
+use islet_audio::Loopback;
 use islet_core::config::{IdleStyle, MonitorChoice, ScreenPosition};
 use islet_core::island::{
     arrange, reduce, AgentCard, AgentState, AlertLevel, ContentSnapshot, DictationCard,
     DictationPhase, Effect, IslandEvent, IslandState, LayoutTarget, MediaCard, NotificationCard,
     TimerKind,
 };
+use islet_core::media::{expanded_action_at, scrub_fraction, BarLevels, MediaAction, Timeline};
 use islet_core::{Config, Rect};
+use islet_media::{MediaCommand, MediaInfo, MediaService};
 use islet_render::{HitRegion, Renderer, RendererConfig};
 use windows::core::{s, w, Result as WinResult};
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, POINT, WPARAM};
@@ -23,7 +26,9 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
-use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+};
 use windows::Win32::UI::Shell::{
     SHAppBarMessage, SHQueryUserNotificationState, ABM_NEW, ABM_REMOVE, ABN_FULLSCREENAPP,
     APPBARDATA, QUNS_BUSY, QUNS_RUNNING_D3D_FULL_SCREEN,
@@ -32,9 +37,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DefWindowProcW, GetCursorPos, GetForegroundWindow, GetWindowLongPtrW, GetWindowRect, KillTimer,
     PostMessageW, SetTimer, SetWindowPos, ShowWindow, GWLP_USERDATA, HTCLIENT, HTTRANSPARENT,
     HWND_TOPMOST, MA_NOACTIVATE, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOZORDER, SW_HIDE,
-    SW_SHOWNOACTIVATE, WINDOWPOS, WM_APP, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND,
-    WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_NCHITTEST, WM_SETTINGCHANGE, WM_TIMER,
-    WM_WINDOWPOSCHANGING,
+    SW_SHOWNOACTIVATE, WINDOWPOS, WM_APP, WM_CAPTURECHANGED, WM_DISPLAYCHANGE, WM_DPICHANGED,
+    WM_ERASEBKGND, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_NCHITTEST,
+    WM_SETTINGCHANGE, WM_TIMER, WM_WINDOWPOSCHANGING,
 };
 
 pub const WINDOW_LOGICAL_WIDTH: f32 = 440.0;
@@ -46,12 +51,15 @@ const TIMER_HOVER_COLLAPSE: usize = 2;
 const TIMER_DONE_EXPIRY: usize = 3;
 const TIMER_POLL: usize = 4;
 const TIMER_DEMO: usize = 5;
+const TIMER_MEDIA_PAUSED: usize = 6;
 const WM_MOUSELEAVE: u32 = 0x02A3;
 /// Shell appbar notifications (only `ABN_FULLSCREENAPP` is used).
 const WM_APP_APPBAR: u32 = WM_APP + 20;
 /// Posted by the render thread when it parks. `WPARAM` is the generation of
 /// the last snapshot it applied.
 const WM_APP_SETTLED: u32 = WM_APP + 21;
+/// Posted by the media thread when now-playing changed.
+const WM_APP_MEDIA: u32 = WM_APP + 22;
 /// Extra room around a morphing island's window region for spring overshoot.
 const REGION_MORPH_MARGIN_DP: f32 = 12.0;
 
@@ -140,6 +148,15 @@ pub struct IslandHost {
     morph_box: Option<Rect>,
     last_target: Option<LayoutTarget>,
     region: Option<WindowRegion>,
+    bars: Arc<BarLevels>,
+    media: Option<MediaService>,
+    media_tx: Sender<Option<MediaInfo>>,
+    media_rx: Receiver<Option<MediaInfo>>,
+    last_media: Option<MediaInfo>,
+    loopback: Option<Loopback>,
+    real_bars: bool,
+    color_tint: bool,
+    scrubbing: bool,
     warned_disconnected: bool,
 }
 
@@ -166,10 +183,13 @@ impl IslandHost {
             anchor_top: layout.anchor_top,
         };
         let render_hit = Arc::clone(&hit);
+        let bars = Arc::new(BarLevels::default());
+        let render_bars = Arc::clone(&bars);
         let notify = hwnd.0 as isize;
         let thread = std::thread::Builder::new()
             .name("islet-render".to_owned())
-            .spawn(move || render_thread(renderer_config, render_hit, rx, notify))?;
+            .spawn(move || render_thread(renderer_config, render_hit, render_bars, rx, notify))?;
+        let (media_tx, media_rx) = unbounded();
 
         let mut host = Box::new(Self {
             hwnd,
@@ -198,12 +218,24 @@ impl IslandHost {
             morph_box: None,
             last_target: None,
             region: None,
+            bars,
+            media: None,
+            media_tx,
+            media_rx,
+            last_media: None,
+            loopback: None,
+            real_bars: config.media.real_bars,
+            color_tint: config.media.color_tint,
+            scrubbing: false,
             warned_disconnected: false,
         });
 
         host.register_appbar();
         host.send_snapshot();
         host.update_poll_timer();
+        if config.media.enabled && demo_state.is_none() && !demo {
+            host.start_media();
+        }
         if let Some(step) = demo_state {
             host.demo = Some(Demo { step });
             host.demo_advance();
@@ -230,7 +262,10 @@ impl IslandHost {
             let _ = KillTimer(Some(self.hwnd), TIMER_DONE_EXPIRY);
             let _ = KillTimer(Some(self.hwnd), TIMER_POLL);
             let _ = KillTimer(Some(self.hwnd), TIMER_DEMO);
+            let _ = KillTimer(Some(self.hwnd), TIMER_MEDIA_PAUSED);
         }
+        self.loopback = None;
+        self.media = None;
         self.poll_interval = None;
         self.unregister_appbar();
         if let Some(thread) = self.thread.take() {
@@ -249,6 +284,23 @@ impl IslandHost {
         self.follow_cursor = config.general.monitor == MonitorChoice::FollowCursor;
         self.idle_style = config.general.idle_style;
         self.dispatch(IslandEvent::SetIdleStyle(self.idle_style));
+        if self.demo.is_none() {
+            match (config.media.enabled, self.media.is_some()) {
+                (true, false) => self.start_media(),
+                (false, true) => {
+                    self.media = None;
+                    self.last_media = None;
+                    self.dispatch(IslandEvent::SetMedia(None));
+                }
+                _ => {}
+            }
+        }
+        let tint_changed = self.color_tint != config.media.color_tint;
+        self.real_bars = config.media.real_bars;
+        self.color_tint = config.media.color_tint;
+        if tint_changed {
+            self.apply_media();
+        }
         if let Err(error) = self.reposition() {
             tracing::warn!(%error, "could not reposition island window");
         }
@@ -271,6 +323,12 @@ impl IslandHost {
     ) -> Option<LRESULT> {
         match message {
             WM_NCHITTEST => Some(self.hit_test(lparam)),
+            WM_MOUSEMOVE if self.scrubbing => {
+                if let Some((x, y, width)) = self.media_point(lparam) {
+                    self.set_scrub(scrub_fraction(x, y, width, true));
+                }
+                Some(LRESULT(0))
+            }
             WM_MOUSEMOVE => {
                 self.track_mouse();
                 let inside = self.cursor_inside();
@@ -283,11 +341,53 @@ impl IslandHost {
             }
             WM_MOUSELEAVE => {
                 self.tracking_mouse = false;
-                self.dispatch(IslandEvent::HoverLeave);
+                if !self.scrubbing {
+                    self.dispatch(IslandEvent::HoverLeave);
+                }
+                Some(LRESULT(0))
+            }
+            WM_LBUTTONDOWN => {
+                if let Some((x, y, width)) = self.media_point(lparam) {
+                    let seekable = self.media_duration().is_some();
+                    if let Some(fraction) = scrub_fraction(x, y, width, false).filter(|_| seekable)
+                    {
+                        self.scrubbing = true;
+                        unsafe {
+                            SetCapture(self.hwnd);
+                        }
+                        self.set_scrub(Some(fraction));
+                    }
+                }
                 Some(LRESULT(0))
             }
             WM_LBUTTONUP => {
-                self.dispatch(IslandEvent::Click);
+                if self.scrubbing {
+                    self.finish_scrub(true);
+                } else if let Some(action) = self
+                    .media_point(lparam)
+                    .and_then(|(x, y, width)| expanded_action_at(x, y, width))
+                {
+                    self.media_action(action);
+                } else {
+                    self.dispatch(IslandEvent::Click);
+                }
+                Some(LRESULT(0))
+            }
+            WM_CAPTURECHANGED => {
+                if self.scrubbing {
+                    self.finish_scrub(false);
+                }
+                Some(LRESULT(0))
+            }
+            WM_APP_MEDIA => {
+                let mut latest = None;
+                while let Ok(info) = self.media_rx.try_recv() {
+                    latest = Some(info);
+                }
+                if let Some(info) = latest {
+                    self.last_media = info;
+                    self.apply_media();
+                }
                 Some(LRESULT(0))
             }
             WM_MOUSEACTIVATE => Some(LRESULT(MA_NOACTIVATE as isize)),
@@ -345,6 +445,166 @@ impl IslandHost {
             self.send_snapshot();
         }
         self.update_poll_timer();
+        self.update_loopback();
+    }
+
+    fn start_media(&mut self) {
+        let tx = self.media_tx.clone();
+        let hwnd = self.hwnd.0 as isize;
+        let service = MediaService::start(move |info| {
+            if tx.send(info).is_ok() {
+                // SAFETY: non-blocking post to the island window.
+                unsafe {
+                    let _ = PostMessageW(
+                        Some(HWND(hwnd as *mut _)),
+                        WM_APP_MEDIA,
+                        WPARAM(0),
+                        LPARAM(0),
+                    );
+                }
+            }
+        });
+        match service {
+            Ok(service) => self.media = Some(service),
+            Err(error) => tracing::warn!(%error, "could not start the media thread"),
+        }
+    }
+
+    /// Converts the latest media report into the island's card.
+    fn apply_media(&mut self) {
+        if self.demo.is_some() {
+            return;
+        }
+        let scrub = self
+            .state
+            .media
+            .as_ref()
+            .and_then(|media| media.scrub)
+            .filter(|_| self.scrubbing);
+        let card = self.last_media.as_ref().map(|info| MediaCard {
+            title: info.title.clone(),
+            artist: info.artist.clone(),
+            source: info.source.clone(),
+            playing: info.playing,
+            timeline: (info.duration > 0.0).then(|| Timeline {
+                position: info.position,
+                duration: info.duration,
+                sampled_at: clock_now(),
+                rate: info.rate,
+            }),
+            art: info.art.clone(),
+            accent: info.accent.filter(|_| self.color_tint),
+            scrub,
+        });
+        self.dispatch(IslandEvent::SetMedia(card));
+    }
+
+    /// Runs the loopback visualizer only while playing media is on screen.
+    fn update_loopback(&mut self) {
+        let wanted = self.real_bars
+            && self.media.is_some()
+            && !self.fullscreen_hidden
+            && self.state.dictation.is_none()
+            && self.state.media.as_ref().is_some_and(|media| media.playing);
+        match (wanted, self.loopback.is_some()) {
+            (true, false) => match Loopback::start(Arc::clone(&self.bars), clock_now_ms) {
+                Ok(loopback) => self.loopback = Some(loopback),
+                Err(error) => {
+                    tracing::warn!(%error, "could not start the visualizer");
+                    self.real_bars = false;
+                }
+            },
+            (false, true) => self.loopback = None,
+            _ => {}
+        }
+    }
+
+    /// Local logical coordinates and pill width, if `lparam` (client pixels)
+    /// is inside the expanded media pill.
+    fn media_point(&self, lparam: LPARAM) -> Option<(f32, f32, f32)> {
+        let layout = self.state.layout();
+        let showing_media = self.state.expanded
+            && layout.main == islet_core::island::MEDIA
+            && matches!(
+                self.state.primary_card(),
+                Some(islet_core::ContentCard::Media(_))
+            );
+        if !showing_media {
+            return None;
+        }
+        let scale = self.dpi as f32 / 96.0;
+        // Client-area mouse messages carry client coordinates.
+        let point = point_from_lparam(lparam);
+        let main = self.target_frame(layout).main;
+        Some((
+            point.x as f32 / scale - main.x,
+            point.y as f32 / scale - main.y,
+            main.width,
+        ))
+    }
+
+    fn media_duration(&self) -> Option<f64> {
+        self.state
+            .media
+            .as_ref()
+            .and_then(|media| media.timeline)
+            .map(|timeline| timeline.duration)
+            .filter(|duration| *duration > 0.0)
+    }
+
+    fn set_scrub(&mut self, scrub: Option<f32>) {
+        if let Some(mut media) = self.state.media.clone() {
+            media.scrub = scrub;
+            self.dispatch(IslandEvent::SetMedia(Some(media)));
+        }
+    }
+
+    fn finish_scrub(&mut self, commit: bool) {
+        self.scrubbing = false;
+        unsafe {
+            let _ = ReleaseCapture();
+        }
+        let fraction = self.state.media.as_ref().and_then(|media| media.scrub);
+        match fraction {
+            Some(fraction) if commit && self.media_duration().is_some() => {
+                self.media_action(MediaAction::Seek(fraction));
+            }
+            _ => self.set_scrub(None),
+        }
+    }
+
+    /// Sends a transport command and updates the card optimistically, so
+    /// the island reacts before the app reports back.
+    fn media_action(&mut self, action: MediaAction) {
+        let Some(mut media) = self.state.media.clone() else {
+            return;
+        };
+        let now = clock_now();
+        let command = match action {
+            MediaAction::Previous => MediaCommand::Previous,
+            MediaAction::Next => MediaCommand::Next,
+            MediaAction::PlayPause => {
+                if let Some(timeline) = &mut media.timeline {
+                    timeline.position = timeline.position_at(now, media.playing);
+                    timeline.sampled_at = now;
+                }
+                media.playing = !media.playing;
+                MediaCommand::TogglePlayPause
+            }
+            MediaAction::Seek(fraction) => {
+                let Some(timeline) = &mut media.timeline else {
+                    return;
+                };
+                timeline.position = f64::from(fraction) * timeline.duration;
+                timeline.sampled_at = now;
+                MediaCommand::Seek(timeline.position)
+            }
+        };
+        media.scrub = None;
+        if let Some(service) = &self.media {
+            service.send(command);
+        }
+        self.dispatch(IslandEvent::SetMedia(Some(media)));
     }
 
     /// Runs the poll timer only while something needs it, so an idle island
@@ -418,16 +678,18 @@ impl IslandHost {
         self.generation = self.generation.wrapping_add(1);
         // Grow the region before the render thread starts moving, so no
         // frame of the morph is clipped. It shrinks again on WM_APP_SETTLED.
-        let previous = self.morph_box.or_else(|| {
-            self.last_target
-                .and_then(|last| self.target_frame(last).bounds())
-        });
-        self.morph_box = match (previous, self.target_frame(target).bounds()) {
-            (Some(previous), Some(next)) => Some(previous.union(next)),
-            (previous, next) => previous.or(next),
-        };
-        self.last_target = Some(target);
-        self.update_region();
+        if self.last_target != Some(target) || self.morph_box.is_some() {
+            let previous = self.morph_box.or_else(|| {
+                self.last_target
+                    .and_then(|last| self.target_frame(last).bounds())
+            });
+            self.morph_box = match (previous, self.target_frame(target).bounds()) {
+                (Some(previous), Some(next)) => Some(previous.union(next)),
+                (previous, next) => previous.or(next),
+            };
+            self.last_target = Some(target);
+            self.update_region();
+        }
         let command = RenderCommand::Snapshot {
             target,
             content: Box::new(self.state.content()),
@@ -490,6 +752,7 @@ impl IslandHost {
             TimerKind::HoverExpand => TIMER_HOVER_EXPAND,
             TimerKind::HoverCollapse => TIMER_HOVER_COLLAPSE,
             TimerKind::DoneExpiry => TIMER_DONE_EXPIRY,
+            TimerKind::MediaPaused => TIMER_MEDIA_PAUSED,
         };
         let result = unsafe { SetTimer(Some(self.hwnd), id, after_ms, None) };
         if result == 0 {
@@ -502,6 +765,7 @@ impl IslandHost {
             TimerKind::HoverExpand => TIMER_HOVER_EXPAND,
             TimerKind::HoverCollapse => TIMER_HOVER_COLLAPSE,
             TimerKind::DoneExpiry => TIMER_DONE_EXPIRY,
+            TimerKind::MediaPaused => TIMER_MEDIA_PAUSED,
         };
         unsafe {
             let _ = KillTimer(Some(self.hwnd), id);
@@ -528,6 +792,12 @@ impl IslandHost {
                 }
                 self.dispatch(IslandEvent::Tick { now: clock_now() });
             }
+            TIMER_MEDIA_PAUSED => {
+                unsafe {
+                    let _ = KillTimer(Some(self.hwnd), TIMER_MEDIA_PAUSED);
+                }
+                self.dispatch(IslandEvent::MediaPausedElapsed);
+            }
             TIMER_POLL => self.poll(),
             TIMER_DEMO => self.demo_advance(),
             _ => {}
@@ -540,7 +810,7 @@ impl IslandHost {
                 tracing::warn!(%error, "could not follow monitor");
             }
         }
-        if !self.fullscreen_hidden {
+        if !self.fullscreen_hidden && !self.scrubbing {
             let inside = self.cursor_inside();
             if inside != self.state.pointer_inside {
                 self.dispatch(if inside {
@@ -648,6 +918,7 @@ impl IslandHost {
         }
         tracing::debug!(hidden, "full-screen visibility changed");
         self.update_poll_timer();
+        self.update_loopback();
     }
 
     fn should_hide_for_fullscreen(&self) -> bool {
@@ -736,11 +1007,21 @@ pub unsafe extern "system" fn window_proc(
 fn render_thread(
     config: RendererConfig,
     hit: Arc<Mutex<HitRegion>>,
+    bars: Arc<BarLevels>,
     rx: Receiver<RenderCommand>,
     notify: isize,
 ) {
     let notify = HWND(notify as *mut _);
-    let mut renderer = match Renderer::new(config, Arc::clone(&hit), clock_now()) {
+    // Tells the UI thread the shape stopped moving, so it can shrink the
+    // window region. Content-only animation does not count as moving.
+    let report_settled = |generation: usize| {
+        // SAFETY: posting to a window owned by the UI thread is
+        // non-blocking; a failure only delays the region shrink.
+        unsafe {
+            let _ = PostMessageW(Some(notify), WM_APP_SETTLED, WPARAM(generation), LPARAM(0));
+        }
+    };
+    let mut renderer = match Renderer::new(config, Arc::clone(&hit), bars, clock_now()) {
         Ok(renderer) => renderer,
         Err(error) => {
             tracing::error!(%error, "could not create island renderer");
@@ -820,6 +1101,10 @@ fn render_thread(
                 tracing::error!(%error, "island render failed");
                 break;
             }
+            if reported_settled != Some(generation) && !renderer.is_morphing(clock_now()) {
+                reported_settled = Some(generation);
+                report_settled(generation);
+            }
             if let Some((writer, last, count)) = &mut frame_log {
                 use std::io::Write;
                 let now = Instant::now();
@@ -838,12 +1123,7 @@ fn render_thread(
         } else {
             if reported_settled != Some(generation) {
                 reported_settled = Some(generation);
-                // SAFETY: posting to a window owned by the UI thread is
-                // non-blocking; a failure only delays the region shrink.
-                unsafe {
-                    let _ =
-                        PostMessageW(Some(notify), WM_APP_SETTLED, WPARAM(generation), LPARAM(0));
-                }
+                report_settled(generation);
             }
             if let Some((writer, _, _)) = &mut frame_log {
                 use std::io::Write;
@@ -964,6 +1244,11 @@ fn wait_for_compositor_clock() {
 fn clock_now() -> f64 {
     static START: OnceLock<Instant> = OnceLock::new();
     START.get_or_init(Instant::now).elapsed().as_secs_f64()
+}
+
+/// The island clock in milliseconds, for [`BarLevels`] freshness.
+fn clock_now_ms() -> u64 {
+    (clock_now() * 1000.0) as u64
 }
 
 fn read_config(shared: &Arc<RwLock<Config>>) -> Config {
@@ -1093,8 +1378,17 @@ fn demo_media() -> MediaCard {
     MediaCard {
         title: "Midnight City".to_owned(),
         artist: "M83".to_owned(),
-        progress: 0.42,
+        source: "Spotify".to_owned(),
         playing: true,
+        timeline: Some(Timeline {
+            position: 91.5,
+            duration: 243.0,
+            sampled_at: clock_now(),
+            rate: 1.0,
+        }),
+        art: None,
+        accent: None,
+        scrub: None,
     }
 }
 

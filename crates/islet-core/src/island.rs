@@ -7,10 +7,13 @@
 
 use crate::config::IdleStyle;
 use crate::geometry::Rect;
+use crate::media::{ArtImage, Timeline};
 
 pub const HOVER_EXPAND_MS: u32 = 250;
 pub const HOVER_COLLAPSE_MS: u32 = 400;
 pub const DONE_VISIBLE_MS: u32 = 4_000;
+/// Paused media drops off the island after this long (PLAN §8.2).
+pub const MEDIA_PAUSED_MS: u32 = 5 * 60 * 1_000;
 pub const SPLIT_GAP_DP: f32 = 6.0;
 
 /// Sizes from PLAN.md §4.4, in logical pixels (DIPs).
@@ -183,8 +186,23 @@ pub enum DictationPhase {
 pub struct MediaCard {
     pub title: String,
     pub artist: String,
-    pub progress: f32,
+    /// Short app name, e.g. "Spotify".
+    pub source: String,
     pub playing: bool,
+    pub timeline: Option<Timeline>,
+    pub art: Option<ArtImage>,
+    /// Dominant album-art colour, when tinting is enabled and the art has one.
+    pub accent: Option<[u8; 3]>,
+    /// Scrubber position while the user drags it, 0..=1.
+    pub scrub: Option<f32>,
+}
+
+impl MediaCard {
+    /// Same track, so an update should not run a content transition.
+    #[must_use]
+    pub fn same_track(&self, other: &Self) -> bool {
+        self.title == other.title && self.artist == other.artist && self.source == other.source
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -236,6 +254,17 @@ impl ContentCard {
         }
     }
 
+    /// Whether `next` is this same item updating in place (new timeline,
+    /// level, or play state), which should not run a content morph.
+    #[must_use]
+    pub fn updates_in_place(&self, next: &Self) -> bool {
+        match (self, next) {
+            (Self::Media(a), Self::Media(b)) => a.same_track(b) && a.art == b.art,
+            (Self::Dictation(a), Self::Dictation(b)) => a.phase == b.phase,
+            (a, b) => a == b,
+        }
+    }
+
     #[must_use]
     pub fn animates(&self) -> bool {
         match self {
@@ -260,6 +289,17 @@ impl ContentSnapshot {
         self.primary.is_none() && self.secondary.is_none()
     }
 
+    /// Whether `next` only updates the same items in the same slots.
+    #[must_use]
+    pub fn updates_in_place(&self, next: &Self) -> bool {
+        let same = |a: &Option<ContentCard>, b: &Option<ContentCard>| match (a, b) {
+            (None, None) => true,
+            (Some(a), Some(b)) => a.updates_in_place(b),
+            _ => false,
+        };
+        same(&self.primary, &next.primary) && same(&self.secondary, &next.secondary)
+    }
+
     #[must_use]
     pub fn animates(&self) -> bool {
         self.primary.as_ref().is_some_and(ContentCard::animates)
@@ -274,6 +314,9 @@ pub struct IslandState {
     pub done: Option<NotificationCard>,
     pub running: Option<AgentCard>,
     pub media: Option<MediaCard>,
+    /// The paused track was dropped after `MEDIA_PAUSED_MS`; ignore paused
+    /// updates until something plays again.
+    pub media_dismissed: bool,
     pub idle_style: IdleStyle,
     pub expanded: bool,
     pub pointer_inside: bool,
@@ -288,6 +331,7 @@ impl Default for IslandState {
             done: None,
             running: None,
             media: None,
+            media_dismissed: false,
             idle_style: IdleStyle::Hidden,
             expanded: false,
             pointer_inside: false,
@@ -414,6 +458,7 @@ pub enum TimerKind {
     HoverExpand,
     HoverCollapse,
     DoneExpiry,
+    MediaPaused,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -437,6 +482,7 @@ pub enum IslandEvent {
     HoverLeave,
     HoverExpandElapsed,
     HoverCollapseElapsed,
+    MediaPausedElapsed,
     Click,
     Tick { now: f64 },
     SetExpanded(bool),
@@ -547,8 +593,43 @@ pub fn reduce(state: &mut IslandState, event: IslandEvent, now: f64) -> Vec<Effe
             }
         }
         IslandEvent::SetMedia(card) => {
+            let was_paused = state.media.as_ref().is_some_and(|media| !media.playing);
+            let card = match card {
+                Some(card) if card.playing => {
+                    state.media_dismissed = false;
+                    Some(card)
+                }
+                Some(_) if state.media_dismissed => None,
+                Some(card) => Some(card),
+                None => {
+                    state.media_dismissed = false;
+                    None
+                }
+            };
+            let mut effects = Vec::new();
+            match &card {
+                Some(media) if !media.playing && !was_paused => {
+                    effects.push(Effect::ArmTimer {
+                        kind: TimerKind::MediaPaused,
+                        after_ms: MEDIA_PAUSED_MS,
+                    });
+                }
+                Some(media) if !media.playing => {}
+                _ => effects.push(Effect::CancelTimer(TimerKind::MediaPaused)),
+            }
             if state.media != card {
                 state.media = card;
+                effects.extend(Effect::changed());
+            }
+            effects
+        }
+        IslandEvent::MediaPausedElapsed => {
+            if state.media.as_ref().is_some_and(|media| !media.playing) {
+                state.media = None;
+                state.media_dismissed = true;
+                if !state.has_activity() {
+                    state.expanded = false;
+                }
                 Effect::changed()
             } else {
                 Vec::new()
@@ -612,7 +693,7 @@ pub fn reduce(state: &mut IslandState, event: IslandEvent, now: f64) -> Vec<Effe
 
 fn accent_for_card(card: &ContentCard) -> [u8; 3] {
     match card {
-        ContentCard::Media(_) => [92, 132, 255],
+        ContentCard::Media(media) => media.accent.unwrap_or([92, 132, 255]),
         ContentCard::Notification(notification) => match notification.level {
             AlertLevel::Info => [110, 150, 255],
             AlertLevel::Success => [64, 210, 122],
@@ -636,9 +717,91 @@ mod tests {
         MediaCard {
             title: "Midnight City".to_owned(),
             artist: "M83".to_owned(),
-            progress: 0.42,
+            source: "Spotify".to_owned(),
             playing: true,
+            timeline: None,
+            art: None,
+            accent: None,
+            scrub: None,
         }
+    }
+
+    fn paused() -> MediaCard {
+        MediaCard {
+            playing: false,
+            ..media()
+        }
+    }
+
+    #[test]
+    fn paused_media_drops_off_after_five_minutes_until_it_plays_again() {
+        let mut state = IslandState::default();
+        reduce(&mut state, IslandEvent::SetMedia(Some(media())), 0.0);
+        let effects = reduce(&mut state, IslandEvent::SetMedia(Some(paused())), 1.0);
+        assert!(effects.contains(&Effect::ArmTimer {
+            kind: TimerKind::MediaPaused,
+            after_ms: MEDIA_PAUSED_MS,
+        }));
+
+        // A further paused update (e.g. a timeline change) does not re-arm.
+        let mut later = paused();
+        later.timeline = Some(Timeline {
+            position: 3.0,
+            duration: 100.0,
+            sampled_at: 2.0,
+            rate: 1.0,
+        });
+        let effects = reduce(&mut state, IslandEvent::SetMedia(Some(later)), 2.0);
+        assert!(!effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::ArmTimer { .. })));
+
+        reduce(&mut state, IslandEvent::MediaPausedElapsed, 301.0);
+        assert!(state.media.is_none());
+        assert_eq!(state.layout(), LayoutTarget::HIDDEN);
+
+        // Still paused: stays hidden.
+        reduce(&mut state, IslandEvent::SetMedia(Some(paused())), 302.0);
+        assert!(state.media.is_none());
+
+        // Playing again brings it back.
+        let effects = reduce(&mut state, IslandEvent::SetMedia(Some(media())), 303.0);
+        assert!(effects.contains(&Effect::CancelTimer(TimerKind::MediaPaused)));
+        assert!(state.media.is_some());
+    }
+
+    #[test]
+    fn timeline_and_play_state_update_in_place_but_tracks_do_not() {
+        let before = ContentSnapshot {
+            primary: Some(ContentCard::Media(media())),
+            ..ContentSnapshot::default()
+        };
+        let mut moved = media();
+        moved.playing = false;
+        moved.scrub = Some(0.5);
+        let after = ContentSnapshot {
+            primary: Some(ContentCard::Media(moved)),
+            ..ContentSnapshot::default()
+        };
+        assert!(before.updates_in_place(&after));
+
+        let mut other = media();
+        other.title = "Wait".to_owned();
+        let changed = ContentSnapshot {
+            primary: Some(ContentCard::Media(other)),
+            ..ContentSnapshot::default()
+        };
+        assert!(!before.updates_in_place(&changed));
+        assert!(!before.updates_in_place(&ContentSnapshot::default()));
+    }
+
+    #[test]
+    fn media_accent_follows_album_art() {
+        let mut state = IslandState::default();
+        let mut card = media();
+        card.accent = Some([200, 40, 60]);
+        reduce(&mut state, IslandEvent::SetMedia(Some(card)), 0.0);
+        assert_eq!(state.content().accent, [200, 40, 60]);
     }
 
     fn agent() -> AgentCard {
