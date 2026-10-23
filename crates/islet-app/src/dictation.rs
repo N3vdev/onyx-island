@@ -107,6 +107,9 @@ const DONE_VISIBLE: Duration = Duration::from_millis(700);
 const FORWARD_SAMPLES: usize = 480;
 /// Audio held while the model is still loading (about two minutes).
 const MAX_PENDING_SAMPLES: usize = 16_000 * 120;
+/// A recording whose loudest sample is below this (about -54 dBFS) is
+/// silence, not a quiet room: the device is muted, virtual, or wrong.
+const SILENCE_PEAK: f32 = 0.002;
 /// Notices about a missing model are not repeated more often than this.
 const NOTICE_COOLDOWN: Duration = Duration::from_secs(8);
 
@@ -139,6 +142,8 @@ struct Session {
     /// Audio waiting to be forwarded in a full chunk.
     outgoing: Vec<f32>,
     samples: usize,
+    /// Loudest sample heard; ~0 means the microphone delivered silence.
+    peak: f32,
     stopped_at: Option<Instant>,
     /// When `End` was sent to the worker.
     end_sent_at: Option<Instant>,
@@ -442,6 +447,7 @@ impl Controller {
             pending: Vec::new(),
             outgoing: Vec::new(),
             samples: 0,
+            peak: 0.0,
             stopped_at: None,
             end_sent_at: None,
         };
@@ -579,6 +585,9 @@ impl Controller {
         }
         self.sample_count += chunk.len();
         session.samples += chunk.len();
+        session.peak = chunk
+            .iter()
+            .fold(session.peak, |peak, sample| peak.max(sample.abs()));
 
         if session.began {
             session.outgoing.extend_from_slice(chunk);
@@ -740,12 +749,24 @@ impl Controller {
             .as_ref()
             .and_then(|session| session.end_sent_at)
             .map(|at| at.elapsed().as_millis() as u64);
+        let heard_silence = self
+            .session
+            .as_ref()
+            .is_some_and(|session| session.peak < SILENCE_PEAK);
         self.session = None;
         let mut text = transcript::clean(raw, &self.text_options);
         if text.is_empty() {
             self.phase = Phase::Idle;
             self.recording_ended();
             self.hide();
+            if heard_silence {
+                // Most often the wrong input device (a virtual or muted one).
+                self.notice(
+                    "No sound",
+                    "Islet heard silence. Choose your microphone in Settings > Dictation.",
+                    AlertLevel::NeedsInput,
+                );
+            }
             return;
         }
         if self.config.trailing_space {
