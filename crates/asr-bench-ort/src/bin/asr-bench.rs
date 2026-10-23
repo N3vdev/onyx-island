@@ -2,8 +2,8 @@
 //! report model load time, latency, real-time speed, WER, and peak RSS.
 //!
 //! Usage:
-//!   cargo run --release -p islet-asr --bin asr-bench
-//!   cargo run --release -p islet-asr --bin asr-bench -- --wav path/to.wav --expected "text"
+//!   cargo run --release -p asr-bench-ort --bin asr-bench
+//!   cargo run --release -p asr-bench-ort --bin asr-bench -- --wav path/to.wav --expected "text"
 //!
 //! Model files are read from `%LOCALAPPDATA%\Islet\models\parakeet-tdt-0.6b-v3-int8`
 //! unless `--models` is supplied.
@@ -14,7 +14,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use islet_asr::{Engine, ParakeetTdt, SAMPLE_RATE};
+use asr_bench_ort::{Engine, ParakeetTdt, SAMPLE_RATE};
 use serde::Deserialize;
 use serde_json::json;
 

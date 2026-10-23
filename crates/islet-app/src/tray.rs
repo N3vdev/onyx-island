@@ -1,5 +1,4 @@
-use std::os::windows::ffi::OsStrExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use islet_core::Config;
@@ -7,19 +6,16 @@ use windows::core::{w, Error, PCWSTR};
 use windows::Win32::Foundation::{GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Shell::{
-    ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
-    NOTIFYICONDATAW,
+    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-    DispatchMessageW, GetCursorPos, GetMessageW, GetWindowLongPtrW, LoadCursorW, LoadIconW,
-    PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SetForegroundWindow,
-    SetWindowLongPtrW, TrackPopupMenu, TranslateMessage, CREATESTRUCTW, CW_USEDEFAULT,
-    GWLP_USERDATA, HICON, IDC_ARROW, IDI_APPLICATION, MF_SEPARATOR, MF_STRING, MSG, SW_SHOWNORMAL,
-    TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE,
-    WM_COMMAND, WM_CONTEXTMENU, WM_CREATE, WM_DESTROY, WM_LBUTTONUP, WM_NCCREATE, WM_NCDESTROY,
-    WM_NULL, WM_RBUTTONUP, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowExW, FindWindowW,
+    GetMessageW, GetWindowLongPtrW, LoadCursorW, LoadIconW, PostMessageW, PostQuitMessage,
+    RegisterClassW, RegisterWindowMessageW, SetWindowLongPtrW, TranslateMessage, CREATESTRUCTW,
+    CW_USEDEFAULT, GWLP_USERDATA, HICON, IDC_ARROW, IDI_APPLICATION, MSG, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WM_APP, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_CREATE, WM_DESTROY,
+    WM_LBUTTONUP, WM_NCCREATE, WM_NCDESTROY, WM_NULL, WM_RBUTTONUP, WNDCLASSW, WS_EX_NOACTIVATE,
+    WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 use crate::config_watch;
@@ -31,23 +27,20 @@ pub const WM_APP_TRAY: u32 = WM_APP + 1;
 pub const WM_APP_CONFIG_CHANGED: u32 = WM_APP + 2;
 
 const TRAY_ICON_ID: u32 = 1;
-const MENU_OPEN_CONFIG: usize = 1;
-const MENU_OPEN_LOGS: usize = 2;
-const MENU_RELOAD_CONFIG: usize = 3;
-const MENU_QUIT: usize = 4;
-const MENU_SETTINGS: usize = 5;
+use crate::context_menu::{
+    self, PAUSE_DICTATION as MENU_PAUSE_DICTATION, QUIT as MENU_QUIT, RESTART as MENU_RESTART,
+    SETTINGS as MENU_SETTINGS,
+};
 
 struct AppState {
     hwnd: HWND,
     icon: HICON,
     nid: NOTIFYICONDATAW,
     tray_added: bool,
-    config_file: PathBuf,
-    log_dir: PathBuf,
-    shared: Arc<RwLock<Config>>,
     taskbar_created: u32,
     island_hwnd: HWND,
     island_host: Option<Box<island_window::IslandHost>>,
+    dictation_paused: bool,
 }
 
 impl Drop for AppState {
@@ -59,23 +52,16 @@ impl Drop for AppState {
 }
 
 impl AppState {
-    fn new(
-        icon: HICON,
-        config_file: PathBuf,
-        log_dir: PathBuf,
-        shared: Arc<RwLock<Config>>,
-    ) -> Self {
+    fn new(icon: HICON) -> Self {
         Self {
             hwnd: HWND::default(),
             icon,
             nid: NOTIFYICONDATAW::default(),
             tray_added: false,
-            config_file,
-            log_dir,
-            shared,
             taskbar_created: 0,
             island_hwnd: HWND::default(),
             island_host: None,
+            dictation_paused: false,
         }
     }
 
@@ -106,74 +92,46 @@ impl AppState {
         }
     }
 
-    fn show_menu(&self) {
-        let menu = match unsafe { CreatePopupMenu() } {
-            Ok(menu) => menu,
-            Err(error) => {
-                tracing::warn!(%error, "could not create tray menu");
-                return;
-            }
-        };
-
-        let _ = unsafe { AppendMenuW(menu, MF_STRING, MENU_SETTINGS, w!("Settings…")) };
-        let _ = unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()) };
-        let _ = unsafe { AppendMenuW(menu, MF_STRING, MENU_OPEN_CONFIG, w!("Open config")) };
-        let _ = unsafe { AppendMenuW(menu, MF_STRING, MENU_OPEN_LOGS, w!("Open logs")) };
-        let _ = unsafe { AppendMenuW(menu, MF_STRING, MENU_RELOAD_CONFIG, w!("Reload config")) };
-        let _ = unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()) };
-        let _ = unsafe { AppendMenuW(menu, MF_STRING, MENU_QUIT, w!("Quit Islet")) };
-
-        let mut point = windows::Win32::Foundation::POINT::default();
-        let _ = unsafe { GetCursorPos(&mut point) };
-        let _ = unsafe { SetForegroundWindow(self.hwnd) };
-
-        let command = unsafe {
-            TrackPopupMenu(
-                menu,
-                TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
-                point.x,
-                point.y,
-                Some(0),
-                self.hwnd,
-                None,
-            )
-        };
-        let _ = unsafe { DestroyMenu(menu) };
-        let _ = unsafe { PostMessageW(Some(self.hwnd), WM_NULL, WPARAM(0), LPARAM(0)) };
-
-        if command.0 != 0 {
-            self.handle_command(command.0 as usize);
+    fn show_menu(&mut self) {
+        match context_menu::show(self.hwnd) {
+            Ok(command) if command != 0 => self.handle_command(command),
+            Ok(_) => {}
+            Err(error) => tracing::warn!(%error, "could not show context menu"),
+        }
+        unsafe {
+            let _ = PostMessageW(Some(self.hwnd), WM_NULL, WPARAM(0), LPARAM(0));
         }
     }
 
-    fn handle_command(&self, command: usize) {
+    fn handle_command(&mut self, command: usize) {
         match command {
             MENU_SETTINGS => settings::open(None),
-            MENU_OPEN_CONFIG => open_path(&self.config_file),
-            MENU_OPEN_LOGS => open_path(&self.log_dir),
-            MENU_RELOAD_CONFIG => self.reload_config(),
+            MENU_PAUSE_DICTATION => {
+                self.dictation_paused = !self.dictation_paused;
+                context_menu::set_dictation_paused(self.dictation_paused);
+                if let Some(host) = &mut self.island_host {
+                    host.set_dictation_paused(self.dictation_paused);
+                }
+                tracing::info!(paused = self.dictation_paused, "dictation pause toggled");
+            }
+            MENU_RESTART => match crate::restart::launch() {
+                Ok(()) => {
+                    tracing::info!("restart requested from tray");
+                    unsafe {
+                        let _ = PostMessageW(Some(self.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+                    }
+                }
+                Err(error) => {
+                    tracing::error!(%error, "could not restart Islet; keeping current instance running")
+                }
+            },
             MENU_QUIT => {
                 tracing::info!("quit requested from tray");
                 unsafe {
-                    let _ = DestroyWindow(self.hwnd);
+                    let _ = PostMessageW(Some(self.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
                 }
             }
             _ => {}
-        }
-    }
-
-    fn reload_config(&self) {
-        match Config::load(&self.config_file) {
-            Ok(config) => {
-                match self.shared.write() {
-                    Ok(mut current) => *current = config,
-                    Err(poisoned) => *poisoned.into_inner() = config,
-                }
-                tracing::info!(path = %self.config_file.display(), "config reloaded from tray");
-            }
-            Err(error) => {
-                tracing::warn!(%error, "config reload failed; keeping previous config");
-            }
         }
     }
 
@@ -198,7 +156,6 @@ impl AppState {
 
 pub fn run(
     config_file: PathBuf,
-    log_dir: PathBuf,
     shared: Arc<RwLock<Config>>,
     demo: bool,
     demo_state: Option<usize>,
@@ -244,12 +201,7 @@ pub fn run(
         return Err(Box::new(Error::from_thread()));
     }
 
-    let state = Box::new(AppState::new(
-        icon,
-        config_file.clone(),
-        log_dir.clone(),
-        Arc::clone(&shared),
-    ));
+    let state = Box::new(AppState::new(icon));
     let state_pointer = Box::into_raw(state);
 
     let hwnd = match unsafe {
@@ -333,6 +285,21 @@ pub fn run(
         (*state_pointer).island_host = Some(host);
     }
     tracing::info!(hwnd = ?island_hwnd, demo, "island window created");
+    // A restart reconnects the same live preview without polling settings.
+    unsafe {
+        if let Ok(settings) = FindWindowW(None, w!("Islet Settings")) {
+            if let Ok(anchor) =
+                FindWindowExW(Some(settings), None, w!("STATIC"), w!("IsletPreviewAnchor"))
+            {
+                let _ = PostMessageW(
+                    Some(island_hwnd),
+                    islet_core::handoff::PREVIEW_ATTACH,
+                    WPARAM(anchor.0 as usize),
+                    LPARAM(0),
+                );
+            }
+        }
+    }
 
     // The watcher lives for the whole message loop. Dropping it disconnects the
     // watcher thread, which then exits naturally.
@@ -365,6 +332,9 @@ unsafe extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    if let Some(result) = context_menu::handle_message(message, lparam) {
+        return result;
+    }
     match message {
         WM_NCCREATE => {
             let create = lparam.0 as *const CREATESTRUCTW;
@@ -454,27 +424,6 @@ fn with_state(hwnd: HWND, action: impl FnOnce(&mut AppState)) {
     if !pointer.is_null() {
         let state = unsafe { &mut *pointer };
         action(state);
-    }
-}
-
-fn open_path(path: &Path) {
-    let wide: Vec<u16> = path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    let result = unsafe {
-        ShellExecuteW(
-            None,
-            w!("open"),
-            PCWSTR(wide.as_ptr()),
-            PCWSTR::null(),
-            PCWSTR::null(),
-            SW_SHOWNORMAL,
-        )
-    };
-    if result.0 as isize <= 32 {
-        tracing::warn!(path = %path.display(), "could not open path");
     }
 }
 

@@ -1,0 +1,16 @@
+[package]
+name = "islet-asr-worker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The only place ONNX Runtime is linked. Speaks the islet-asr protocol on
+# stdin/stdout; see islet-asr/src/protocol.rs.
+[[bin]]
+name = "islet-asr-worker"
+path = "src/main.rs"
+
+[dependencies]
+islet-asr = { path = "../islet-asr" }
+sherpa-onnx = "=1.13.8"

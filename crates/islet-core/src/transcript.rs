@@ -1,0 +1,495 @@
+//! Cleaning up recognised speech before it is typed.
+//!
+//! Parakeet already returns punctuated, capitalised text, so this stage only
+//! does what the model cannot: drop filler words, turn spoken commands into
+//! punctuation, and apply the user's own spellings and snippets. It works on
+//! words with their attached punctuation, so "Um, so" and "claude code." are
+//! handled without regular expressions.
+
+use crate::config::{DictationConfig, Replacement};
+
+/// What to clean, taken from the user's settings.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TextOptions {
+    pub filler_removal: bool,
+    pub spoken_punctuation: bool,
+    pub dictionary: Vec<Replacement>,
+    pub snippets: Vec<Replacement>,
+}
+
+impl TextOptions {
+    #[must_use]
+    pub fn from_config(config: &DictationConfig) -> Self {
+        Self {
+            filler_removal: config.filler_removal,
+            spoken_punctuation: config.spoken_punctuation,
+            dictionary: config.dictionary.clone(),
+            snippets: config.snippets.clone(),
+        }
+    }
+}
+
+/// A word with the punctuation stuck to its ends: `("(", "hello", ",")`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Token {
+    lead: String,
+    word: String,
+    trail: String,
+    /// Replacement text that must be emitted verbatim (not re-capitalised).
+    verbatim: bool,
+}
+
+impl Token {
+    fn parse(raw: &str) -> Self {
+        if !raw.chars().any(char::is_alphanumeric) {
+            // A dash or ellipsis standing alone is a word of its own, spaced
+            // like any other (bare marks are only ever made by the rules).
+            return Self {
+                lead: String::new(),
+                word: raw.to_owned(),
+                trail: String::new(),
+                verbatim: true,
+            };
+        }
+        let start = raw.find(|c: char| c.is_alphanumeric()).unwrap_or(raw.len());
+        let end = raw
+            .rfind(|c: char| c.is_alphanumeric())
+            .map_or(start, |index| {
+                index + raw[index..].chars().next().map_or(1, char::len_utf8)
+            });
+        // Keep inner apostrophes and hyphens ("don't", "well-known") in the word.
+        Self {
+            lead: raw[..start].to_owned(),
+            word: raw[start..end].to_owned(),
+            trail: raw[end..].to_owned(),
+            verbatim: false,
+        }
+    }
+
+    fn key(&self) -> String {
+        self.word.to_lowercase()
+    }
+
+    fn ends_sentence(&self) -> bool {
+        self.trail.contains(['.', '?', '!'])
+    }
+
+    fn render(&self) -> String {
+        format!("{}{}{}", self.lead, self.word, self.trail)
+    }
+}
+
+#[derive(Clone, Debug)]
+enum Rule {
+    /// Replace the words, keeping surrounding punctuation.
+    Text(String),
+    /// Replace the words and swallow trailing sentence punctuation.
+    Snippet(String),
+    Punct(&'static str),
+    /// A line break; the next word starts a sentence.
+    Break(&'static str),
+}
+
+struct Phrase {
+    words: Vec<String>,
+    rule: Rule,
+}
+
+fn phrase_words(text: &str) -> Vec<String> {
+    text.split_whitespace()
+        .map(|part| Token::parse(part).key())
+        .filter(|word| !word.is_empty())
+        .collect()
+}
+
+fn build_phrases(options: &TextOptions) -> Vec<Phrase> {
+    let mut phrases = Vec::new();
+    for entry in &options.snippets {
+        let words = phrase_words(&entry.from);
+        if !words.is_empty() {
+            phrases.push(Phrase {
+                words,
+                rule: Rule::Snippet(entry.to.clone()),
+            });
+        }
+    }
+    if options.spoken_punctuation {
+        for (spoken, rule) in [
+            ("new paragraph", Rule::Break("\n\n")),
+            ("new line", Rule::Break("\n")),
+            ("full stop", Rule::Punct(".")),
+            ("question mark", Rule::Punct("?")),
+            ("exclamation mark", Rule::Punct("!")),
+            ("exclamation point", Rule::Punct("!")),
+            ("comma", Rule::Punct(",")),
+        ] {
+            phrases.push(Phrase {
+                words: phrase_words(spoken),
+                rule,
+            });
+        }
+    }
+    for entry in &options.dictionary {
+        let words = phrase_words(&entry.from);
+        if !words.is_empty() {
+            phrases.push(Phrase {
+                words,
+                rule: Rule::Text(entry.to.clone()),
+            });
+        }
+    }
+    // Longest phrase first, so "new paragraph" beats a dictionary "new".
+    phrases.sort_by_key(|phrase| std::cmp::Reverse(phrase.words.len()));
+    phrases
+}
+
+/// Applies the phrase rules left to right.
+fn apply_phrases(tokens: &[Token], phrases: &[Phrase]) -> Vec<Token> {
+    let mut out: Vec<Token> = Vec::with_capacity(tokens.len());
+    let mut index = 0;
+    'next: while index < tokens.len() {
+        for phrase in phrases {
+            let end = index + phrase.words.len();
+            if end > tokens.len() {
+                continue;
+            }
+            let span = &tokens[index..end];
+            if span
+                .iter()
+                .zip(&phrase.words)
+                .all(|(token, word)| &token.key() == word)
+            {
+                let first = &span[0];
+                let last = &span[span.len() - 1];
+                match &phrase.rule {
+                    Rule::Text(text) => out.push(Token {
+                        lead: first.lead.clone(),
+                        word: text.clone(),
+                        trail: last.trail.clone(),
+                        verbatim: true,
+                    }),
+                    Rule::Snippet(text) => out.push(Token {
+                        lead: first.lead.clone(),
+                        word: text.clone(),
+                        trail: last
+                            .trail
+                            .trim_start_matches(['.', ',', '?', '!'])
+                            .to_owned(),
+                        verbatim: true,
+                    }),
+                    Rule::Punct(mark) => {
+                        // Attach to the previous word, replacing its own
+                        // trailing mark ("Hello, comma" -> "Hello,").
+                        if let Some(previous) = out.last_mut() {
+                            previous.trail = (*mark).to_owned();
+                        } else {
+                            out.push(Token {
+                                lead: String::new(),
+                                word: String::new(),
+                                trail: (*mark).to_owned(),
+                                verbatim: true,
+                            });
+                        }
+                    }
+                    Rule::Break(text) => out.push(Token {
+                        lead: String::new(),
+                        word: String::new(),
+                        trail: (*text).to_owned(),
+                        verbatim: true,
+                    }),
+                }
+                index = end;
+                continue 'next;
+            }
+        }
+        out.push(tokens[index].clone());
+        index += 1;
+    }
+    out
+}
+
+const FILLERS: &[&str] = &["um", "umm", "uh", "uhh", "uhm", "erm", "hmm", "mhm"];
+
+fn is_break(token: &Token) -> bool {
+    token.word.is_empty() && token.trail.starts_with('\n')
+}
+
+/// Drops filler words and a clause-initial "you know".
+fn remove_fillers(tokens: Vec<Token>) -> Vec<Token> {
+    let mut out: Vec<Token> = Vec::with_capacity(tokens.len());
+    let mut index = 0;
+    while index < tokens.len() {
+        let token = &tokens[index];
+        let at_clause_start = out
+            .last()
+            .is_none_or(|previous| previous.ends_sentence() || is_break(previous));
+
+        let is_filler = !token.verbatim && FILLERS.contains(&token.key().as_str());
+        let is_you_know = at_clause_start
+            && !token.verbatim
+            && token.key() == "you"
+            && tokens
+                .get(index + 1)
+                .is_some_and(|next| next.key() == "know");
+
+        if is_filler || is_you_know {
+            let removed = if is_you_know {
+                &tokens[index + 1]
+            } else {
+                token
+            };
+            // Keep what the filler carried: a sentence end moves to the
+            // previous word ("... that, um." -> "... that.").
+            if removed.ends_sentence() {
+                if let Some(previous) = out.last_mut() {
+                    if !previous.ends_sentence() {
+                        previous.trail = removed.trail.clone();
+                    }
+                }
+            }
+            index += if is_you_know { 2 } else { 1 };
+            // The word after a dropped sentence-initial filler starts the
+            // sentence, so it gets its capital back.
+            if at_clause_start {
+                if let Some(next) = tokens.get(index) {
+                    let mut next = next.clone();
+                    capitalize(&mut next);
+                    out.push(next);
+                    index += 1;
+                }
+            }
+            continue;
+        }
+        out.push(token.clone());
+        index += 1;
+    }
+    out
+}
+
+fn capitalize(token: &mut Token) {
+    if token.verbatim {
+        return;
+    }
+    let mut chars = token.word.chars();
+    if let Some(first) = chars.next() {
+        token.word = first.to_uppercase().chain(chars).collect();
+    }
+}
+
+/// Spacing rules: words separated by one space, marks attached to the
+/// previous word, a capital after a line break.
+fn render(tokens: &[Token]) -> String {
+    let mut out = String::new();
+    let mut capitalize_next = false;
+    for token in tokens {
+        let mut token = token.clone();
+        if capitalize_next && !token.word.is_empty() {
+            capitalize(&mut token);
+            capitalize_next = false;
+        }
+        if token.word.is_empty() {
+            // A bare mark or line break.
+            let trail = token.trail.as_str();
+            if trail.starts_with('\n') {
+                while out.ends_with(' ') {
+                    out.pop();
+                }
+                out.push_str(trail);
+                capitalize_next = true;
+            } else {
+                while out.ends_with(' ') {
+                    out.pop();
+                }
+                out.push_str(trail);
+            }
+            continue;
+        }
+        if !out.is_empty() && !out.ends_with(['\n', ' ']) {
+            out.push(' ');
+        }
+        out.push_str(&token.render());
+    }
+    out.trim().to_owned()
+}
+
+/// Cleans one recognised utterance.
+#[must_use]
+pub fn clean(text: &str, options: &TextOptions) -> String {
+    let tokens: Vec<Token> = text.split_whitespace().map(Token::parse).collect();
+    if tokens.is_empty() {
+        return String::new();
+    }
+    let phrases = build_phrases(options);
+    let mut tokens = if phrases.is_empty() {
+        tokens
+    } else {
+        apply_phrases(&tokens, &phrases)
+    };
+    if options.filler_removal {
+        tokens = remove_fillers(tokens);
+    }
+    render(&tokens)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn options() -> TextOptions {
+        TextOptions {
+            filler_removal: true,
+            spoken_punctuation: true,
+            dictionary: Vec::new(),
+            snippets: Vec::new(),
+        }
+    }
+
+    fn entry(from: &str, to: &str) -> Replacement {
+        Replacement {
+            from: from.to_owned(),
+            to: to.to_owned(),
+        }
+    }
+
+    #[test]
+    fn plain_text_passes_through() {
+        assert_eq!(
+            clean("Hello, world. How are you?", &options()),
+            "Hello, world. How are you?"
+        );
+        assert_eq!(clean("   ", &options()), "");
+        assert_eq!(clean("", &options()), "");
+    }
+
+    #[test]
+    fn removes_filler_words_and_keeps_the_rest() {
+        let o = options();
+        assert_eq!(
+            clean("I was, um, thinking about it.", &o),
+            "I was, thinking about it."
+        );
+        assert_eq!(clean("So uh we should go.", &o), "So we should go.");
+        assert_eq!(clean("Um, so we should go.", &o), "So we should go.");
+        assert_eq!(clean("We should go, um.", &o), "We should go.");
+        assert_eq!(
+            clean("It was good. Uh, really good.", &o),
+            "It was good. Really good."
+        );
+        // Words that merely contain a filler are untouched.
+        assert_eq!(
+            clean("The umbrella and the hummus.", &o),
+            "The umbrella and the hummus."
+        );
+    }
+
+    #[test]
+    fn removes_you_know_only_at_clause_starts() {
+        let o = options();
+        assert_eq!(clean("You know, I think so.", &o), "I think so.");
+        assert_eq!(
+            clean("It works. You know, it really does.", &o),
+            "It works. It really does."
+        );
+        assert_eq!(
+            clean("Do you know the answer?", &o),
+            "Do you know the answer?"
+        );
+    }
+
+    #[test]
+    fn filler_removal_can_be_turned_off() {
+        let mut o = options();
+        o.filler_removal = false;
+        assert_eq!(clean("Um, so we go.", &o), "Um, so we go.");
+    }
+
+    #[test]
+    fn spoken_punctuation_becomes_marks_and_breaks() {
+        let o = options();
+        assert_eq!(
+            clean("Dear team new paragraph Thanks for the update", &o),
+            "Dear team\n\nThanks for the update"
+        );
+        assert_eq!(
+            clean("Hello. New line. How are you?", &o),
+            "Hello.\nHow are you?"
+        );
+        assert_eq!(clean("first new line second", &o), "first\nSecond");
+        assert_eq!(clean("Wait comma what question mark", &o), "Wait, what?");
+        assert_eq!(clean("Great exclamation mark", &o), "Great!");
+        assert_eq!(clean("That is all full stop", &o), "That is all.");
+    }
+
+    #[test]
+    fn spoken_punctuation_can_be_turned_off() {
+        let mut o = options();
+        o.spoken_punctuation = false;
+        assert_eq!(clean("a new line b", &o), "a new line b");
+    }
+
+    #[test]
+    fn dictionary_fixes_spellings_and_keeps_punctuation() {
+        let mut o = options();
+        o.dictionary = vec![
+            entry("claude code", "Claude Code"),
+            entry("kubernetes", "Kubernetes"),
+        ];
+        assert_eq!(
+            clean("I use claude code every day.", &o),
+            "I use Claude Code every day."
+        );
+        assert_eq!(
+            clean("Run kubernetes, then claude code.", &o),
+            "Run Kubernetes, then Claude Code."
+        );
+        assert_eq!(clean("Claude Code, please", &o), "Claude Code, please");
+    }
+
+    #[test]
+    fn snippets_expand_and_drop_sentence_punctuation() {
+        let mut o = options();
+        o.snippets = vec![entry("insert my email", "me@example.com")];
+        assert_eq!(
+            clean("Send it to insert my email.", &o),
+            "Send it to me@example.com"
+        );
+        assert_eq!(
+            clean("Insert my email, thanks", &o),
+            "me@example.com thanks"
+        );
+    }
+
+    #[test]
+    fn longer_phrases_win() {
+        let mut o = options();
+        o.dictionary = vec![entry("new", "NEW")];
+        assert_eq!(clean("a new paragraph b", &o), "a\n\nB");
+    }
+
+    #[test]
+    fn non_english_text_is_left_alone() {
+        let o = options();
+        assert_eq!(clean("Привет, как дела?", &o), "Привет, как дела?");
+        assert_eq!(
+            clean("Das ist schön — nicht wahr?", &o),
+            "Das ist schön — nicht wahr?"
+        );
+    }
+
+    #[test]
+    fn tokens_keep_their_punctuation() {
+        let token = Token::parse("(Hello,");
+        assert_eq!(
+            (
+                token.lead.as_str(),
+                token.word.as_str(),
+                token.trail.as_str()
+            ),
+            ("(", "Hello", ",")
+        );
+        let token = Token::parse("don't.");
+        assert_eq!((token.word.as_str(), token.trail.as_str()), ("don't", "."));
+        let token = Token::parse("...");
+        assert_eq!((token.word.as_str(), token.lead.as_str()), ("...", ""));
+    }
+}

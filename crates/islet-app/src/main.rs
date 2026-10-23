@@ -1,11 +1,14 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod config_watch;
+mod context_menu;
+mod dictation;
 mod icon;
 mod island_window;
 mod logging;
 mod occlusion;
 mod paths;
+mod restart;
 mod settings;
 mod tray;
 
@@ -22,6 +25,10 @@ use windows::Win32::UI::HiDpi::{
 };
 
 fn main() -> ExitCode {
+    if let Err(error) = restart::wait_for_previous_instance() {
+        eprintln!("could not restart Islet: {error}");
+        return ExitCode::FAILURE;
+    }
     let paths = Paths::discover();
     let _log_guard = match logging::init(&paths.log_dir) {
         Ok(guard) => guard,
@@ -98,7 +105,7 @@ fn run(paths: Paths) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
-    tray::run(paths.config_file, paths.log_dir, shared, demo, demo_state)
+    tray::run(paths.config_file, shared, demo, demo_state)
 }
 
 /// Holds the per-session singleton mutex for the lifetime of the process.

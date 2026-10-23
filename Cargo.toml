@@ -5,9 +5,12 @@ members = [
     "crates/islet-render",
     "crates/islet-media",
     "crates/islet-audio",
+    "crates/islet-input",
     "crates/islet-settings",
     "crates/islet-app",
     "crates/islet-asr",
+    "crates/islet-asr-worker",
+    "crates/asr-bench-ort",
     "crates/asr-bench-sherpa",
 ]
 

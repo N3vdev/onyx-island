@@ -297,52 +297,92 @@ pub enum MediaAction {
     OpenApp,
 }
 
+/// The expanded control under the pointer. Separate from track data so hover
+/// feedback never starts a content transition or touches playback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MediaHover {
+    Artwork,
+    Title,
+    Source,
+    Previous,
+    PlayPause,
+    Next,
+    Seek,
+    Volume,
+}
+
+/// Uses the same hit zones and precedence as mouse presses. Unavailable
+/// sliders and invisible source shortcuts do not advertise an action.
+#[must_use]
+pub fn expanded_hover_at(
+    x: f32,
+    y: f32,
+    pill_width: f32,
+    seekable: bool,
+    has_volume: bool,
+    has_source: bool,
+) -> Option<MediaHover> {
+    if seekable && scrub_fraction(x, y, pill_width, false).is_some() {
+        return Some(MediaHover::Seek);
+    }
+    if has_volume && volume_fraction(x, y, pill_width, false).is_some() {
+        return Some(MediaHover::Volume);
+    }
+    match expanded_action_at(x, y, pill_width) {
+        Some(MediaAction::Previous) => Some(MediaHover::Previous),
+        Some(MediaAction::PlayPause) => Some(MediaHover::PlayPause),
+        Some(MediaAction::Next) => Some(MediaHover::Next),
+        Some(MediaAction::OpenApp) if expanded::ART_HIT.contains(x, y) => Some(MediaHover::Artwork),
+        Some(MediaAction::OpenApp) if expanded::title_area(pill_width).contains(x, y) => {
+            Some(MediaHover::Title)
+        }
+        Some(MediaAction::OpenApp) if has_source => Some(MediaHover::Source),
+        _ => None,
+    }
+}
+
 /// Layout of the expanded media view, relative to the pill's top-left, in
 /// logical pixels. The renderer draws with these and the UI thread hit-tests
 /// with them, so they cannot drift apart.
 pub mod expanded {
     use super::Rect;
 
-    /// A large cover in the left column; the card is 400x168.
-    pub const ART: Rect = Rect::new(18.0, 24.0, 120.0, 120.0);
-    pub const ART_RADIUS: f32 = 26.0;
-    pub const TEXT_X: f32 = 154.0;
-    pub const TITLE_Y: f32 = 15.0;
-    pub const TITLE_HEIGHT: f32 = 25.0;
-    pub const ARTIST_Y: f32 = 43.0;
-    pub const ARTIST_HEIGHT: f32 = 18.0;
-    pub const CHIP_Y: f32 = 69.0;
-    pub const CHIP_HEIGHT: f32 = 21.0;
-    pub const SCRUBBER_Y: f32 = 102.0;
-    pub const SCRUBBER_HEIGHT: f32 = 3.0;
+    /// The music pane stays fixed as features are added on its right.
+    pub const PLAYER_WIDTH: f32 = 280.0;
+    pub const ART: Rect = Rect::new(14.0, 14.0, 84.0, 84.0);
+    pub const ART_RADIUS: f32 = 24.0;
+    pub const TEXT_X: f32 = 112.0;
+    pub const TEXT_WIDTH: f32 = 152.0;
+    pub const TITLE_Y: f32 = 18.0;
+    pub const TITLE_HEIGHT: f32 = 19.0;
+    pub const ARTIST_Y: f32 = 38.0;
+    pub const ARTIST_HEIGHT: f32 = 16.0;
+    pub const CHIP_Y: f32 = 16.0;
+    pub const CHIP_HEIGHT: f32 = 36.0;
+    pub const SCRUBBER_Y: f32 = 90.0;
+    pub const SCRUBBER_HEIGHT: f32 = 2.0;
     /// Vertical slack around the thin scrubber for comfortable clicking.
-    pub const SCRUBBER_HIT_SLOP: f32 = 8.0;
-    pub const TIMES_Y: f32 = 109.0;
+    pub const SCRUBBER_HIT_SLOP: f32 = 6.0;
+    pub const TIMES_Y: f32 = 96.0;
     pub const TIMES_HEIGHT: f32 = 12.0;
-    pub const CONTROLS_Y: f32 = 143.0;
-    pub const CONTROL_SPACING: f32 = 44.0;
-    pub const CONTROL_HIT_RADIUS: f32 = 20.0;
-    pub const VOLUME_TRACK_WIDTH: f32 = 68.0;
-    pub const VOLUME_TRACK_HEIGHT: f32 = 4.0;
-    pub const VOLUME_MARGIN: f32 = 22.0;
+    pub const CONTROLS_Y: f32 = 68.0;
+    pub const CONTROL_SPACING: f32 = 42.0;
+    pub const CONTROL_HIT_RADIUS: f32 = 16.0;
+    pub const VOLUME_TRACK_WIDTH: f32 = 78.0;
+    pub const VOLUME_TRACK_HEIGHT: f32 = 3.0;
     /// Gap between the speaker glyph and the start of the track.
-    pub const VOLUME_ICON_GAP: f32 = 15.0;
+    pub const VOLUME_ICON_GAP: f32 = 20.0;
     pub const VOLUME_HIT_SLOP: f32 = 11.0;
 
     #[must_use]
-    pub fn scrubber(pill_width: f32) -> Rect {
-        Rect::new(
-            TEXT_X,
-            SCRUBBER_Y,
-            (pill_width - TEXT_X - 22.0).max(30.0),
-            SCRUBBER_HEIGHT,
-        )
+    pub fn scrubber(_pill_width: f32) -> Rect {
+        Rect::new(TEXT_X, SCRUBBER_Y, TEXT_WIDTH, SCRUBBER_HEIGHT)
     }
 
     /// Centres of previous, play/pause, next.
     #[must_use]
-    pub fn controls(pill_width: f32) -> [(f32, f32); 3] {
-        let center = pill_width * 0.5;
+    pub fn controls(_pill_width: f32) -> [(f32, f32); 3] {
+        let center = TEXT_X + 56.0;
         [
             (center - CONTROL_SPACING, CONTROLS_Y),
             (center, CONTROLS_Y),
@@ -350,26 +390,40 @@ pub mod expanded {
         ]
     }
 
-    /// The source chip under the artist: the app name plus an "open" arrow.
+    /// First feature column. Additional columns can grow to its right without
+    /// moving playback controls or their hit zones.
     #[must_use]
-    pub fn chip(pill_width: f32, source: &str) -> Rect {
-        let estimate = source.chars().count() as f32 * 5.9;
-        let max = (pill_width - TEXT_X - 24.0).max(64.0);
+    pub fn feature_area(pill_width: f32) -> Rect {
         Rect::new(
-            TEXT_X,
-            CHIP_Y,
-            (estimate + 40.0).clamp(64.0, max),
-            CHIP_HEIGHT,
+            PLAYER_WIDTH + 14.0,
+            16.0,
+            (pill_width - PLAYER_WIDTH - 28.0).clamp(64.0, 140.0),
+            80.0,
         )
+    }
+
+    /// The source shortcut in the upper feature slot.
+    #[must_use]
+    pub fn chip(pill_width: f32, _source: &str) -> Rect {
+        let area = feature_area(pill_width);
+        Rect::new(area.x, CHIP_Y, area.width, CHIP_HEIGHT)
+    }
+
+    #[must_use]
+    pub fn volume_area(pill_width: f32) -> Rect {
+        let area = feature_area(pill_width);
+        Rect::new(area.x, 60.0, area.width, 36.0)
     }
 
     /// The volume slider track, right-aligned with the card's margin.
     #[must_use]
     pub fn volume_track(pill_width: f32) -> Rect {
+        let area = volume_area(pill_width);
+        let width = VOLUME_TRACK_WIDTH.min(area.width - 54.0);
         Rect::new(
-            pill_width - VOLUME_MARGIN - VOLUME_TRACK_WIDTH,
-            CONTROLS_Y - VOLUME_TRACK_HEIGHT * 0.5,
-            VOLUME_TRACK_WIDTH,
+            area.right() - 18.0 - width,
+            area.center().1 - VOLUME_TRACK_HEIGHT * 0.5,
+            width,
             VOLUME_TRACK_HEIGHT,
         )
     }
@@ -377,20 +431,23 @@ pub mod expanded {
     /// Centre of the speaker glyph left of the volume track.
     #[must_use]
     pub fn volume_icon_center(pill_width: f32) -> (f32, f32) {
-        (volume_track(pill_width).x - VOLUME_ICON_GAP, CONTROLS_Y)
+        (
+            volume_track(pill_width).x - VOLUME_ICON_GAP,
+            volume_area(pill_width).center().1,
+        )
     }
 
     /// Clickable region for the album art.
-    pub const ART_HIT: Rect = Rect::new(12.0, 18.0, 132.0, 132.0);
+    pub const ART_HIT: Rect = ART;
 
-    /// Clickable region for the title, artist and source chip.
+    /// Clickable region for the title and artist, clear of transport controls.
     #[must_use]
-    pub fn title_area(pill_width: f32) -> Rect {
+    pub fn title_area(_pill_width: f32) -> Rect {
         Rect::new(
-            TEXT_X - 6.0,
-            8.0,
-            (pill_width - TEXT_X - 8.0).max(40.0),
-            SCRUBBER_Y - SCRUBBER_HIT_SLOP - 8.0,
+            TEXT_X,
+            TITLE_Y,
+            TEXT_WIDTH,
+            ARTIST_Y + ARTIST_HEIGHT - TITLE_Y,
         )
     }
 }
@@ -414,7 +471,10 @@ pub fn expanded_action_at(x: f32, y: f32, pill_width: f32) -> Option<MediaAction
     if let Some(fraction) = scrub_fraction(x, y, pill_width, false) {
         return Some(MediaAction::Seek(fraction));
     }
-    if expanded::ART_HIT.contains(x, y) || expanded::title_area(pill_width).contains(x, y) {
+    if expanded::ART_HIT.contains(x, y)
+        || expanded::title_area(pill_width).contains(x, y)
+        || expanded::chip(pill_width, "").contains(x, y)
+    {
         return Some(MediaAction::OpenApp);
     }
     None
@@ -734,7 +794,7 @@ mod tests {
 
     #[test]
     fn expanded_controls_and_scrubber_hit_testing() {
-        let width = 400.0;
+        let width = crate::island::MEDIA.width;
         let [previous, play, next] = expanded::controls(width);
         assert_eq!(
             expanded_action_at(previous.0, previous.1, width),
@@ -773,7 +833,7 @@ mod tests {
 
     #[test]
     fn volume_slider_hit_testing() {
-        let width = 400.0;
+        let width = crate::island::MEDIA.width;
         let track = expanded::volume_track(width);
         let somewhere = track.y + track.height * 0.5;
 
@@ -802,7 +862,7 @@ mod tests {
 
     #[test]
     fn dragging_clamps_outside_the_bar() {
-        let width = 400.0;
+        let width = crate::island::MEDIA.width;
         let bar = expanded::scrubber(width);
         assert_eq!(scrub_fraction(bar.x - 50.0, 0.0, width, true), Some(0.0));
         assert_eq!(
@@ -810,6 +870,75 @@ mod tests {
             Some(1.0)
         );
         assert_eq!(scrub_fraction(bar.x, 0.0, width, false), None);
+    }
+
+    #[test]
+    fn extending_the_feature_lane_preserves_playback_and_separate_hit_zones() {
+        let width = crate::island::MEDIA.width;
+        let wider = width + 160.0;
+        assert_eq!(expanded::controls(width), expanded::controls(wider));
+        assert_eq!(expanded::scrubber(width), expanded::scrubber(wider));
+        assert_eq!(
+            expanded::chip(width, "Spotify"),
+            expanded::chip(wider, "Spotify")
+        );
+        for test_width in [width, wider] {
+            for (x, y) in expanded::controls(test_width) {
+                assert_eq!(volume_fraction(x, y, test_width, false), None);
+                assert_eq!(scrub_fraction(x, y, test_width, false), None);
+            }
+            let track = expanded::volume_track(test_width);
+            let (x, y) = track.center();
+            assert_eq!(expanded_action_at(x, y, test_width), None);
+            assert_eq!(scrub_fraction(x, y, test_width, false), None);
+            // The divider and future feature space must not open the source app.
+            assert_eq!(
+                expanded_action_at(expanded::PLAYER_WIDTH, 56.0, test_width),
+                None
+            );
+            assert_eq!(expanded_action_at(wider - 24.0, 32.0, test_width), None);
+        }
+    }
+
+    #[test]
+    fn unavailable_controls_and_empty_space_do_not_show_hover_feedback() {
+        let width = crate::island::MEDIA.width;
+        let seek = expanded::scrubber(width).center();
+        let volume = expanded::volume_track(width).center();
+        let source = expanded::chip(width, "").center();
+        for (point, expected) in [
+            (seek, MediaHover::Seek),
+            (volume, MediaHover::Volume),
+            (source, MediaHover::Source),
+        ] {
+            assert_eq!(
+                expanded_hover_at(point.0, point.1, width, true, true, true),
+                Some(expected)
+            );
+            assert_eq!(
+                expanded_hover_at(point.0, point.1, width, false, false, false),
+                None
+            );
+        }
+        for (x, y) in [(280.0, 56.0), (-20.0, 40.0), (460.0, 40.0), (250.0, 70.0)] {
+            assert_eq!(expanded_hover_at(x, y, width, true, true, true), None);
+        }
+    }
+
+    #[test]
+    fn hover_at_the_transport_seek_boundary_follows_mouse_down_precedence() {
+        let width = crate::island::MEDIA.width;
+        let (x, y) = expanded::controls(width)[1];
+        let boundary = y + expanded::CONTROL_HIT_RADIUS;
+        assert!(scrub_fraction(x, boundary, width, false).is_some());
+        assert_eq!(
+            expanded_hover_at(x, boundary, width, true, true, true),
+            Some(MediaHover::Seek)
+        );
+        assert_eq!(
+            expanded_hover_at(x, boundary, width, false, true, true),
+            Some(MediaHover::PlayPause)
+        );
     }
 
     #[test]

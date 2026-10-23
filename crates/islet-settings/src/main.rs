@@ -7,6 +7,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod autostart;
+mod dictation_page;
+mod preview;
 mod ui;
 
 use std::path::PathBuf;
@@ -49,6 +51,7 @@ fn main() -> eframe::Result {
         .as_deref()
     {
         Some("media" | "now-playing") => Page::NowPlaying,
+        Some("dictation" | "models") => Page::Dictation,
         Some("about") => Page::About,
         _ => Page::General,
     };
@@ -57,8 +60,8 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(WINDOW_TITLE)
-            .with_inner_size([780.0, 560.0])
-            .with_min_inner_size([640.0, 440.0])
+            .with_inner_size([1000.0, 800.0])
+            .with_min_inner_size([860.0, 680.0])
             .with_icon(Arc::new(window_icon())),
         ..Default::default()
     };
@@ -114,16 +117,23 @@ fn config_path() -> PathBuf {
 pub enum Page {
     General,
     NowPlaying,
+    Dictation,
     About,
 }
 
 pub struct SettingsApp {
+    preview: preview::PreviewLink,
+    page_changed: std::time::Instant,
+    animations: bool,
     config_file: PathBuf,
     config: Config,
     saved: Config,
     page: Page,
     new_site: String,
     status: Option<String>,
+    dictation_ui: dictation_page::DictationUi,
+    /// One-shot initial scroll position (`--scroll <px>`, for development).
+    initial_scroll: Option<f32>,
 }
 
 impl SettingsApp {
@@ -134,13 +144,22 @@ impl SettingsApp {
         page: Page,
     ) -> Self {
         ui::install_theme(&cc.egui_ctx);
+        ui::install_titlebar_theme();
         Self {
+            preview: preview::PreviewLink::default(),
+            page_changed: std::time::Instant::now(),
+            animations: preview::animations_enabled(),
             config_file,
             saved: config.clone(),
             config,
             page,
             new_site: String::new(),
             status: None,
+            dictation_ui: dictation_page::DictationUi::new(),
+            initial_scroll: std::env::args()
+                .skip_while(|arg| arg != "--scroll")
+                .nth(1)
+                .and_then(|value| value.parse().ok()),
         }
     }
 
@@ -152,9 +171,12 @@ impl SettingsApp {
         if normalized == self.saved {
             return;
         }
+        let mut startup_error = None;
         if normalized.general.start_with_windows != self.saved.general.start_with_windows {
             if let Err(error) = autostart::set(normalized.general.start_with_windows) {
-                self.status = Some(format!("Could not change startup setting: {error}"));
+                startup_error = Some(format!("Could not change startup setting: {error}"));
+                normalized.general.start_with_windows = self.saved.general.start_with_windows;
+                self.config.general.start_with_windows = self.saved.general.start_with_windows;
             }
         }
         if let Some(parent) = self.config_file.parent() {
@@ -163,7 +185,7 @@ impl SettingsApp {
         match normalized.save_atomic(&self.config_file) {
             Ok(()) => {
                 self.saved = normalized;
-                self.status = None;
+                self.status = startup_error;
             }
             Err(error) => self.status = Some(format!("Could not save settings: {error}")),
         }
@@ -199,5 +221,6 @@ impl eframe::App for SettingsApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ui::draw(self, ctx);
         self.save_if_changed();
+        self.preview.close_requested(ctx);
     }
 }

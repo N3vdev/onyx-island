@@ -13,11 +13,12 @@ use std::mem::ManuallyDrop;
 use std::sync::{Arc, Mutex};
 
 use islet_core::geometry::{point_in_rounded_rect, Rect};
+use islet_core::handoff::Handoff;
 use islet_core::island::{
     arrange_at, AgentCard, AgentState, AlertLevel, ContentCard, ContentSnapshot, DictationCard,
-    LayoutTarget, MediaCard, NotificationCard, PillSize,
+    DictationPhase, LayoutTarget, MediaCard, NotificationCard, PillSize, DICTATION_BARS,
 };
-use islet_core::media::{expanded, format_clock, ArtImage, BarLevels, BAR_COUNT};
+use islet_core::media::{expanded, format_clock, ArtImage, BarLevels, MediaHover, BAR_COUNT};
 use islet_core::{Spring, SpringParams};
 use windows::core::{w, Interface, PCWSTR};
 use windows::Win32::Foundation::{HMODULE, HWND};
@@ -179,6 +180,8 @@ impl From<windows::core::Error> for RenderError {
 pub type RenderResult<T> = Result<T, RenderError>;
 
 pub struct Renderer {
+    handoff: Option<(Handoff, Sample)>,
+    departure_reported: bool,
     hwnd: HWND,
     gfx: Option<Gfx>,
     animator: Animator,
@@ -189,6 +192,7 @@ pub struct Renderer {
     hidden_since: Option<f64>,
     hit_region: Arc<Mutex<HitRegion>>,
     bars: Arc<BarLevels>,
+    media_hover: Option<MediaHover>,
     anchor_top: bool,
     logical_width: f32,
     logical_height: f32,
@@ -210,6 +214,8 @@ impl Renderer {
         let anchor = if config.anchor_top { 0.0 } else { 1.0 };
         let animator = Animator::new(LayoutTarget::HIDDEN, anchor, now);
         Ok(Self {
+            handoff: None,
+            departure_reported: false,
             hwnd: config.hwnd,
             gfx: None,
             animator,
@@ -220,6 +226,7 @@ impl Renderer {
             hidden_since: Some(now),
             hit_region,
             bars,
+            media_hover: None,
             anchor_top: config.anchor_top,
             logical_width: config.logical_width,
             logical_height: config.logical_height,
@@ -289,8 +296,48 @@ impl Renderer {
         self.logical_height = height;
     }
 
+    /// Hover is a single repaint, including while playback is paused.
+    pub fn set_media_hover(&mut self, hover: Option<MediaHover>) {
+        self.media_hover = hover;
+    }
+
+    pub fn depart_surface(&mut self, now: f64, animate: bool) {
+        self.handoff = Some((Handoff::new(false, now, animate), self.animator.sample(now)));
+        self.departure_reported = false;
+        self.media_hover = None;
+    }
+
+    pub fn arrive_surface(&mut self, now: f64, animate: bool) {
+        let anchor = if self.anchor_top { 0.0 } else { 1.0 };
+        self.animator = Animator::new(self.target, anchor, now);
+        self.previous_content = None;
+        self.transition_start = None;
+        self.handoff = Some((Handoff::new(true, now, animate), self.animator.sample(now)));
+    }
+
+    /// Called only after the final invisible frame was presented.
+    pub fn take_departure_completed(&mut self, now: f64) -> bool {
+        let completed = self
+            .handoff
+            .is_some_and(|(transfer, _)| !transfer.arriving && transfer.settled(now));
+        if completed && !self.departure_reported {
+            self.departure_reported = true;
+            true
+        } else {
+            false
+        }
+    }
+
     #[must_use]
     pub fn needs_frame(&self, now: f64) -> bool {
+        if let Some((transfer, _)) = self.handoff {
+            if !transfer.arriving {
+                return !self.departure_reported || !transfer.settled(now);
+            }
+            if !transfer.settled(now) {
+                return true;
+            }
+        }
         !self.animator.is_settled(now)
             || self.transition_progress(now).is_some()
             || self.content.animates()
@@ -304,7 +351,10 @@ impl Renderer {
     /// These need every vblank; content-only animation can be throttled.
     #[must_use]
     pub fn is_morphing(&self, now: f64) -> bool {
-        !self.animator.is_settled(now) || self.transition_progress(now).is_some()
+        self.handoff
+            .is_some_and(|(transfer, _)| !transfer.settled(now))
+            || !self.animator.is_settled(now)
+            || self.transition_progress(now).is_some()
     }
 
     #[must_use]
@@ -350,7 +400,22 @@ impl Renderer {
             }
         }
 
-        let sample = self.animator.sample(now);
+        let mut sample = self.animator.sample(now);
+        if let Some((transfer, frozen)) = self.handoff {
+            if !transfer.arriving {
+                sample = frozen;
+            }
+            let top = frozen.anchor <= 0.5;
+            let fullness = transfer.fullness(now);
+            sample.anchor = if top {
+                (1.0 - fullness) * 0.5
+            } else {
+                0.5 + fullness * 0.5
+            };
+            if transfer.arriving && transfer.settled(now) {
+                self.handoff = None;
+            }
+        }
         let progress = self.transition_progress(now).unwrap_or(1.0);
         let previous = if progress < 1.0 {
             self.previous_content.as_ref()
@@ -363,6 +428,7 @@ impl Renderer {
         // the render thread that created it.
         unsafe {
             let gfx = self.gfx.as_mut().ok_or(RenderError::InvalidSize)?;
+            gfx.media_hover = self.media_hover;
             gfx.bar_levels = self
                 .bars
                 .load_fresh((now * 1000.0) as u64, BAR_LEVELS_MAX_AGE_MS);
@@ -796,6 +862,7 @@ struct Gfx {
     mask_layer: Option<ID2D1Layer>,
     art: Vec<(u64, ID2D1BitmapBrush1)>,
     bar_levels: Option<[f32; BAR_COUNT]>,
+    media_hover: Option<MediaHover>,
     pixel_width: u32,
     pixel_height: u32,
     dpi: f32,
@@ -949,6 +1016,7 @@ impl Gfx {
             mask_layer: None,
             art: Vec::with_capacity(ART_CACHE_SIZE),
             bar_levels: None,
+            media_hover: None,
             pixel_width: config.pixel_width,
             pixel_height: config.pixel_height,
             dpi: config.dpi,
@@ -1525,11 +1593,15 @@ impl Gfx {
             expanded::ART_RADIUS,
             media.art.as_ref(),
             accent,
-            alpha,
+            if self.media_hover == Some(MediaHover::Artwork) {
+                alpha * 0.92
+            } else {
+                alpha
+            },
         )?;
 
         let text_x = expanded::TEXT_X;
-        let text_w = (width - text_x - 20.0).max(40.0);
+        let text_w = expanded::TEXT_WIDTH;
         self.draw_text(
             &media.title,
             FormatId::MediaTitle,
@@ -1537,7 +1609,14 @@ impl Gfx {
             expanded::TITLE_Y,
             text_w,
             expanded::TITLE_HEIGHT,
-            color([255, 255, 255], 0.98 * alpha),
+            color(
+                if self.media_hover == Some(MediaHover::Title) {
+                    [214, 214, 218]
+                } else {
+                    [255, 255, 255]
+                },
+                0.98 * alpha,
+            ),
         )?;
         self.draw_text(
             &media.artist,
@@ -1546,12 +1625,38 @@ impl Gfx {
             expanded::ARTIST_Y,
             text_w,
             expanded::ARTIST_HEIGHT,
-            color([177, 185, 204], 0.92 * alpha),
+            color(
+                [166, 166, 170],
+                if self.media_hover == Some(MediaHover::Title) {
+                    alpha * 0.9
+                } else {
+                    alpha
+                },
+            ),
         )?;
-        self.draw_source_chip(&media.source, media.accent.is_some(), accent, width, alpha)?;
+        self.fill_round_rect(
+            expanded::PLAYER_WIDTH,
+            18.0,
+            1.0,
+            76.0,
+            0.5,
+            color([255, 255, 255], 0.085 * alpha),
+        )?;
+        self.draw_source_chip(&media.source, width, alpha)?;
 
         if let Some(timeline) = media.timeline.filter(|timeline| timeline.duration > 0.0) {
             let bar = expanded::scrubber(width);
+            if self.media_hover == Some(MediaHover::Seek) {
+                let hover = bar.inflate(expanded::SCRUBBER_HIT_SLOP);
+                self.fill_round_rect(
+                    hover.x,
+                    hover.y,
+                    hover.width,
+                    hover.height,
+                    7.0,
+                    color([255, 255, 255], 0.14 * alpha),
+                )?;
+            }
             let progress = media
                 .scrub
                 .unwrap_or_else(|| timeline.progress_at(now, media.playing))
@@ -1571,9 +1676,9 @@ impl Gfx {
                 (bar.width * progress).max(bar.height),
                 bar.height,
                 bar.height * 0.5,
-                color(accent, 0.98 * alpha),
+                color([255, 255, 255], 0.78 * alpha),
             )?;
-            if media.scrub.is_some() {
+            if media.scrub.is_some() || self.media_hover == Some(MediaHover::Seek) {
                 self.fill_circle(
                     bar.x + bar.width * progress,
                     bar.y + bar.height * 0.5,
@@ -1581,7 +1686,7 @@ impl Gfx {
                     color([255, 255, 255], alpha),
                 )?;
             }
-            let label = color([146, 153, 172], 0.9 * alpha);
+            let label = color([145, 145, 150], alpha);
             self.draw_text(
                 &format_clock(position),
                 FormatId::Tiny,
@@ -1603,21 +1708,28 @@ impl Gfx {
         }
 
         let [previous, play, next] = expanded::controls(width);
-        self.draw_transport(
-            previous.0,
-            previous.1,
-            TransportIcon::Previous,
-            accent,
-            alpha,
-        )?;
+        let hovered_control = match self.media_hover {
+            Some(MediaHover::Previous) => Some(previous),
+            Some(MediaHover::PlayPause) => Some(play),
+            Some(MediaHover::Next) => Some(next),
+            _ => None,
+        };
+        if let Some((x, y)) = hovered_control {
+            self.fill_circle(
+                x,
+                y,
+                expanded::CONTROL_HIT_RADIUS,
+                color([255, 255, 255], 0.14 * alpha),
+            )?;
+        }
+        self.draw_transport(previous.0, previous.1, TransportIcon::Previous, alpha)?;
         self.draw_transport(
             play.0,
             play.1,
             TransportIcon::PlayPause(media.playing),
-            accent,
             alpha,
         )?;
-        self.draw_transport(next.0, next.1, TransportIcon::Next, accent, alpha)?;
+        self.draw_transport(next.0, next.1, TransportIcon::Next, alpha)?;
 
         if let Some(volume) = media.volume {
             self.draw_volume(volume, width, alpha)?;
@@ -1630,8 +1742,6 @@ impl Gfx {
     unsafe fn draw_source_chip(
         &mut self,
         source: &str,
-        tinted: bool,
-        accent: [u8; 3],
         pill_width: f32,
         alpha: f32,
     ) -> RenderResult<()> {
@@ -1639,14 +1749,15 @@ impl Gfx {
             return Ok(());
         }
         let chip = expanded::chip(pill_width, source);
-        let (fill, ink) = if tinted {
-            (color(accent, 0.14 * alpha), color(accent, 0.96 * alpha))
-        } else {
-            (
-                color([255, 255, 255], 0.065 * alpha),
-                color([188, 196, 214], 0.92 * alpha),
-            )
-        };
+        let fill = color(
+            [255, 255, 255],
+            if self.media_hover == Some(MediaHover::Source) {
+                0.22
+            } else {
+                0.115
+            } * alpha,
+        );
+        let ink = color([240, 240, 242], alpha);
         self.fill_round_rect(
             chip.x,
             chip.y,
@@ -1658,14 +1769,14 @@ impl Gfx {
         self.draw_text(
             source,
             FormatId::Chip,
-            chip.x + 11.0,
-            chip.y + 4.0,
-            (chip.width - 32.0).max(10.0),
-            14.0,
+            chip.x + 16.0,
+            chip.y + 10.0,
+            (chip.width - 44.0).max(10.0),
+            16.0,
             ink,
         )?;
         // A small north-east arrow, so the chip reads as "opens the app".
-        let ax = chip.right() - 13.0;
+        let ax = chip.right() - 18.0;
         let ay = chip.center().1;
         self.set_color(ink);
         self.dc.DrawLine(
@@ -1713,9 +1824,25 @@ impl Gfx {
     /// Speaker button and a slim volume slider. At zero the waves turn into a
     /// cross, so mute reads at a glance.
     unsafe fn draw_volume(&mut self, volume: f32, pill_width: f32, alpha: f32) -> RenderResult<()> {
+        let area = expanded::volume_area(pill_width);
+        self.fill_round_rect(
+            area.x,
+            area.y,
+            area.width,
+            area.height,
+            18.0,
+            color(
+                [255, 255, 255],
+                if self.media_hover == Some(MediaHover::Volume) {
+                    0.22
+                } else {
+                    0.115
+                } * alpha,
+            ),
+        )?;
         let track = expanded::volume_track(pill_width);
         let (cx, cy) = expanded::volume_icon_center(pill_width);
-        let ink = color([220, 225, 238], 0.72 * alpha);
+        let ink = color([210, 210, 214], alpha);
         let volume = volume.clamp(0.0, 1.0);
 
         self.fill_polygon(
@@ -1903,133 +2030,58 @@ impl Gfx {
         x: f32,
         y: f32,
         icon: TransportIcon,
-        accent: [u8; 3],
         alpha: f32,
     ) -> RenderResult<()> {
-        let _ = accent;
+        let ink = color([240, 240, 242], alpha);
         match icon {
-            TransportIcon::Previous => {
-                self.set_color(color([220, 225, 238], 0.72 * alpha));
-                self.dc.DrawLine(
-                    Vector2 {
-                        X: x + 5.5,
-                        Y: y - 8.0,
-                    },
-                    Vector2 { X: x - 2.5, Y: y },
-                    &self.brush,
-                    2.2,
-                    None,
-                );
-                self.dc.DrawLine(
-                    Vector2 { X: x - 2.5, Y: y },
-                    Vector2 {
-                        X: x + 5.5,
-                        Y: y + 8.0,
-                    },
-                    &self.brush,
-                    2.2,
-                    None,
-                );
-                self.fill_round_rect(
-                    x + 7.5,
-                    y - 8.0,
-                    2.2,
-                    16.0,
-                    1.1,
-                    color([220, 225, 238], 0.72 * alpha),
-                )?;
-            }
-            TransportIcon::Next => {
-                self.set_color(color([220, 225, 238], 0.72 * alpha));
-                self.dc.DrawLine(
-                    Vector2 {
-                        X: x - 5.5,
-                        Y: y - 8.0,
-                    },
-                    Vector2 { X: x + 2.5, Y: y },
-                    &self.brush,
-                    2.2,
-                    None,
-                );
-                self.dc.DrawLine(
-                    Vector2 { X: x + 2.5, Y: y },
-                    Vector2 {
-                        X: x - 5.5,
-                        Y: y + 8.0,
-                    },
-                    &self.brush,
-                    2.2,
-                    None,
-                );
-                self.fill_round_rect(
-                    x - 9.7,
-                    y - 8.0,
-                    2.2,
-                    16.0,
-                    1.1,
-                    color([220, 225, 238], 0.72 * alpha),
-                )?;
-            }
-            TransportIcon::PlayPause(playing) => {
-                self.fill_circle(x, y, 16.0, color([255, 255, 255], 0.12 * alpha))?;
-                if playing {
-                    self.fill_round_rect(
-                        x - 4.6,
-                        y - 7.0,
-                        3.4,
-                        14.0,
-                        1.7,
-                        color([255, 255, 255], 0.9 * alpha),
-                    )?;
-                    self.fill_round_rect(
-                        x + 1.2,
-                        y - 7.0,
-                        3.4,
-                        14.0,
-                        1.7,
-                        color([255, 255, 255], 0.9 * alpha),
-                    )?;
+            TransportIcon::Previous | TransportIcon::Next => {
+                let direction = if matches!(icon, TransportIcon::Previous) {
+                    -1.0
                 } else {
-                    self.set_color(color([255, 255, 255], 0.9 * alpha));
-                    self.dc.DrawLine(
+                    1.0
+                };
+                self.fill_polygon(
+                    &[
                         Vector2 {
-                            X: x - 4.5,
-                            Y: y - 7.0,
-                        },
-                        Vector2 { X: x + 7.0, Y: y },
-                        &self.brush,
-                        2.2,
-                        None,
-                    );
-                    self.dc.DrawLine(
-                        Vector2 { X: x + 7.0, Y: y },
-                        Vector2 {
-                            X: x - 4.5,
-                            Y: y + 7.0,
-                        },
-                        &self.brush,
-                        2.2,
-                        None,
-                    );
-                    self.dc.DrawLine(
-                        Vector2 {
-                            X: x - 4.5,
-                            Y: y + 7.0,
+                            X: x - direction * 4.0,
+                            Y: y - 4.5,
                         },
                         Vector2 {
-                            X: x - 4.5,
-                            Y: y - 7.0,
+                            X: x + direction * 3.0,
+                            Y: y,
                         },
-                        &self.brush,
-                        2.2,
-                        None,
-                    );
-                }
+                        Vector2 {
+                            X: x - direction * 4.0,
+                            Y: y + 4.5,
+                        },
+                    ],
+                    ink,
+                )?;
+                self.fill_round_rect(x + direction * 4.5 - 0.8, y - 4.5, 1.6, 9.0, 0.6, ink)?;
+            }
+            TransportIcon::PlayPause(true) => {
+                self.fill_round_rect(x - 4.0, y - 5.0, 2.7, 10.0, 0.7, ink)?;
+                self.fill_round_rect(x + 1.3, y - 5.0, 2.7, 10.0, 0.7, ink)?;
+            }
+            TransportIcon::PlayPause(false) => {
+                self.fill_polygon(
+                    &[
+                        Vector2 {
+                            X: x - 3.5,
+                            Y: y - 5.5,
+                        },
+                        Vector2 { X: x + 5.0, Y: y },
+                        Vector2 {
+                            X: x - 3.5,
+                            Y: y + 5.5,
+                        },
+                    ],
+                    ink,
+                )?;
             }
         }
         Ok(())
     }
-
     unsafe fn draw_notification(
         &mut self,
         width: f32,
@@ -2251,35 +2303,150 @@ impl Gfx {
         accent: [u8; 3],
         alpha: f32,
     ) -> RenderResult<()> {
-        self.fill_circle(17.0, height * 0.5, 4.5, color(accent, alpha))?;
-        let bars = 14;
-        let start = 31.0;
-        let spacing = 9.0;
         let mid = height * 0.5;
-        for index in 0..bars {
-            let phase = now * 9.0 + f64::from(index) * 0.7;
-            let wave = ((phase.sin() * 0.5 + 0.5) as f32) * 0.75 + 0.25;
-            let bar_h = 4.0 + wave * (height - 15.0) * dictation.level.clamp(0.0, 1.0);
-            self.fill_round_rect(
-                start + index as f32 * spacing,
-                mid - bar_h * 0.5,
-                3.0,
-                bar_h,
-                1.5,
-                color(accent, 0.92 * alpha),
+        let indicator_x = 22.0;
+
+        // Left: what state we are in.
+        match dictation.phase {
+            DictationPhase::Recording => {
+                let pulse = 0.78 + 0.22 * (now * 5.0).sin() as f32;
+                self.fill_circle(indicator_x, mid, 4.5, color(accent, alpha * pulse))?;
+                if dictation.hands_free {
+                    // A ring marks a locked (hands-free) recording.
+                    let ring = D2D1_ELLIPSE {
+                        point: Vector2 {
+                            X: indicator_x,
+                            Y: mid,
+                        },
+                        radiusX: 9.0,
+                        radiusY: 9.0,
+                    };
+                    self.set_color(color(accent, 0.55 * alpha));
+                    self.dc
+                        .DrawEllipse(&ring, &self.brush, 1.5, None::<&ID2D1StrokeStyle>);
+                }
+            }
+            DictationPhase::Loading | DictationPhase::Transcribing => {
+                self.draw_spinner(indicator_x, mid, now, accent, alpha)?;
+            }
+            DictationPhase::Done => self.draw_check(indicator_x, mid, accent, alpha)?,
+        }
+
+        let wave_left = 42.0;
+        let wave_right = (width - 66.0).max(wave_left + 40.0);
+        match dictation.phase {
+            DictationPhase::Recording | DictationPhase::Transcribing => {
+                let count = DICTATION_BARS;
+                let pitch = (wave_right - wave_left) / count as f32;
+                let max_h = (height - 14.0).max(6.0);
+                for index in 0..count {
+                    let (level, bar_alpha) = if dictation.phase == DictationPhase::Recording {
+                        // Newest bars are brightest.
+                        let level = f32::from(dictation.bars[index]) / 255.0;
+                        (level, 0.45 + 0.5 * (index as f32 / count as f32))
+                    } else {
+                        // A slow shimmer sweeps across while transcribing.
+                        let wave = (now * 5.0 - index as f64 * 0.45).sin() * 0.5 + 0.5;
+                        (0.10 + 0.26 * wave as f32, 0.8)
+                    };
+                    let bar_h = 3.0 + level.clamp(0.0, 1.0) * (max_h - 3.0);
+                    self.fill_round_rect(
+                        wave_left + index as f32 * pitch,
+                        mid - bar_h * 0.5,
+                        3.0,
+                        bar_h,
+                        1.5,
+                        color(accent, bar_alpha * alpha),
+                    )?;
+                }
+            }
+            DictationPhase::Loading => {
+                self.draw_text(
+                    "Warming up\u{2026}",
+                    FormatId::Tucked,
+                    wave_left,
+                    0.0,
+                    (width - wave_left - 16.0).max(10.0),
+                    height,
+                    color([210, 214, 228], 0.9 * alpha),
+                )?;
+            }
+            DictationPhase::Done => {
+                self.draw_text(
+                    "Inserted",
+                    FormatId::Tucked,
+                    wave_left,
+                    0.0,
+                    (width - wave_left - 16.0).max(10.0),
+                    height,
+                    color([210, 214, 228], 0.9 * alpha),
+                )?;
+            }
+        }
+
+        // Right: elapsed time while recording.
+        if dictation.phase == DictationPhase::Recording {
+            self.draw_text(
+                &format_elapsed(dictation.elapsed_ms),
+                FormatId::Timer,
+                width - 62.0,
+                8.0,
+                48.0,
+                height - 16.0,
+                color([255, 255, 255], 0.9 * alpha),
             )?;
         }
-        let timer = format_elapsed(dictation.elapsed_ms);
-        self.draw_text(
-            &timer,
-            FormatId::Timer,
-            width - 62.0,
-            8.0,
-            48.0,
-            height - 16.0,
-            color([255, 255, 255], 0.9 * alpha),
-        )?;
-        let _ = dictation.phase;
+        Ok(())
+    }
+
+    /// Eight dots chasing each other: "working on it".
+    unsafe fn draw_spinner(
+        &mut self,
+        x: f32,
+        y: f32,
+        now: f64,
+        accent: [u8; 3],
+        alpha: f32,
+    ) -> RenderResult<()> {
+        let head = (now * 10.0) as usize % 8;
+        for index in 0..8usize {
+            let angle = index as f32 * std::f32::consts::TAU / 8.0;
+            let behind = (index + 8 - head) % 8;
+            let strength = 1.0 - behind as f32 / 8.0;
+            self.fill_circle(
+                x + angle.cos() * 6.5,
+                y + angle.sin() * 6.5,
+                1.5 + 0.4 * strength,
+                color(accent, (0.18 + 0.8 * strength) * alpha),
+            )?;
+        }
+        Ok(())
+    }
+
+    unsafe fn draw_check(
+        &mut self,
+        x: f32,
+        y: f32,
+        accent: [u8; 3],
+        alpha: f32,
+    ) -> RenderResult<()> {
+        self.fill_circle(x, y, 9.0, color(accent, 0.18 * alpha))?;
+        self.set_color(color(accent, alpha));
+        for (from, to) in [((-4.0, 0.5), (-1.2, 3.4)), ((-1.2, 3.4), (4.2, -3.2))] {
+            self.dc.DrawLine(
+                Vector2 {
+                    X: x + from.0,
+                    Y: y + from.1,
+                },
+                Vector2 {
+                    X: x + to.0,
+                    Y: y + to.1,
+                },
+                &self.brush,
+                2.0,
+                None,
+            );
+        }
         Ok(())
     }
 
@@ -2619,7 +2786,7 @@ impl TextFormats {
             )?,
             media_title: create_format(
                 factory,
-                17.0,
+                13.0,
                 DWRITE_FONT_WEIGHT_DEMI_BOLD,
                 DWRITE_TEXT_ALIGNMENT_LEADING,
                 DWRITE_PARAGRAPH_ALIGNMENT_NEAR,

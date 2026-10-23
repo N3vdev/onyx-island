@@ -13,14 +13,17 @@ use islet_core::island::{
     TimerKind,
 };
 use islet_core::media::{
-    expanded_action_at, scrub_fraction, volume_fraction, BarLevels, MediaAction, Timeline,
+    expanded_action_at, expanded_hover_at, scrub_fraction, volume_fraction, BarLevels, MediaAction,
+    MediaHover, Timeline,
 };
 use islet_core::music::MusicFilter;
 use islet_core::{Config, Rect};
 use islet_media::{MediaCommand, MediaInfo, MediaService};
 use islet_render::{HitRegion, Renderer, RendererConfig};
 
+use crate::dictation::{self, DictationHandle, UiUpdate};
 use crate::occlusion;
+use islet_core::handoff::{PREVIEW_ATTACH, PREVIEW_DEPARTED, PREVIEW_DETACH};
 use windows::core::{s, w, Result as WinResult, PCWSTR};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::Graphics::Dwm::DwmFlush;
@@ -34,6 +37,7 @@ use windows::Win32::System::Threading::{
     AttachThreadInput, GetCurrentThreadId, OpenProcess, QueryFullProcessImageNameW,
     PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
 };
+use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
@@ -53,8 +57,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_ERASEBKGND, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_NCHITTEST,
     WM_SETTINGCHANGE, WM_TIMER, WM_WINDOWPOSCHANGING, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
 };
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetAncestor, IsWindow, RemovePropW, SetPropW, GA_ROOT, HWND_NOTOPMOST,
+};
 
-pub const WINDOW_LOGICAL_WIDTH: f32 = 440.0;
+pub const WINDOW_LOGICAL_WIDTH: f32 = 488.0;
 pub const WINDOW_LOGICAL_HEIGHT: f32 = 200.0;
 
 const TIMER_HOVER_EXPAND: usize = 1;
@@ -64,6 +71,7 @@ const TIMER_POLL: usize = 4;
 const TIMER_DEMO: usize = 5;
 const TIMER_MEDIA_PAUSED: usize = 6;
 const TIMER_OCCLUSION: usize = 7;
+const TIMER_PREVIEW_HANDOFF: usize = 8;
 /// Window moves arrive in bursts (dragging); check what is behind after this.
 const OCCLUSION_DEBOUNCE_MS: u32 = 120;
 const WM_MOUSELEAVE: u32 = 0x02A3;
@@ -76,6 +84,8 @@ const WM_APP_SETTLED: u32 = WM_APP + 21;
 const WM_APP_MEDIA: u32 = WM_APP + 22;
 /// Posted by the WinEvent hooks when any top-level window changed.
 const WM_APP_WINDOWS_CHANGED: u32 = WM_APP + 23;
+/// Posted by the dictation controller when it queued island updates.
+const WM_APP_DICTATION: u32 = WM_APP + 30;
 /// Extra room around a morphing island's window region for spring overshoot.
 const REGION_MORPH_MARGIN_DP: f32 = 12.0;
 
@@ -122,6 +132,9 @@ enum WindowRegion {
 }
 
 enum RenderCommand {
+    Depart,
+    Arrive,
+    MediaHover(Option<MediaHover>),
     Snapshot {
         target: LayoutTarget,
         content: Box<ContentSnapshot>,
@@ -144,6 +157,8 @@ struct Demo {
 }
 
 pub struct IslandHost {
+    preview: Option<HWND>,
+    preview_pending: Option<Option<HWND>>,
     hwnd: HWND,
     shared: Arc<RwLock<Config>>,
     state: IslandState,
@@ -189,6 +204,9 @@ pub struct IslandHost {
     media_tx: Sender<Option<MediaInfo>>,
     media_rx: Receiver<Option<MediaInfo>>,
     last_media: Option<MediaInfo>,
+    dictation: Option<DictationHandle>,
+    dictation_tx: Sender<UiUpdate>,
+    dictation_rx: Receiver<UiUpdate>,
     loopback: Option<Loopback>,
     volume: Option<VolumeHandle>,
     real_bars: bool,
@@ -196,6 +214,7 @@ pub struct IslandHost {
     music_filter: MusicFilter,
     scrubbing: bool,
     volume_dragging: bool,
+    media_hover: Option<MediaHover>,
     tuck_enabled: bool,
     window_events: Option<occlusion::WindowEvents>,
     occlusion_pending: bool,
@@ -233,6 +252,7 @@ impl IslandHost {
             .name("islet-render".to_owned())
             .spawn(move || render_thread(renderer_config, render_hit, render_bars, rx, notify))?;
         let (media_tx, media_rx) = unbounded();
+        let (dictation_tx, dictation_rx) = unbounded();
         let volume = match VolumeHandle::start() {
             Ok(handle) => Some(handle),
             Err(error) => {
@@ -242,6 +262,8 @@ impl IslandHost {
         };
 
         let mut host = Box::new(Self {
+            preview: None,
+            preview_pending: None,
             hwnd,
             shared,
             state: IslandState {
@@ -279,6 +301,9 @@ impl IslandHost {
             media_tx,
             media_rx,
             last_media: None,
+            dictation: None,
+            dictation_tx,
+            dictation_rx,
             loopback: None,
             volume,
             real_bars: config.media.real_bars,
@@ -286,6 +311,7 @@ impl IslandHost {
             music_filter: music_filter(&config),
             scrubbing: false,
             volume_dragging: false,
+            media_hover: None,
             tuck_enabled: config.general.tuck_behind_windows,
             window_events: None,
             occlusion_pending: false,
@@ -309,6 +335,9 @@ impl IslandHost {
             }
             host.demo_advance();
         }
+        if !demo && demo_state.is_none() {
+            host.start_dictation(&config);
+        }
         // After the demo is set up: the demo never tucks.
         host.update_window_events();
         Ok(host)
@@ -331,6 +360,7 @@ impl IslandHost {
             let _ = KillTimer(Some(self.hwnd), TIMER_OCCLUSION);
         }
         self.window_events = None;
+        self.dictation = None;
         self.loopback = None;
         self.media = None;
         self.poll_interval = None;
@@ -346,6 +376,9 @@ impl IslandHost {
 
     pub fn apply_config(&mut self) {
         let config = read_config(&self.shared);
+        if let Some(dictation) = &self.dictation {
+            dictation.configure(&config.dictation);
+        }
         self.anchor_top = config.general.position == ScreenPosition::Top;
         self.hide_in_fullscreen = config.general.hide_in_fullscreen;
         self.follow_cursor = config.general.monitor == MonitorChoice::FollowCursor;
@@ -406,6 +439,88 @@ impl IslandHost {
         lparam: LPARAM,
     ) -> Option<LRESULT> {
         match message {
+            windows::Win32::UI::WindowsAndMessaging::WM_CONTEXTMENU => {
+                unsafe {
+                    if let Ok(tray) = windows::Win32::UI::WindowsAndMessaging::FindWindowW(
+                        w!("IsletTrayWindow"),
+                        None,
+                    ) {
+                        let _ = PostMessageW(
+                            Some(tray),
+                            windows::Win32::UI::WindowsAndMessaging::WM_CONTEXTMENU,
+                            wparam,
+                            lparam,
+                        );
+                    }
+                }
+                Some(LRESULT(0))
+            }
+            PREVIEW_ATTACH => {
+                let anchor = HWND(wparam.0 as *mut _);
+                if unsafe { IsWindow(Some(anchor)) }.as_bool() {
+                    if self.preview == Some(anchor) {
+                        self.refresh_preview();
+                    } else if self.preview_pending.is_none() {
+                        unsafe {
+                            let _ = SetPropW(
+                                anchor,
+                                w!("IsletPreviewAttached"),
+                                Some(HANDLE(std::ptr::without_provenance_mut(1))),
+                            );
+                        }
+                        self.preview_pending = Some(Some(anchor));
+                        self.begin_departure();
+                    }
+                }
+                Some(LRESULT(0))
+            }
+            PREVIEW_DETACH => {
+                if self.preview.is_some_and(|h| h.0 as usize == wparam.0)
+                    || self.preview_pending == Some(Some(HWND(wparam.0 as *mut _)))
+                {
+                    self.preview_pending = Some(None);
+                    self.begin_departure();
+                }
+                Some(LRESULT(0))
+            }
+            PREVIEW_DEPARTED => {
+                unsafe {
+                    let _ = KillTimer(Some(self.hwnd), TIMER_PREVIEW_HANDOFF);
+                }
+                if let Some(next) = self.preview_pending.take() {
+                    if let Some(old) = self.preview {
+                        unsafe {
+                            let _ = RemovePropW(old, w!("IsletPreviewAttached"));
+                        }
+                    }
+                    self.preview = next.filter(|h| unsafe { IsWindow(Some(*h)) }.as_bool());
+                    if self.preview.is_none() {
+                        self.set_fullscreen_hidden(false);
+                    }
+                    self.last_layout = None;
+                    self.last_target = None;
+                    self.last_sent_anchor_top = None;
+                    self.last_target_anchor_top = None;
+                    self.morph_box = None;
+                    self.state.tucked = false;
+                    let _ = self.reposition_layout();
+                    self.send_snapshot();
+                    let _ = self.tx.send(RenderCommand::Arrive);
+                    self.set_click_through(false);
+                    self.update_window_events();
+                    self.update_poll_timer();
+                    if let Some(anchor) = self.preview {
+                        unsafe {
+                            let _ = SetPropW(
+                                anchor,
+                                w!("IsletPreviewAttached"),
+                                Some(HANDLE(std::ptr::without_provenance_mut(2))),
+                            );
+                        }
+                    }
+                }
+                Some(LRESULT(0))
+            }
             WM_NCHITTEST => Some(self.hit_test(lparam)),
             WM_MOUSEMOVE if self.scrubbing => {
                 if let Some((x, y, width)) = self.media_point(lparam) {
@@ -429,11 +544,13 @@ impl IslandHost {
                 } else {
                     IslandEvent::HoverLeave
                 });
+                self.update_media_hover();
                 Some(LRESULT(0))
             }
             WM_MOUSELEAVE => {
                 self.tracking_mouse = false;
                 if !self.scrubbing && !self.volume_dragging {
+                    self.set_media_hover(None);
                     self.dispatch(IslandEvent::HoverLeave);
                 }
                 Some(LRESULT(0))
@@ -444,6 +561,7 @@ impl IslandHost {
                     if let Some(fraction) = scrub_fraction(x, y, width, false).filter(|_| seekable)
                     {
                         self.scrubbing = true;
+                        self.set_media_hover(Some(MediaHover::Seek));
                         unsafe {
                             SetCapture(self.hwnd);
                         }
@@ -456,6 +574,7 @@ impl IslandHost {
                         .and_then(|_| volume_fraction(x, y, width, false))
                     {
                         self.volume_dragging = true;
+                        self.set_media_hover(Some(MediaHover::Volume));
                         unsafe {
                             SetCapture(self.hwnd);
                         }
@@ -488,6 +607,10 @@ impl IslandHost {
                 Some(LRESULT(0))
             }
             WM_APP_WINDOWS_CHANGED => {
+                if self.preview.is_some() {
+                    self.refresh_preview();
+                    return Some(LRESULT(0));
+                }
                 if !self.occlusion_pending {
                     self.occlusion_pending = true;
                     unsafe {
@@ -497,6 +620,17 @@ impl IslandHost {
                             OCCLUSION_DEBOUNCE_MS,
                             None,
                         );
+                    }
+                }
+                Some(LRESULT(0))
+            }
+            WM_APP_DICTATION => {
+                while let Ok(update) = self.dictation_rx.try_recv() {
+                    match update {
+                        UiUpdate::Card(card) => self.dispatch(IslandEvent::SetDictation(card)),
+                        UiUpdate::Notice(notice) => {
+                            self.dispatch(IslandEvent::SetDone(Some(notice)));
+                        }
                     }
                 }
                 Some(LRESULT(0))
@@ -514,11 +648,17 @@ impl IslandHost {
             }
             WM_MOUSEACTIVATE => Some(LRESULT(MA_NOACTIVATE as isize)),
             WM_TIMER => {
+                if wparam.0 == TIMER_PREVIEW_HANDOFF {
+                    return self.handle_message(self.hwnd, PREVIEW_DEPARTED, WPARAM(0), LPARAM(0));
+                }
                 self.on_timer(wparam.0);
                 Some(LRESULT(0))
             }
             WM_ERASEBKGND => Some(LRESULT(1)),
             WM_WINDOWPOSCHANGING => {
+                if self.preview.is_some() {
+                    return None;
+                }
                 let position = lparam.0 as *mut WINDOWPOS;
                 if !position.is_null() {
                     let position = unsafe { &mut *position };
@@ -576,7 +716,7 @@ impl IslandHost {
 
     /// Hooks window events only while slim mode is enabled.
     fn update_window_events(&mut self) {
-        let wanted = self.tuck_enabled && self.demo.is_none();
+        let wanted = self.preview.is_some() || (self.tuck_enabled && self.demo.is_none());
         match (wanted, self.window_events.is_some()) {
             (true, false) => {
                 self.window_events = Some(occlusion::WindowEvents::install(
@@ -594,6 +734,9 @@ impl IslandHost {
     /// The window already spans the work area, so the renderer simply springs
     /// the same pill to the other edge.
     fn update_tucked(&mut self) {
+        if self.preview.is_some() || self.preview_pending.is_some() {
+            return;
+        }
         // The demo drives docking itself; real occlusion is not monitored.
         if self.demo.is_some() {
             return;
@@ -630,6 +773,33 @@ impl IslandHost {
             compact.height * scale,
         );
         occlusion::window_behind(zone)
+    }
+
+    fn start_dictation(&mut self, config: &Config) {
+        let hwnd = self.hwnd.0 as isize;
+        let notify: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            // SAFETY: a non-blocking post to the island window.
+            unsafe {
+                let _ = PostMessageW(
+                    Some(HWND(hwnd as *mut _)),
+                    WM_APP_DICTATION,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            }
+        });
+        let models = crate::paths::Paths::discover().model_dir;
+        match dictation::spawn(&config.dictation, models, self.dictation_tx.clone(), notify) {
+            Ok(handle) => self.dictation = Some(handle),
+            Err(error) => tracing::error!(%error, "could not start dictation"),
+        }
+    }
+
+    /// Tray "Pause dictation": hotkeys pass through while paused.
+    pub fn set_dictation_paused(&mut self, paused: bool) {
+        if let Some(dictation) = &self.dictation {
+            dictation.set_paused(paused);
+        }
     }
 
     fn start_media(&mut self) {
@@ -738,6 +908,50 @@ impl IslandHost {
             .filter(|duration| *duration > 0.0)
     }
 
+    fn set_media_hover(&mut self, hover: Option<MediaHover>) {
+        if self.media_hover != hover {
+            self.media_hover = hover;
+            let _ = self.tx.send(RenderCommand::MediaHover(hover));
+        }
+    }
+
+    /// Reconcile on mouse movement, expansion, and the existing hover poll,
+    /// including when the island moves under a stationary pointer.
+    fn update_media_hover(&mut self) {
+        let mut point = POINT::default();
+        let hover = if !self.state.expanded || self.fullscreen_hidden || self.traveling {
+            None
+        } else if self.scrubbing {
+            Some(MediaHover::Seek)
+        } else if self.volume_dragging {
+            Some(MediaHover::Volume)
+        } else if unsafe { GetCursorPos(&mut point) }.is_ok()
+            && unsafe { ScreenToClient(self.hwnd, &mut point) }.as_bool()
+        {
+            match self.state.primary_card() {
+                Some(islet_core::ContentCard::Media(media)) => {
+                    let layout = self.state.layout();
+                    let main = self.target_frame(layout, self.effective_anchor_top()).main;
+                    let scale = self.dpi as f32 / 96.0;
+                    expanded_hover_at(
+                        point.x as f32 / scale - main.x,
+                        point.y as f32 / scale - main.y,
+                        main.width,
+                        media
+                            .timeline
+                            .is_some_and(|timeline| timeline.duration > 0.0),
+                        media.volume.is_some(),
+                        !media.source.is_empty(),
+                    )
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        self.set_media_hover(hover);
+    }
+
     fn set_scrub(&mut self, scrub: Option<f32>) {
         if let Some(mut media) = self.state.media.clone() {
             media.scrub = scrub;
@@ -757,6 +971,7 @@ impl IslandHost {
             }
             _ => self.set_scrub(None),
         }
+        self.update_media_hover();
     }
 
     /// Moves the slider and the system volume together; the worker writes the
@@ -781,6 +996,7 @@ impl IslandHost {
         unsafe {
             let _ = ReleaseCapture();
         }
+        self.update_media_hover();
     }
 
     /// Follows volume changes made elsewhere (media keys, the Windows mixer)
@@ -862,7 +1078,7 @@ impl IslandHost {
     fn update_poll_timer(&mut self) {
         let wanted = if self.state.pointer_inside && !self.fullscreen_hidden {
             Some(POLL_HOVER_MS)
-        } else if self.follow_cursor {
+        } else if self.follow_cursor && self.preview.is_none() {
             Some(POLL_FOLLOW_MS)
         } else {
             None
@@ -914,7 +1130,7 @@ impl IslandHost {
     }
 
     fn on_fullscreen_notification(&mut self, opened: bool) {
-        if !self.hide_in_fullscreen || self.demo.is_some() {
+        if self.preview.is_some() || !self.hide_in_fullscreen || self.demo.is_some() {
             return;
         }
         // The shell also reports the desktop and some maximized windows as
@@ -924,7 +1140,21 @@ impl IslandHost {
     }
 
     fn send_snapshot(&mut self) {
-        let target = self.state.layout();
+        let preview_state = self.preview.map(|_| {
+            let mut state = self.state.clone();
+            state.tucked = false;
+            if state.content().primary.is_none() {
+                state.running = Some(AgentCard {
+                    project: "Islet".into(),
+                    activity: "Ready when you are".into(),
+                    state: AgentState::Done,
+                });
+            }
+            state
+        });
+        let display_state = preview_state.as_ref().unwrap_or(&self.state);
+        let target = display_state.layout();
+        let content = display_state.content();
         let anchor_top = self.effective_anchor_top();
         if self
             .last_sent_anchor_top
@@ -959,7 +1189,7 @@ impl IslandHost {
         }
         let command = RenderCommand::Snapshot {
             target,
-            content: Box::new(self.state.content()),
+            content: Box::new(content),
             anchor_top,
             generation: self.generation,
         };
@@ -967,6 +1197,7 @@ impl IslandHost {
             self.warned_disconnected = true;
             tracing::warn!("render thread is no longer accepting snapshots");
         }
+        self.update_media_hover();
     }
 
     fn target_frame(
@@ -988,7 +1219,7 @@ impl IslandHost {
     /// The slim bar always docks at the bottom edge: at the top it would
     /// cover browser tabs and title bars.
     fn effective_anchor_top(&self) -> bool {
-        self.anchor_top && !self.state.tucked
+        self.preview.is_some() || (self.anchor_top && !self.state.tucked)
     }
 
     fn update_region(&mut self) {
@@ -1109,6 +1340,7 @@ impl IslandHost {
             }
         }
         self.sync_volume();
+        self.update_media_hover();
         self.update_poll_timer();
     }
 
@@ -1164,6 +1396,108 @@ impl IslandHost {
         }
     }
 
+    fn begin_departure(&mut self) {
+        self.set_click_through(true);
+        if let Some(target) = self.last_target {
+            self.morph_box = self
+                .target_frame(target, self.effective_anchor_top())
+                .bounds();
+            self.update_region();
+        }
+        let _ = self.tx.send(RenderCommand::Suspend(false));
+        let _ = self.tx.send(RenderCommand::Depart);
+        unsafe {
+            SetTimer(Some(self.hwnd), TIMER_PREVIEW_HANDOFF, 900, None);
+        }
+    }
+
+    fn refresh_preview(&mut self) {
+        let Some(anchor) = self.preview else {
+            return;
+        };
+        if !unsafe { IsWindow(Some(anchor)) }.as_bool() {
+            self.preview = None;
+            self.preview_pending = None;
+            self.last_layout = None;
+            let _ = self.reposition_layout();
+            self.set_fullscreen_hidden(false);
+            self.send_snapshot();
+            let _ = self.tx.send(RenderCommand::Arrive);
+            self.update_window_events();
+            return;
+        }
+        let root = unsafe { GetAncestor(anchor, GA_ROOT) };
+        // Keep an independent window: owning it across processes would destroy
+        // the island if settings crashed. Match the settings z-order explicitly.
+        let hidden =
+            unsafe { IsIconic(root) }.as_bool() || !unsafe { IsWindowVisible(root) }.as_bool();
+        self.set_fullscreen_hidden(hidden);
+        let mut rect = windows::Win32::Foundation::RECT::default();
+        if unsafe { GetWindowRect(anchor, &mut rect) }.is_err() {
+            return;
+        }
+        let dpi = unsafe { GetDpiForWindow(root) }.max(96);
+        let layout = WindowLayout {
+            x: rect.left,
+            y: rect.top,
+            width: rect.right - rect.left,
+            height: rect.bottom - rect.top,
+            dpi,
+            anchor_top: true,
+            logical_height: (rect.bottom - rect.top) as f32 * 96.0 / dpi as f32,
+        };
+        if self.last_layout == Some(layout) {
+            self.align_preview_z_order(root);
+            return;
+        }
+        unsafe {
+            let _ = SetWindowPos(
+                self.hwnd,
+                Some(HWND_NOTOPMOST),
+                layout.x,
+                layout.y,
+                layout.width,
+                layout.height,
+                SWP_NOACTIVATE,
+            );
+        }
+        self.align_preview_z_order(root);
+        self.last_layout = Some(layout);
+        self.dpi = dpi;
+        self.pixel_width = layout.width as u32;
+        self.pixel_height = layout.height as u32;
+        self.logical_height = layout.logical_height;
+        let _ = self.tx.send(RenderCommand::Resize {
+            width: self.pixel_width,
+            height: self.pixel_height,
+            dpi: dpi as f32,
+            logical_width: WINDOW_LOGICAL_WIDTH,
+            logical_height: self.logical_height,
+        });
+        self.region = None;
+        self.update_region();
+    }
+
+    fn align_preview_z_order(&self, root: HWND) {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetWindow, GW_HWNDPREV, HWND_TOP, SWP_NOMOVE, SWP_NOSIZE,
+        };
+        let previous = unsafe { GetWindow(root, GW_HWNDPREV) }.unwrap_or(HWND_TOP);
+        if previous != self.hwnd {
+            unsafe {
+                let _ = SetWindowPos(
+                    self.hwnd,
+                    Some(previous),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
+                );
+            }
+        }
+    }
+
     fn reposition(&mut self) -> WinResult<()> {
         self.reposition_layout()?;
         self.update_tucked();
@@ -1174,6 +1508,10 @@ impl IslandHost {
     /// window spans the whole work area, giving the renderer room to spring
     /// the pill to the bottom and back.
     fn reposition_layout(&mut self) -> WinResult<()> {
+        if self.preview.is_some() {
+            self.refresh_preview();
+            return Ok(());
+        }
         let config = read_config(&self.shared);
         let layout = compute_window_layout(&config, self.anchor_top)?;
         self.home_layout = Some(layout);
@@ -1242,6 +1580,9 @@ impl IslandHost {
     }
 
     fn should_hide_for_fullscreen(&self) -> bool {
+        if self.preview.is_some() {
+            return self.fullscreen_hidden;
+        }
         let foreground = unsafe { GetForegroundWindow() };
         if foreground.is_invalid() || foreground == self.hwnd {
             return false;
@@ -1423,6 +1764,11 @@ fn render_thread(
                 tracing::error!(%error, "island render failed");
                 break;
             }
+            if renderer.take_departure_completed(last_frame) {
+                unsafe {
+                    let _ = PostMessageW(Some(notify), PREVIEW_DEPARTED, WPARAM(0), LPARAM(0));
+                }
+            }
             if reported_settled != Some(generation) && !renderer.is_morphing(clock_now()) {
                 reported_settled = Some(generation);
                 report_settled(generation);
@@ -1504,6 +1850,21 @@ fn apply_command(
     generation: &mut usize,
 ) -> bool {
     match command {
+        RenderCommand::Depart => {
+            renderer.depart_surface(clock_now(), surface_animations_enabled());
+            *dirty = true;
+            false
+        }
+        RenderCommand::Arrive => {
+            renderer.arrive_surface(clock_now(), surface_animations_enabled());
+            *dirty = true;
+            false
+        }
+        RenderCommand::MediaHover(hover) => {
+            renderer.set_media_hover(hover);
+            *dirty = true;
+            false
+        }
         RenderCommand::Snapshot {
             target,
             content,
@@ -1757,10 +2118,19 @@ fn demo_done() -> NotificationCard {
 }
 
 fn demo_dictation() -> DictationCard {
+    // A plausible speech waveform: syllable bursts with small pauses.
+    let mut bars = [0u8; islet_core::island::DICTATION_BARS];
+    for (index, bar) in bars.iter_mut().enumerate() {
+        let burst =
+            ((index as f32 * 0.9).sin() * 0.5 + 0.5) * ((index as f32 * 0.37).cos() * 0.4 + 0.6);
+        *bar = (burst * 230.0) as u8;
+    }
     DictationCard {
         elapsed_ms: 7_400,
         level: 0.72,
         phase: DictationPhase::Recording,
+        bars,
+        hands_free: false,
     }
 }
 
@@ -1959,4 +2329,20 @@ unsafe fn is_candidate_window(hwnd: HWND, needles: &[String]) -> bool {
     }
 
     false
+}
+
+fn surface_animations_enabled() -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SystemParametersInfoW, SPI_GETCLIENTAREAANIMATION, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+    };
+    let mut enabled = windows::core::BOOL(1);
+    unsafe {
+        let _ = SystemParametersInfoW(
+            SPI_GETCLIENTAREAANIMATION,
+            0,
+            Some((&mut enabled as *mut windows::core::BOOL).cast()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        );
+    }
+    enabled.as_bool()
 }

@@ -5,10 +5,13 @@
 
 pub mod config;
 pub mod geometry;
+pub mod handoff;
+pub mod hotkey;
 pub mod island;
 pub mod media;
 pub mod music;
 pub mod spring;
+pub mod transcript;
 
 pub use config::Config;
 pub use geometry::Rect;

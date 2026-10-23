@@ -699,3 +699,236 @@ Window-only captures of the demo state show the new card; a scripted mouse drag
 from 25% to 75% moved the knob with the cursor, and a probe read the endpoint,
 wrote the same value back and read it again (0.9676).
 
+
+## Reference-led horizontal hover player (2026-10-23)
+
+The expanded media card is now a 448 x 112 black capsule with an 84 dp cover,
+compact Inter title and artist, small filled transport icons, and a white
+hairline seek track. A quiet vertical divider separates the fixed 280 dp music
+pane from two charcoal pills containing the existing source shortcut and volume
+slider. Source activation, seeking, mute, and captured volume dragging are
+preserved. The window grows to 488 dp to retain 20 dp of animation clearance.
+
+Playback layout and its hit zones stay fixed when the capsule widens. The first
+feature column also stays anchored beside the player, leaving future columns
+to grow on its right. The shared geometry module owns drawing and hit testing.
+
+Verification: 90 tests across islet-core, islet-render, and islet-app pass,
+including a regression check for extending the feature area and separate
+transport/seek/volume hit zones. Scoped Clippy with warnings denied, formatting,
+diff whitespace checks, and the release build pass. Native screenshot inspection
+was unavailable: the Computer Use helper's native pipe failed to connect after
+retry and session reset. No rendered visual approval is claimed.
+
+## Expanded control hover feedback (2026-10-23)
+
+Every actionable part of the expanded music player now gets a neutral grey
+hover tint: album art, title/artist, previous, play/pause, next, seek bar, source
+shortcut, and volume. The seek thumb also appears on hover. Artwork retains its
+rounded mask, transport uses circular backgrounds, and the two existing feature
+pills brighten in place. Captured slider drags keep their highlight until release.
+
+Hover targets use the same shared hit zones and mouse-down precedence as clicks.
+Missing timeline, volume, or source controls do not show feedback. The UI sends
+only hover-target changes over a separate render command, avoiding track
+transitions and continuous animation while paused. Mouse leave, collapse, and
+the existing stationary-pointer poll reconcile the highlight.
+
+Verification: 92 tests pass across islet-core, islet-render, and islet-app,
+including unavailable controls and the transport/seek boundary. Scoped Clippy
+with warnings denied and formatting pass.
+
+## Hover feedback correction (2026-10-23)
+
+Per the user's correction, hover feedback now changes foreground only. The
+white title and source label shift to light grey; transport and volume icons
+soften their opacity. Artist text and the seek fill get a small opacity change,
+and artwork dims slightly. Removed the hover backgrounds, pill brightening,
+and hover-only seek thumb. Existing static pill fills retain their resting color.
+
+## Mixed hover treatment (2026-10-23)
+
+Restored the original grey hover backgrounds for previous, play/pause, next,
+seek, volume, and the source shortcut above volume, per the user's latest
+preference. These controls retain their normal foreground opacity. The seek
+thumb appears on hover again. Title and artist keep the light text-only effect;
+artwork keeps its subtle opacity feedback. Scoped Clippy and formatting pass.
+
+### Settings redesign and native preview handoff (2026-10-23)
+- Rebuilt all three settings pages around the supplied black-sidebar / purple-workspace reference: rounded main surface, static atmospheric gradient, authored navigation icons, compact sidebar footer, softer controls, independent page scroll state, and short page fades.
+- Reserved the upper workspace for the existing live island. Settings publishes an invisible geometry anchor; the main app retracts through its current edge, relocates while hidden, and emerges from the preview top. Closing restores desktop placement.
+- Preview remains an independent native window, aligned in normal z-order. Cross-process ownership was rejected after a forced-close probe showed Windows destroys owned windows. The final implementation survives settings process termination and restores the same island HWND to the desktop.
+- Motion is finite and respects Windows client-area animation settings. No second media/audio/render pipeline; settings uses no permanent preview timer. Idle settings CPU measured 0 seconds over a three-second settled sample (not an FPS/GPU benchmark).
+- Added named/checked metadata and keyboard-focus outlines to switches. Startup-registration failures now remain visible and roll back the requested startup toggle rather than falsely reporting success.
+- Validation: 94 core/render/app tests passed; settings built; scoped Clippy with warnings denied passed. Native probes verified matching preview/anchor rectangles, move/resize, minimize/restore, graceful close, and forced-close recovery. All three pages captured, including About at minimum size.
+- Finish review: reference styling matched; startup error fix resolved; switch labels/checked metadata/focus-outline source verified. Actual focused-switch screenshot remains unverified because native keyboard-focus injection was refused; no further source change was indicated.
+- Launched the app with cargo run -p islet-app and reopened the redesigned settings. Native integration captures/probe scripts are under ignored target/.
+
+### Matching title bar and rounded settings typography (2026-10-23)
+- Set the native settings caption and border to the app frame's #030304, with light caption text and dark native controls through DWM attributes. Native drag, resize, minimize/maximize, and close controls are retained.
+- Bundled SIL Open Font License Nunito at regular weight 400 for all proportional settings typography. The upstream variable font defaults to weight 200, so a static 400 instance was generated using fontTools for clear labels and descriptions. Font and license ship in crates/islet-settings/assets/fonts/.
+- Updated DESIGN.md and design sidecar typography. Built settings, passed scoped Clippy with warnings denied, and visually checked the final window. Reopened updated settings for the user.
+
+### Bold headings and animated sidebar (2026-10-23)
+- Added a bundled Nunito Bold 700 face for page/section headings, branding, and selected navigation labels. Regular text remains weight 400.
+- Rebuilt the sidebar with a clearer brand lockup, icon/label/description navigation rows, a shared sliding selection surface, subtle hover and icon transitions, visible keyboard focus, and compact connection/version footer.
+- Selection moves over 220ms, responds immediately with Windows reduced motion, and stops repainting when settled. Existing egui animation manager is reused.
+- Built settings, passed scoped Clippy with warnings denied, visually checked General and Now Playing, and verified page navigation by clicking the running app. Settled settings CPU measured zero seconds over three seconds. Updated design records; updated app remains open.
+
+### Dark context menu and Restart app (2026-10-23)
+- Styled the native tray/island context menu with dark backgrounds, light text, muted separators, and a dark hover state. Owner drawing retains native menu tracking, item captions, keyboard navigation, and dismissal; GDI/menu resources are released after closing.
+- Added Restart app above Quit. The replacement preserves launch arguments, waits on the old process handle before initialization, and starts after singleton/logging cleanup. Failure to spawn keeps the existing instance running.
+- New app instances reconnect to an existing settings preview anchor without permanent polling. Right-clicking the island forwards to the same menu as the tray icon.
+- Validation: app built; three app tests and scoped Clippy with warnings denied passed; formatting and diff checks passed. Captured the dark menu. Native menu-item hit testing selected Restart app, confirmed a new PID with exactly one running main instance, and verified the existing settings preview reconnects with matching anchor/island rectangles.
+
+### Compact rounded context menu (2026-10-23)
+- Reduced the menu from 232 x 228 to 184 x 182 physical pixels at 100% scaling (about 20% smaller in each dimension), with 27-point rows, 13-point text, narrower padding, and tighter separators.
+- Added 10-point outer corner rounding and inset rounded hover surfaces. Rounding uses a process/thread-scoped popup-start hook installed only while the menu is open; its region is owned by Windows and the hook is released on close.
+- Built and relaunched the app; scoped Clippy with warnings denied passed. Screenshot and native window-region probe confirmed the compact size and actual corner clipping (corner outside the region, center inside). Existing menu actions are unchanged.
+
+### Simplified context menu (2026-10-23)
+- Removed Open config, Reload config, and Open logs, along with their obsolete command handlers. The compact rounded dark menu now contains Settings, Restart app, and Quit Islet.
+- Built and relaunched the app; scoped Clippy with warnings denied passed. Settings was closed during rebuilding to prevent its preview recovery from relaunching the old binary, then reopened afterward.
+
+### Borderless native context menu (2026-10-23)
+- Removed the stock light outline by clipping the two-point system frame inside the existing rounded window region. Native item layout, hover behavior, hit testing, and scoped hook lifetime remain intact; no extra paint loop or subclass is needed.
+- Built, passed scoped Clippy with warnings denied, and relaunched app/settings. Verified the finished popup visually and sampled edge pixels to confirm the light outline is gone; visible menu edges use #120f15 and clipped pixels expose the background.
+
+## P3 - Dictation (implemented, 2026-10-23; real-speech checks pending)
+
+**Status:** the whole pipeline works end to end on this machine: hotkey ->
+microphone -> Parakeet -> text cleanup -> inserted at the cursor, with the
+clipboard restored. Verified with a fake microphone playing the P0 test clips
+(so no one has to talk while a script drives the keys), with the real keyboard
+hook, and with real text insertion. Not yet verified with a human voice on the
+real microphone, nor in Notepad/VS Code/Chrome/Windows Terminal (see
+"Pending").
+
+### Decisions (deviations from PLAN, all small)
+
+1. **ASR runs in `islet-asr-worker.exe`, not a thread in `islet.exe`.** The
+   sherpa + ONNX Runtime static link is 19 MB, which would take `islet.exe`
+   from 2 MB to ~20 MB (budget: 8 MB). A child process also makes "unload the
+   model" mean "the process exits" (every byte returned; P0 showed ONNX Runtime
+   keeps memory after long clips) and isolates ASR crashes from the island.
+   Same stack (sherpa-onnx); only the process boundary differs. Protocol:
+   length-prefixed frames over stdin/stdout, JSON control + raw f32 audio
+   (`islet-asr/src/protocol.rs`).
+2. **No `cpal` or `rubato`.** WASAPI shared mode with `AUTOCONVERTPCM` delivers
+   16 kHz mono 16-bit directly (Windows' own converter), so mic capture is ~150
+   lines on the `windows` crate we already use and needs no resampler. `cpal`
+   will still be wanted for P5 (key sounds).
+3. **The `ort` spike moved to its own crate** (`asr-bench-ort`) so the shipping
+   `islet-asr` has no ONNX Runtime and the two static copies can never meet.
+4. **Model registry** (`islet-asr/src/registry.rs`): Parakeet TDT v3 (default,
+   multilingual) and v2 (English). Adding a model is one entry with its files,
+   sizes and SHA-256. Hashes of the large files are Hugging Face's published
+   LFS ids; the existing local v3 files were checked against them. The VAD
+   model and v2's `tokens.txt` have no published hash, so theirs are pinned from
+   the first download over HTTPS (trust on first use).
+5. **No regex crate** for the personal dictionary yet (PLAN says "regex
+   allowed"): dictionary and snippets match whole words/phrases.
+
+### What was built
+
+- `islet-core::hotkey`: `Combo` parsing ("Ctrl+Win", "F9", ...) and an
+  allocation-free `HotkeyFsm` that runs *inside* the hook callback (it must
+  decide synchronously whether to swallow a key). Hold = push to talk; taps
+  under 250 ms are discarded; double-tap or Ctrl+Win+Space = hands-free; Esc
+  cancels; any other key during a hold cancels and passes through (Ctrl+Win+
+  Left still switches desktops); extra modifiers or typing first do not
+  trigger. 19 tests.
+- `islet-core::transcript`: filler removal ("um", "uh", clause-initial "you
+  know"), spoken punctuation ("new line", "new paragraph", "comma", "question
+  mark", ...), personal dictionary, snippets; unicode-safe. 11 tests.
+- `islet-asr`: registry, `ModelManager` (resumable HTTPS download with `Range`,
+  SHA-256 verify, delete, status; tested against a local HTTP server for
+  resume, dropped connections, servers that ignore ranges, corrupt files and
+  cancel), protocol, and `AsrClient` (spawns and supervises the worker).
+- `islet-asr-worker`: Parakeet via sherpa `nemo_transducer` + Silero VAD
+  (a 0.5 s pause closes an utterance, 12 s cap), recognising each utterance as
+  it closes so only the last one is pending at release.
+- `islet-audio`: `Microphone` (opened warm, started on demand, 16 kHz mono),
+  device list for the picker, `Tone` (generated start/stop/done chimes via
+  `PlaySound`), and an `ISLET_FAKE_MIC=<wav>` test hook.
+- `islet-input`: `KeyboardHook` (`WH_KEYBOARD_LL` thread; ignores its own
+  injected keys) and `insert_text`: clipboard paste (all formats saved and
+  restored, only if the user did not copy something meanwhile; flagged out of
+  clipboard history and cloud sync) or Unicode typing. It waits for the
+  hotkey's modifiers to be released first (a synthetic Ctrl+V with Win still
+  down becomes Win+V), detects elevated target windows (UIPI), and injects a
+  dummy key so releasing Win does not open the Start menu.
+- `islet-app::dictation`: one controller thread owns hook, mic and worker.
+  The model loads lazily on the first press (the pill says "Warming up", audio
+  is held and replayed), unloads after `unload_after_minutes` (which also
+  closes the mic), or stays loaded with `keep_warm`. Tray menu: Pause/Resume
+  dictation.
+- Island pill: pulsing dot (ring when hands-free), 24-bar live waveform, timer;
+  spinner while warming up or transcribing; green check when done. Notices
+  (model missing, mic problem, admin window) use the compact pill.
+- Settings: **Dictation page** with hotkey capture (reads key state directly,
+  so the Win key works; the island ignores dictation while Settings has focus),
+  microphone picker, filler/punctuation/spacing/insert-method/tones toggles,
+  model list with Download/Resume/Cancel/Verify/Delete and progress, keep-warm
+  and unload timer, personal dictionary and snippets. First run (no model)
+  shows a notice and opens this page. About > Privacy now describes dictation.
+
+### Bugs found by testing the real flow
+
+- **Audio buffered while the model loads lost its opening words** ("The quick
+  brown fox jumps" vanished). Silero VAD in sherpa mishandles one large
+  `accept_waveform` call; the worker now feeds it 512-sample windows. Burst
+  sizes 0-4000 ms all return the full sentence now.
+- The message loop in my own test harness dropped queued keystrokes (posted
+  messages overtake input); harness fixed, product unaffected.
+- A standalone dash in a transcript was dropped by the text cleaner (found by a
+  unit test); fixed.
+
+### Measurements (release, static CRT, i5-12400F)
+
+| | |
+|---|---|
+| `islet.exe` | 2.18 MB (budget 8 MB) |
+| `islet-asr-worker.exe` | 18.84 MB (only running while in use) |
+| `islet-settings.exe` | 5.63 MB |
+| island idle, no model | 17.3 MiB private, 15 ms CPU / 10 s |
+| island after a dictation | 26.1 MiB private |
+| worker with model loaded | 712 MiB private, 0 ms CPU idle |
+| after the idle timeout | worker process gone; island 12 MiB private |
+| model load | 1.8 s |
+| mic open / first audio after `start()` | 19 ms / 17 ms |
+| key release -> text ready (15.5 s clip) | 156-182 ms (finishing the last utterance) |
+| key release -> inserted | ~430 ms, of which 250 ms is the deliberate wait before restoring the clipboard; the text is pasted ~180 ms after release |
+| 15.5 s dictation, cold start (model loaded mid-recording) | complete and correct |
+
+### Pending / open issues
+
+- **Real microphone + real voice not tested.** The system default input on this
+  PC is the *Voicemeeter* virtual device (silent); the FIFINE mic works when
+  selected explicitly (Settings > Dictation > Microphone). WER with a human
+  voice is untested (the clips are SAPI speech).
+- **The latency budget (400 ms for a 10 s utterance) is not proven.** The clips
+  end in silence, so the last utterance had already closed. With unbroken
+  speech the final utterance is still decoding at release: about 0.3-0.75 s
+  measured for 5-12 s segments. If real speech misses the budget: lower the
+  12 s cap, give the tail decode more threads, or shorten the pause threshold.
+- Not tested in Notepad, VS Code, Chrome or Windows Terminal. Per-app
+  insertion overrides (terminals that dislike Ctrl+V) are not implemented.
+- Not implemented: transcript history, the "record 5 s and transcribe" test
+  button, hook watchdog/re-install, GPU provider, models other than Parakeet.
+- The old `%LOCALAPPDATA%\Islet\models\parakeet-tdt-0.6b-v3-int8` (the `ort`
+  export, ~640 MB) is no longer used and can be deleted.
+- The hotkey capture button could not be clicked by automation; its logic is
+  unit-tested (6 tests) but the button itself was only seen, not pressed.
+- Hands-free recordings stop themselves after 10 minutes.
+
+### P3 acceptance
+
+- [x] Hold / double-tap / toggle / Esc through the real keyboard hook.
+- [x] Text inserted at the cursor with the clipboard preserved (own text box;
+  paste and type methods; emoji, accents, CJK, line breaks).
+- [x] The model unloads after the timeout and memory is returned.
+- [x] 15 s hands-free and push-to-talk dictations, cold and warm.
+- [ ] 10 s utterance in Notepad / VS Code / Chrome / Windows Terminal within
+  400 ms.
+- [ ] 3-minute hands-free dictation without memory growth.

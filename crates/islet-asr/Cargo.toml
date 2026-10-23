@@ -5,22 +5,20 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
-[lib]
-name = "islet_asr"
-path = "src/lib.rs"
-
-[[bin]]
-name = "asr-bench"
-path = "src/bin/asr-bench.rs"
-
+# Everything the island process needs to use speech recognition: the model
+# registry, the model downloader, and the client for `islet-asr-worker.exe`.
+# No ONNX Runtime is linked here; it lives in the worker (see PROGRESS.md).
 [dependencies]
-ort = "=2.0.0-rc.15"
-hound = "3.5"
-serde = { workspace = true, features = ["derive"] }
+crossbeam-channel.workspace = true
+serde.workspace = true
 serde_json = "1"
+sha2 = "0.10"
 tracing.workspace = true
-windows-sys = { version = "0.59", features = [
-    "Win32_Foundation",
-    "Win32_System_ProcessStatus",
-    "Win32_System_Threading",
-] }
+ureq = "2"
+
+[dev-dependencies]
+hound = "3.5"
+
+[[example]]
+name = "dictate_wav"
+path = "examples/dictate_wav.rs"

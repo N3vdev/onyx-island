@@ -14,6 +14,8 @@ islet-core = { path = "../islet-core" }
 islet-render = { path = "../islet-render" }
 islet-media = { path = "../islet-media" }
 islet-audio = { path = "../islet-audio" }
+islet-asr = { path = "../islet-asr" }
+islet-input = { path = "../islet-input" }
 crossbeam-channel.workspace = true
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -30,6 +32,7 @@ windows = { version = "0.62", features = [
     "Win32_UI_HiDpi",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Accessibility",
+    "Win32_UI_Controls",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }

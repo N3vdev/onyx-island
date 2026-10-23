@@ -89,6 +89,25 @@ pub struct DictationConfig {
     pub model: String,
     pub keep_warm: bool,
     pub unload_after_minutes: u32,
+    /// Microphone to use; empty means the system default.
+    pub microphone: String,
+    /// Play a soft tone when recording starts and stops.
+    pub tones: bool,
+    /// End the inserted text with a space so back-to-back dictations do not
+    /// run together.
+    pub trailing_space: bool,
+    /// Replace spoken words with preferred spellings ("claude code" ->
+    /// "Claude Code").
+    pub dictionary: Vec<Replacement>,
+    /// Spoken triggers that expand to longer text ("insert my email").
+    pub snippets: Vec<Replacement>,
+}
+
+/// One "say this, get that" entry for the dictionary or snippets.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Replacement {
+    pub from: String,
+    pub to: String,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -160,6 +179,11 @@ impl Default for DictationConfig {
             model: "parakeet-tdt-0.6b-v3-int8".to_owned(),
             keep_warm: false,
             unload_after_minutes: 10,
+            microphone: String::new(),
+            tones: true,
+            trailing_space: true,
+            dictionary: Vec::new(),
+            snippets: Vec::new(),
         }
     }
 }
@@ -262,6 +286,9 @@ impl Config {
         self.dictation.push_to_talk = self.dictation.push_to_talk.trim().to_owned();
         self.dictation.hands_free = self.dictation.hands_free.trim().to_owned();
         self.media.pause_hide_seconds = self.media.pause_hide_seconds.clamp(1, 300);
+        for list in [&mut self.dictation.dictionary, &mut self.dictation.snippets] {
+            list.retain(|entry| !entry.from.trim().is_empty());
+        }
         self.media
             .music_sites
             .retain(|site| !site.trim().is_empty());

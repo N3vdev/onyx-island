@@ -22,7 +22,7 @@ pub const EDGE_GAP_DP: f32 = 8.0;
 pub const COMPACT: PillSize = PillSize::new(220.0, 36.0, 18.0);
 pub const SPLIT_BUBBLE: PillSize = PillSize::new(36.0, 36.0, 18.0);
 pub const NOTIFICATION: PillSize = PillSize::new(380.0, 76.0, 30.0);
-pub const MEDIA: PillSize = PillSize::new(400.0, 168.0, 38.0);
+pub const MEDIA: PillSize = PillSize::new(448.0, 112.0, 36.0);
 pub const DICTATION: PillSize = PillSize::new(260.0, 44.0, 22.0);
 pub const SLIVER: PillSize = PillSize::new(120.0, 6.0, 3.0);
 pub const HIDDEN: PillSize = PillSize::new(0.0, 0.0, 0.0);
@@ -213,9 +213,16 @@ pub enum AgentState {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DictationPhase {
+    /// The speech model is still loading ("warming up").
+    Loading,
     Recording,
     Transcribing,
+    /// The text was inserted; shown briefly as a check mark.
+    Done,
 }
+
+/// Bars in the live waveform; the newest is last.
+pub const DICTATION_BARS: usize = 24;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct MediaCard {
@@ -260,8 +267,25 @@ pub struct AgentCard {
 #[derive(Clone, Debug, PartialEq)]
 pub struct DictationCard {
     pub elapsed_ms: u32,
+    /// Current microphone level, 0..=1.
     pub level: f32,
     pub phase: DictationPhase,
+    /// Recent levels (0..=255) for the waveform, oldest first.
+    pub bars: [u8; DICTATION_BARS],
+    /// Locked on with the hands-free hotkey; shown as a ring around the dot.
+    pub hands_free: bool,
+}
+
+impl Default for DictationCard {
+    fn default() -> Self {
+        Self {
+            elapsed_ms: 0,
+            level: 0.0,
+            phase: DictationPhase::Recording,
+            bars: [0; DICTATION_BARS],
+            hands_free: false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -306,7 +330,7 @@ impl ContentCard {
     pub fn animates(&self) -> bool {
         match self {
             Self::Media(media) => media.playing,
-            Self::Dictation(dictation) => dictation.phase == DictationPhase::Recording,
+            Self::Dictation(dictation) => dictation.phase != DictationPhase::Done,
             Self::Notification(_) | Self::Agent(_) => false,
         }
     }
@@ -784,7 +808,11 @@ fn accent_for_card(card: &ContentCard) -> [u8; 3] {
             AgentState::NeedsInput => [255, 159, 46],
             AgentState::Done => [64, 210, 122],
         },
-        ContentCard::Dictation(_) => [255, 78, 92],
+        ContentCard::Dictation(dictation) => match dictation.phase {
+            DictationPhase::Done => [64, 210, 122],
+            DictationPhase::Loading | DictationPhase::Transcribing => [140, 160, 255],
+            DictationPhase::Recording => [255, 78, 92],
+        },
     }
 }
 
@@ -953,6 +981,7 @@ mod tests {
                 elapsed_ms: 2_000,
                 level: 0.4,
                 phase: DictationPhase::Recording,
+                ..DictationCard::default()
             })),
             0.0,
         );
@@ -1172,6 +1201,7 @@ mod tests {
                 elapsed_ms: 0,
                 level: 0.5,
                 phase: DictationPhase::Recording,
+                ..DictationCard::default()
             })),
             0.0,
         );
@@ -1220,15 +1250,48 @@ mod tests {
         });
         assert!(!state.content().animates());
 
+        // Warming up, recording and transcribing all animate; only the
+        // finished check mark is still.
+        for (phase, animates) in [
+            (DictationPhase::Loading, true),
+            (DictationPhase::Recording, true),
+            (DictationPhase::Transcribing, true),
+            (DictationPhase::Done, false),
+        ] {
+            reduce(
+                &mut state,
+                IslandEvent::SetDictation(Some(DictationCard {
+                    phase,
+                    ..DictationCard::default()
+                })),
+                0.0,
+            );
+            assert_eq!(state.content().animates(), animates, "{phase:?}");
+        }
+    }
+
+    #[test]
+    fn dictation_waveform_updates_do_not_run_a_content_morph() {
+        let mut state = IslandState::default();
+        let mut card = DictationCard::default();
         reduce(
             &mut state,
-            IslandEvent::SetDictation(Some(DictationCard {
-                elapsed_ms: 0,
-                level: 0.1,
-                phase: DictationPhase::Transcribing,
-            })),
+            IslandEvent::SetDictation(Some(card.clone())),
             0.0,
         );
-        assert!(!state.content().animates());
+        let before = state.content();
+        card.level = 0.8;
+        card.elapsed_ms = 1_500;
+        card.bars[DICTATION_BARS - 1] = 200;
+        reduce(
+            &mut state,
+            IslandEvent::SetDictation(Some(card.clone())),
+            0.0,
+        );
+        assert!(before.updates_in_place(&state.content()));
+        // A phase change is a real transition.
+        card.phase = DictationPhase::Transcribing;
+        reduce(&mut state, IslandEvent::SetDictation(Some(card)), 0.0);
+        assert!(!before.updates_in_place(&state.content()));
     }
 }
