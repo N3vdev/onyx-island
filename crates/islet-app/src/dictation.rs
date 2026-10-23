@@ -97,6 +97,10 @@ pub fn spawn(
 
 /// How often the pill's clock and waveform update while recording.
 const TICK: Duration = Duration::from_millis(33);
+/// A press must last this long before anything is shown or played. Taps of
+/// a single-key hotkey that is really part of another shortcut (Right
+/// Ctrl+C) then cause no flash, tone, or model load.
+const REVEAL_DELAY: Duration = Duration::from_millis(120);
 /// A dictation shorter than this is an accident, not speech.
 const MIN_SPEECH_SECONDS: f32 = 0.30;
 /// Safety stop for a forgotten hands-free recording.
@@ -132,6 +136,10 @@ enum ModelState {
 
 struct Session {
     started: Instant,
+    /// When the pill and tone appear (and the model starts loading if it
+    /// is not loaded yet).
+    reveal_at: Instant,
+    revealed: bool,
     hands_free: bool,
     /// `Begin` has been sent to the worker.
     began: bool,
@@ -425,22 +433,10 @@ impl Controller {
             self.recording_ended();
             return;
         }
-        if self.model == ModelState::NotLoaded || self.loaded_model != spec.id {
-            self.asr.shutdown();
-            self.begin_load();
-            if self.model == ModelState::NotLoaded {
-                self.notice(
-                    "Voice error",
-                    "The voice model could not be started.",
-                    AlertLevel::Error,
-                );
-                self.recording_ended();
-                return;
-            }
-        }
-
         let mut session = Session {
             started: Instant::now(),
+            reveal_at: Instant::now() + REVEAL_DELAY,
+            revealed: false,
             hands_free: false,
             began: false,
             stop_requested: false,
@@ -451,7 +447,7 @@ impl Controller {
             stopped_at: None,
             end_sent_at: None,
         };
-        if self.model == ModelState::Ready {
+        if self.model == ModelState::Ready && self.loaded_model == spec.id {
             if self.asr.begin().is_err() {
                 self.model = ModelState::NotLoaded;
                 self.notice("Voice error", "Try again.", AlertLevel::Error);
@@ -464,14 +460,34 @@ impl Controller {
         self.phase = Phase::Recording;
         self.reset_meter();
 
-        if self.config.tones {
-            tone::play(Tone::Start);
-        }
         if let Some(mic) = &self.mic {
             mic.start();
         }
+        // The pill and tone follow after `REVEAL_DELAY` (see `reveal`).
         self.next_tick = Instant::now();
+    }
+
+    /// The press has lasted long enough to be a real dictation: load the
+    /// model if needed, play the start tone, and show the pill. Returns
+    /// false if the model could not be started (the dictation is dropped).
+    fn reveal(&mut self) -> bool {
+        let spec = islet_asr::find_or_default(&self.config.model);
+        if let Some(session) = &mut self.session {
+            session.revealed = true;
+        }
+        if self.model == ModelState::NotLoaded || self.loaded_model != spec.id {
+            self.asr.shutdown();
+            self.begin_load();
+            if self.model == ModelState::NotLoaded {
+                self.fail("Voice error", "The voice model could not be started.");
+                return false;
+            }
+        }
+        if self.config.tones {
+            tone::play(Tone::Start);
+        }
         self.send_card();
+        true
     }
 
     fn stop(&mut self) {
@@ -488,18 +504,25 @@ impl Controller {
                 self.on_audio(&chunk);
             }
         }
-        if self.config.tones {
-            tone::play(Tone::Stop);
-        }
         let Some(session) = &mut self.session else {
             self.phase = Phase::Idle;
             return;
         };
+        let revealed = session.revealed;
         session.stopped_at = Some(Instant::now());
         if (session.samples as f32) < MIN_SPEECH_SECONDS * 16_000.0 {
             self.discard();
             return;
         }
+        if !revealed && !self.reveal() {
+            return;
+        }
+        if self.config.tones {
+            tone::play(Tone::Stop);
+        }
+        let Some(session) = &mut self.session else {
+            return;
+        };
         self.phase = Phase::Transcribing;
         self.last_used = Instant::now();
         if session.began {
@@ -651,6 +674,13 @@ impl Controller {
         match self.phase {
             Phase::Recording => {
                 self.update_meter();
+                let due = self
+                    .session
+                    .as_ref()
+                    .is_some_and(|session| !session.revealed && now >= session.reveal_at);
+                if due && !self.reveal() {
+                    return;
+                }
                 self.send_card();
                 let over = self
                     .session
@@ -815,7 +845,13 @@ impl Controller {
         let phase = match self.phase {
             Phase::Idle => return,
             Phase::Recording => {
-                let waiting = self.session.as_ref().is_some_and(|session| !session.began);
+                let Some(session) = &self.session else {
+                    return;
+                };
+                if !session.revealed {
+                    return; // Still deciding whether this was a real press.
+                }
+                let waiting = !session.began;
                 if waiting {
                     DictationPhase::Loading
                 } else {

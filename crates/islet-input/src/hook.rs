@@ -33,6 +33,7 @@ const WM_COMMANDS: u32 = WM_APP + 1;
 /// Actions buffered between the hook and the controller.
 const EVENT_CAPACITY: usize = 64;
 const LLKHF_INJECTED: u32 = 0x10;
+const ALTGR_FAKE_CTRL_SCAN: u32 = 0x21D;
 
 /// What the hook reports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -204,7 +205,11 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
         let key = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
         // Our own injected keys (paste, Start-menu suppression) never count.
         let ours = key.flags.0 & LLKHF_INJECTED != 0 && key.dwExtraInfo == EXTRA_INFO;
-        if !ours {
+        // On layouts with AltGr, pressing Right Alt first sends a fake Left
+        // Ctrl (scan code 0x21D). Counting it would stop a Right Alt hotkey
+        // from ever matching, so it is ignored.
+        let altgr_ctrl = key.scanCode == ALTGR_FAKE_CTRL_SCAN;
+        if !ours && !altgr_ctrl {
             let down = matches!(wparam.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
             let swallow = STATE.with(|state| {
                 let Ok(mut guard) = state.try_borrow_mut() else {

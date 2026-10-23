@@ -13,7 +13,7 @@ use eframe::egui::{self, Color32, RichText};
 use islet_asr::{ModelManager, ModelSpec, ModelStatus, MODELS};
 use islet_audio::{list_input_devices, InputDevice};
 use islet_core::config::{InjectionMethod, Replacement};
-use islet_core::hotkey::{name_for_vk, Combo, Modifiers, VK_ESCAPE};
+use islet_core::hotkey::{modifier_bit, name_for_vk, Combo, Modifiers, VK_ESCAPE};
 use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
 
 use crate::ui::{card, divider, header, row, segmented, toggle};
@@ -32,7 +32,9 @@ enum HotkeyTarget {
 /// A hotkey being captured: held keys are polled until all are released.
 struct Capture {
     target: HotkeyTarget,
-    modifiers: Modifiers,
+    /// Every modifier key pressed during the capture, one bit per physical
+    /// key (so Right Ctrl and Left Ctrl are different).
+    down: u8,
     key: Option<u16>,
     seen_any: bool,
 }
@@ -195,15 +197,10 @@ impl DictationUi {
             unsafe { GetAsyncKeyState(i32::from(vk)) as u16 & 0x8000 != 0 }
         };
 
-        let mut modifiers_now = Modifiers::NONE;
-        for (vks, modifier) in [
-            (&[0xA2u16, 0xA3][..], Modifiers::CTRL),
-            (&[0xA0, 0xA1][..], Modifiers::SHIFT),
-            (&[0xA4, 0xA5][..], Modifiers::ALT),
-            (&[0x5B, 0x5C][..], Modifiers::WIN),
-        ] {
-            if vks.iter().any(|&vk| held(vk)) {
-                modifiers_now = modifiers_now.union(modifier);
+        let mut down_now = 0u8;
+        for vk in [0xA0u16, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0x5B, 0x5C] {
+            if held(vk) {
+                down_now |= modifier_bit(vk).unwrap_or(0);
             }
         }
         let mut key_now = None;
@@ -215,7 +212,7 @@ impl DictationUi {
             }
         }
 
-        match step_capture(capture, modifiers_now, key_now) {
+        match step_capture(capture, down_now, key_now) {
             CaptureStep::Continue => None,
             CaptureStep::Cancelled => {
                 self.capture = None;
@@ -247,21 +244,18 @@ enum CaptureStep {
 }
 
 /// One poll of a hotkey capture. Pure: the keyboard is read by the caller.
-/// The combo is everything pressed during the capture, finished when all
-/// keys are released; Esc cancels.
-fn step_capture(
-    capture: &mut Capture,
-    modifiers_now: Modifiers,
-    key_now: Option<u16>,
-) -> CaptureStep {
+/// `down_now` is the held modifier keys (one bit per physical key). The combo
+/// is everything pressed during the capture, finished when all keys are
+/// released; Esc cancels.
+fn step_capture(capture: &mut Capture, down_now: u8, key_now: Option<u16>) -> CaptureStep {
     if key_now == Some(VK_ESCAPE) {
         return CaptureStep::Cancelled;
     }
-    capture.modifiers = capture.modifiers.union(modifiers_now);
+    capture.down |= down_now;
     if key_now.is_some() {
         capture.key = key_now;
     }
-    if !modifiers_now.is_empty() || key_now.is_some() {
+    if down_now != 0 || key_now.is_some() {
         capture.seen_any = true;
         return CaptureStep::Continue;
     }
@@ -270,7 +264,7 @@ fn step_capture(
     }
 
     let combo = Combo {
-        modifiers: capture.modifiers,
+        modifiers: Modifiers::from_capture(capture.down, capture.key.is_some()),
         key: capture.key,
     };
     if combo.key.is_some_and(|vk| name_for_vk(vk).is_none()) {
@@ -282,6 +276,35 @@ fn step_capture(
             .map(|_| text)
             .map_err(|error| error.to_string()),
     )
+}
+
+/// A small "remove" cross drawn with lines, so it does not depend on the
+/// font having a glyph for it.
+fn cross_button(ui: &mut egui::Ui) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(26.0, 26.0), egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let hovered = response.hovered();
+        if hovered {
+            ui.painter().rect_filled(
+                rect,
+                egui::CornerRadius::same(8),
+                Color32::from_white_alpha(18),
+            );
+        }
+        let color = if hovered {
+            Color32::from_rgb(236, 237, 242)
+        } else {
+            MUTED
+        };
+        let stroke = egui::Stroke::new(1.6, color);
+        let c = rect.center();
+        let d = 4.5;
+        ui.painter()
+            .line_segment([c + egui::vec2(-d, -d), c + egui::vec2(d, d)], stroke);
+        ui.painter()
+            .line_segment([c + egui::vec2(-d, d), c + egui::vec2(d, -d)], stroke);
+    }
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 fn hotkey_row(
@@ -300,29 +323,49 @@ fn hotkey_row(
         HotkeyTarget::PushToTalk => app.config.dictation.push_to_talk.clone(),
         HotkeyTarget::HandsFree => app.config.dictation.hands_free.clone(),
     };
+    let is_set = !current.trim().is_empty();
     let mut start_capture = false;
+    let mut clear = false;
     row(ui, title, description, |ui| {
-        let label = if capturing {
-            "Press the keys\u{2026}".to_owned()
+        // Right to left: the clear button sits at the right edge.
+        if is_set
+            && cross_button(ui)
+                .on_hover_text("Remove this hotkey")
+                .clicked()
+        {
+            clear = true;
+        }
+        let text = if capturing {
+            RichText::new("Press the keys\u{2026}").strong()
+        } else if is_set {
+            RichText::new(current).strong()
         } else {
-            current
+            RichText::new("Not set").color(MUTED)
         };
-        let button = egui::Button::new(RichText::new(label).strong())
+        let button = egui::Button::new(text)
             .min_size(egui::vec2(170.0, 30.0))
             .selected(capturing);
         if ui
             .add(button)
-            .on_hover_text("Click, then press the keys")
+            .on_hover_text("Click, then press a key or a combination")
             .clicked()
         {
             start_capture = true;
         }
     });
+    if clear {
+        match target {
+            HotkeyTarget::PushToTalk => app.config.dictation.push_to_talk.clear(),
+            HotkeyTarget::HandsFree => app.config.dictation.hands_free.clear(),
+        }
+        app.dictation_ui.capture = None;
+        app.dictation_ui.capture_error = None;
+    }
     if start_capture && !capturing {
         app.dictation_ui.capture_error = None;
         app.dictation_ui.capture = Some(Capture {
             target,
-            modifiers: Modifiers::NONE,
+            down: 0,
             key: None,
             seen_any: false,
         });
@@ -344,11 +387,7 @@ fn entries_editor(
             ui.label(RichText::new("\u{2192}").color(MUTED));
             ui.label(&entry.to);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .add(egui::Button::new(RichText::new("\u{2715}").color(MUTED)).frame(false))
-                    .on_hover_text("Remove")
-                    .clicked()
-                {
+                if cross_button(ui).on_hover_text("Remove").clicked() {
                     remove = Some(index);
                 }
             });
@@ -547,6 +586,25 @@ pub fn show(app: &mut SettingsApp, ui: &mut egui::Ui) {
         if let Some(error) = &app.dictation_ui.capture_error {
             ui.label(RichText::new(error).small().color(DANGER));
         }
+        let nothing_set = app.config.dictation.push_to_talk.trim().is_empty()
+            && app.config.dictation.hands_free.trim().is_empty();
+        if nothing_set {
+            ui.label(
+                RichText::new("No hotkey is set, so dictation can't be started.")
+                    .small()
+                    .color(DANGER),
+            );
+        }
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(
+                "Use a single key (Right Ctrl, Right Alt, F9, CapsLock...) or a combination. \
+                 In a combination, left-side keys work on either side; right-side keys match \
+                 only the right one.",
+            )
+            .small()
+            .color(MUTED),
+        );
     });
 
     card(ui, "Microphone", |ui| {
@@ -758,21 +816,31 @@ pub fn show(app: &mut SettingsApp, ui: &mut egui::Ui) {
 mod tests {
     use super::*;
 
+    fn bit(vk: u16) -> u8 {
+        modifier_bit(vk).unwrap()
+    }
+
+    const LCTRL: u16 = 0xA2;
+    const RCTRL: u16 = 0xA3;
+    const LALT: u16 = 0xA4;
+    const RALT: u16 = 0xA5;
+    const LWIN: u16 = 0x5B;
+
     fn capture() -> Capture {
         Capture {
             target: HotkeyTarget::PushToTalk,
-            modifiers: Modifiers::NONE,
+            down: 0,
             key: None,
             seen_any: false,
         }
     }
 
-    /// Feeds a list of (modifiers, key) polls and returns the last step.
-    fn run(polls: &[(Modifiers, Option<u16>)]) -> CaptureStep {
+    /// Feeds (held modifier bits, held key) polls and returns the last step.
+    fn run(polls: &[(u8, Option<u16>)]) -> CaptureStep {
         let mut capture = capture();
         let mut last = CaptureStep::Continue;
-        for &(modifiers, key) in polls {
-            last = step_capture(&mut capture, modifiers, key);
+        for &(down, key) in polls {
+            last = step_capture(&mut capture, down, key);
             if !matches!(last, CaptureStep::Continue) {
                 break;
             }
@@ -780,7 +848,7 @@ mod tests {
         last
     }
 
-    const NOTHING: (Modifiers, Option<u16>) = (Modifiers::NONE, None);
+    const NOTHING: (u8, Option<u16>) = (0, None);
 
     fn finished(step: CaptureStep) -> Result<String, String> {
         match step {
@@ -791,24 +859,50 @@ mod tests {
     }
 
     #[test]
-    fn modifier_only_combo_is_captured_when_released() {
-        let ctrl_win = Modifiers::CTRL.union(Modifiers::WIN);
-        let step = run(&[NOTHING, (Modifiers::CTRL, None), (ctrl_win, None), NOTHING]);
+    fn ctrl_win_from_the_left_hand_means_either_side() {
+        let step = run(&[
+            NOTHING,
+            (bit(LCTRL), None),
+            (bit(LCTRL) | bit(LWIN), None),
+            NOTHING,
+        ]);
         assert_eq!(finished(step), Ok("Ctrl+Win".to_owned()));
     }
 
     #[test]
+    fn a_lone_modifier_keeps_its_side() {
+        assert_eq!(
+            finished(run(&[(bit(RCTRL), None), NOTHING])),
+            Ok("Right Ctrl".to_owned())
+        );
+        assert_eq!(
+            finished(run(&[(bit(RALT), None), NOTHING])),
+            Ok("Right Alt".to_owned())
+        );
+        assert_eq!(
+            finished(run(&[(bit(LCTRL), None), NOTHING])),
+            Ok("Left Ctrl".to_owned())
+        );
+    }
+
+    #[test]
     fn combo_with_a_key_remembers_modifiers_released_first() {
-        let ctrl_alt = Modifiers::CTRL.union(Modifiers::ALT);
         // Ctrl and Alt go up before D does; the combo still has all three.
+        let both = bit(LCTRL) | bit(LALT);
         let step = run(&[
-            (Modifiers::CTRL, None),
-            (ctrl_alt, None),
-            (ctrl_alt, Some(0x44)),
-            (Modifiers::NONE, Some(0x44)),
+            (bit(LCTRL), None),
+            (both, None),
+            (both, Some(0x44)),
+            (0, Some(0x44)),
             NOTHING,
         ]);
         assert_eq!(finished(step), Ok("Ctrl+Alt+D".to_owned()));
+    }
+
+    #[test]
+    fn a_right_side_key_in_a_combo_stays_right_only() {
+        let step = run(&[(bit(RALT), None), (bit(RALT), Some(0x44)), NOTHING]);
+        assert_eq!(finished(step), Ok("Right Alt+D".to_owned()));
     }
 
     #[test]
@@ -816,7 +910,7 @@ mod tests {
         let mut capture = capture();
         for _ in 0..5 {
             assert!(matches!(
-                step_capture(&mut capture, Modifiers::NONE, None),
+                step_capture(&mut capture, 0, None),
                 CaptureStep::Continue
             ));
         }
@@ -824,26 +918,29 @@ mod tests {
 
     #[test]
     fn escape_cancels() {
-        let step = run(&[(Modifiers::CTRL, None), (Modifiers::CTRL, Some(VK_ESCAPE))]);
+        let step = run(&[(bit(LCTRL), None), (bit(LCTRL), Some(VK_ESCAPE))]);
         assert!(matches!(step, CaptureStep::Cancelled));
     }
 
     #[test]
     fn invalid_combos_report_why() {
-        // A lone modifier is too easy to hit by accident.
-        let lone = finished(run(&[(Modifiers::CTRL, None), NOTHING]));
-        assert!(lone.unwrap_err().contains("two modifiers"));
         // A bare letter would fire while typing.
-        let bare = finished(run(&[(Modifiers::NONE, Some(0x41)), NOTHING]));
+        let bare = finished(run(&[(0, Some(0x41)), NOTHING]));
         assert!(bare.unwrap_err().contains("modifier"));
         // A key Islet has no name for.
-        let odd = finished(run(&[(Modifiers::CTRL, Some(0xE8)), NOTHING]));
+        let odd = finished(run(&[(bit(LCTRL), Some(0xE8)), NOTHING]));
         assert!(odd.unwrap_err().contains("isn't supported"));
     }
 
     #[test]
-    fn function_keys_need_no_modifier() {
-        let step = run(&[(Modifiers::NONE, Some(0x78)), NOTHING]);
-        assert_eq!(finished(step), Ok("F9".to_owned()));
+    fn single_non_typing_keys_need_no_modifier() {
+        assert_eq!(
+            finished(run(&[(0, Some(0x78)), NOTHING])),
+            Ok("F9".to_owned())
+        );
+        assert_eq!(
+            finished(run(&[(0, Some(0x14)), NOTHING])),
+            Ok("CapsLock".to_owned())
+        );
     }
 }

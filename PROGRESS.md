@@ -932,3 +932,40 @@ real microphone, nor in Notepad/VS Code/Chrome/Windows Terminal (see
 - [ ] 10 s utterance in Notepad / VS Code / Chrome / Windows Terminal within
   400 ms.
 - [ ] 3-minute hands-free dictation without memory growth.
+
+## Hotkeys: left/right modifiers, single keys, remove button (user request, 2026-10-23)
+
+- **Sides.** Modifiers are now `Option<Side>` per family (`Any`/`Left`/`Right`)
+  matched against one bit per physical key, so "Right Ctrl" and "Right Alt"
+  are distinct from their left twins. Config text: `Right Ctrl`, `Left Alt`,
+  `Ctrl+Right Alt+Space`; aliases `RCtrl`, `right-alt`, `AltGr`. Plain `Ctrl`
+  still means either side, so the default `Ctrl+Win` works with either hand.
+- **Single-key hotkeys.** A lone modifier must name a side ("Right Ctrl"; bare
+  "Ctrl" would fire on every shortcut). A lone ordinary key must be one nobody
+  types with: F1-F24, CapsLock, Pause, ScrollLock, PrintScreen, Insert, Menu
+  (letters, Space, Enter, arrows, Home/End... need a modifier). Such keys are
+  swallowed so they do not also act (CapsLock does not toggle caps). A
+  modifier-only hands-free toggle also works.
+- **Setting one.** Settings captures *physical* keys. A lone modifier keeps its
+  side; in a combination, left-side keys mean "either side" and right-side keys
+  stay right-only. Each hotkey row has a drawn "x" button that removes it
+  ("Not set"); an unparsable or empty hotkey is simply disabled, and Settings
+  warns when neither is set.
+- **No false starts for shared keys.** A single-key hotkey that is also part of
+  other shortcuts (Right Ctrl+C) used to flash the pill, play the tone and start
+  loading the 700 MiB model. The controller now waits 120 ms of holding before
+  showing the pill, playing the tone, or loading the model; shorter presses are
+  silent.
+- **AltGr.** On layouts with AltGr, Windows sends a fake Left Ctrl (scan code
+  0x21D) before Right Alt; the hook ignores it so a Right Alt hotkey can match.
+- Tests: hotkey 34 (sides, aliases, single-key rules, exact side matching,
+  Right Ctrl hold/shortcut/double-tap/Space, F9/CapsLock swallowing,
+  modifier-only toggle, removed hotkeys), settings capture 8.
+- Verified through the real keyboard hook (release build, fake mic): with
+  `Right Ctrl` as the only hotkey, holding Left Ctrl did nothing, a Right Ctrl
+  tap and Right Ctrl+C neither loaded the model nor inserted anything, and a
+  real Right Ctrl hold loaded the model once and inserted once.
+- Not verified: AltGr layouts (none available), and the capture button itself
+  could not be clicked by automation (its logic is unit-tested). A later
+  automated run was disrupted when focus moved to another window while keys
+  were being sent, so it did not re-confirm the final text in the test box.

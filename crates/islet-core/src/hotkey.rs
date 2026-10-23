@@ -30,51 +30,240 @@ pub const MIN_HOLD_SECONDS: f64 = 0.25;
 /// Two taps within this window start hands-free dictation.
 pub const DOUBLE_TAP_SECONDS: f64 = 0.4;
 
-/// A set of modifier keys (either side).
+/// Which side of the keyboard a modifier must be pressed on.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Modifiers(u8);
+pub enum Side {
+    /// Either the left or the right key.
+    #[default]
+    Any,
+    Left,
+    Right,
+}
 
-impl Modifiers {
-    pub const CTRL: Self = Self(1);
-    pub const SHIFT: Self = Self(2);
-    pub const ALT: Self = Self(4);
-    pub const WIN: Self = Self(8);
-    pub const NONE: Self = Self(0);
+/// The four modifier families.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Group {
+    Ctrl,
+    Shift,
+    Alt,
+    Win,
+}
 
-    #[must_use]
-    pub const fn union(self, other: Self) -> Self {
-        Self(self.0 | other.0)
+impl Group {
+    const ALL: [Self; 4] = [Self::Ctrl, Self::Alt, Self::Shift, Self::Win];
+
+    /// The bit for this family's left key in the held-modifier bitmap
+    /// (the right key is the next bit up).
+    const fn left_bit(self) -> u8 {
+        match self {
+            Self::Shift => 1,
+            Self::Ctrl => 4,
+            Self::Alt => 16,
+            Self::Win => 64,
+        }
     }
 
-    #[must_use]
-    pub const fn contains(self, other: Self) -> bool {
-        self.0 & other.0 == other.0
+    const fn right_bit(self) -> u8 {
+        self.left_bit() << 1
     }
 
-    #[must_use]
-    pub const fn count(self) -> u32 {
-        self.0.count_ones()
-    }
-
-    #[must_use]
-    pub const fn is_empty(self) -> bool {
-        self.0 == 0
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Ctrl => "Ctrl",
+            Self::Shift => "Shift",
+            Self::Alt => "Alt",
+            Self::Win => "Win",
+        }
     }
 }
 
-/// Which modifier a virtual-key code is, if any.
+/// The modifier keys a hotkey needs, each optionally tied to one side.
+/// A family that is not required must not be held (matching is exact).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Modifiers {
+    ctrl: Option<Side>,
+    shift: Option<Side>,
+    alt: Option<Side>,
+    win: Option<Side>,
+}
+
+impl Modifiers {
+    pub const NONE: Self = Self {
+        ctrl: None,
+        shift: None,
+        alt: None,
+        win: None,
+    };
+    /// Either-side requirements.
+    pub const CTRL: Self = Self {
+        ctrl: Some(Side::Any),
+        ..Self::NONE
+    };
+    pub const SHIFT: Self = Self {
+        shift: Some(Side::Any),
+        ..Self::NONE
+    };
+    pub const ALT: Self = Self {
+        alt: Some(Side::Any),
+        ..Self::NONE
+    };
+    pub const WIN: Self = Self {
+        win: Some(Side::Any),
+        ..Self::NONE
+    };
+
+    /// The requirement for one family.
+    #[must_use]
+    pub const fn group(self, group: Group) -> Option<Side> {
+        match group {
+            Group::Ctrl => self.ctrl,
+            Group::Shift => self.shift,
+            Group::Alt => self.alt,
+            Group::Win => self.win,
+        }
+    }
+
+    #[must_use]
+    pub const fn has(self, group: Group) -> bool {
+        self.group(group).is_some()
+    }
+
+    #[must_use]
+    pub const fn with(mut self, group: Group, side: Side) -> Self {
+        match group {
+            Group::Ctrl => self.ctrl = Some(side),
+            Group::Shift => self.shift = Some(side),
+            Group::Alt => self.alt = Some(side),
+            Group::Win => self.win = Some(side),
+        }
+        self
+    }
+
+    /// Both requirements at once. A family needed on two different sides
+    /// becomes "either side".
+    #[must_use]
+    pub fn union(self, other: Self) -> Self {
+        let merge = |a: Option<Side>, b: Option<Side>| match (a, b) {
+            (None, side) | (side, None) => side,
+            (Some(a), Some(b)) if a == b => Some(a),
+            _ => Some(Side::Any),
+        };
+        Self {
+            ctrl: merge(self.ctrl, other.ctrl),
+            shift: merge(self.shift, other.shift),
+            alt: merge(self.alt, other.alt),
+            win: merge(self.win, other.win),
+        }
+    }
+
+    /// How many families are required.
+    #[must_use]
+    pub fn count(self) -> u32 {
+        Group::ALL.into_iter().filter(|g| self.has(*g)).count() as u32
+    }
+
+    #[must_use]
+    pub fn is_empty(self) -> bool {
+        self.count() == 0
+    }
+
+    /// The only required family and its side, when exactly one is required.
+    #[must_use]
+    pub fn single(self) -> Option<(Group, Side)> {
+        let mut found = Group::ALL
+            .into_iter()
+            .filter_map(|group| self.group(group).map(|side| (group, side)));
+        let first = found.next()?;
+        found.next().is_none().then_some(first)
+    }
+
+    /// Whether the held modifier keys (`down`, one bit per physical key, see
+    /// [`modifier_bit`]) are exactly what this requires.
+    #[must_use]
+    pub fn matches(self, down: u8) -> bool {
+        Group::ALL.into_iter().all(|group| {
+            let (left, right) = (group.left_bit(), group.right_bit());
+            let held = down & (left | right);
+            match self.group(group) {
+                None => held == 0,
+                Some(Side::Any) => held != 0,
+                Some(Side::Left) => held == left,
+                Some(Side::Right) => held == right,
+            }
+        })
+    }
+
+    /// Exactly the physical keys in `down`: a family with only its left key
+    /// down needs the left key, only the right needs the right, both either.
+    #[must_use]
+    pub fn from_physical(down: u8) -> Self {
+        let mut modifiers = Self::NONE;
+        for group in Group::ALL {
+            let (left, right) = (down & group.left_bit() != 0, down & group.right_bit() != 0);
+            let side = match (left, right) {
+                (false, false) => continue,
+                (true, false) => Side::Left,
+                (false, true) => Side::Right,
+                (true, true) => Side::Any,
+            };
+            modifiers = modifiers.with(group, side);
+        }
+        modifiers
+    }
+
+    /// What a user means by the keys they pressed while setting a hotkey.
+    /// A lone modifier key keeps its side ("Right Ctrl" is not "Left Ctrl").
+    /// In a combination, left-side keys mean "either side" so that the usual
+    /// Ctrl+Win works with whichever hand is free; right-side keys stay
+    /// right-only because pressing one is a deliberate choice.
+    #[must_use]
+    pub fn from_capture(down: u8, has_key: bool) -> Self {
+        let exact = Self::from_physical(down);
+        if exact.count() == 1 && !has_key {
+            return exact;
+        }
+        let mut modifiers = Self::NONE;
+        for group in Group::ALL {
+            if let Some(side) = exact.group(group) {
+                modifiers =
+                    modifiers.with(group, if side == Side::Left { Side::Any } else { side });
+            }
+        }
+        modifiers
+    }
+}
+
+/// Which modifier key a virtual-key code is, and on which side.
 #[must_use]
-pub const fn modifier_of(vk: u16) -> Option<Modifiers> {
+pub const fn modifier_of(vk: u16) -> Option<(Group, Side)> {
     match vk {
-        VK_LCONTROL | VK_RCONTROL | VK_CONTROL => Some(Modifiers::CTRL),
-        VK_LSHIFT | VK_RSHIFT | VK_SHIFT => Some(Modifiers::SHIFT),
-        VK_LMENU | VK_RMENU | VK_MENU => Some(Modifiers::ALT),
-        VK_LWIN | VK_RWIN => Some(Modifiers::WIN),
+        VK_LCONTROL | VK_CONTROL => Some((Group::Ctrl, Side::Left)),
+        VK_RCONTROL => Some((Group::Ctrl, Side::Right)),
+        VK_LSHIFT | VK_SHIFT => Some((Group::Shift, Side::Left)),
+        VK_RSHIFT => Some((Group::Shift, Side::Right)),
+        VK_LMENU | VK_MENU => Some((Group::Alt, Side::Left)),
+        VK_RMENU => Some((Group::Alt, Side::Right)),
+        VK_LWIN => Some((Group::Win, Side::Left)),
+        VK_RWIN => Some((Group::Win, Side::Right)),
         _ => None,
     }
 }
 
-/// A hotkey: modifiers, plus at most one ordinary key.
+/// The bit a modifier virtual key occupies in the held-modifier bitmap
+/// (`LShift`=1, `RShift`=2, `LCtrl`=4, `RCtrl`=8, `LAlt`=16, `RAlt`=32,
+/// `LWin`=64, `RWin`=128).
+#[must_use]
+pub const fn modifier_bit(vk: u16) -> Option<u8> {
+    match modifier_of(vk) {
+        Some((group, Side::Right)) => Some(group.right_bit()),
+        Some((group, _)) => Some(group.left_bit()),
+        None => None,
+    }
+}
+
+/// A hotkey: modifiers, plus at most one ordinary key. A hotkey can be a
+/// single key: one side-specific modifier ("Right Ctrl") or one non-typing
+/// key ("F9", "CapsLock").
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Combo {
     pub modifiers: Modifiers,
@@ -87,10 +276,11 @@ pub enum HotkeyError {
     UnknownKey(String),
     /// More than one non-modifier key.
     TooManyKeys,
-    /// A bare key (other than F1-F24) would fire while typing.
+    /// A key that is used for typing would fire while typing.
     NeedsModifier,
-    /// A modifiers-only combo needs at least two, or it fires constantly.
-    NeedsTwoModifiers,
+    /// A lone modifier must say which side ("Right Ctrl"), or it would fire
+    /// on every shortcut.
+    NeedsSide,
     /// Esc cancels a dictation, so it cannot be a hotkey.
     ReservedKey,
 }
@@ -101,8 +291,11 @@ impl fmt::Display for HotkeyError {
             Self::Empty => write!(f, "press at least one key"),
             Self::UnknownKey(name) => write!(f, "`{name}` is not a key Islet knows"),
             Self::TooManyKeys => write!(f, "use one key plus modifiers (Ctrl, Alt, Shift, Win)"),
-            Self::NeedsModifier => write!(f, "add a modifier such as Ctrl or Alt"),
-            Self::NeedsTwoModifiers => write!(f, "use two modifiers, or add a key"),
+            Self::NeedsModifier => write!(
+                f,
+                "add a modifier such as Ctrl or Alt (single keys like F9 or Right Ctrl are fine)"
+            ),
+            Self::NeedsSide => write!(f, "choose the left or right key, or add a second key"),
             Self::ReservedKey => write!(f, "Esc is reserved for cancelling a dictation"),
         }
     }
@@ -116,6 +309,11 @@ const NAMED_KEYS: &[(&str, u16)] = &[
     ("Enter", VK_RETURN),
     ("Tab", VK_TAB),
     ("Backspace", VK_BACK),
+    ("CapsLock", 0x14),
+    ("Pause", 0x13),
+    ("ScrollLock", 0x91),
+    ("PrintScreen", 0x2C),
+    ("Menu", 0x5D),
     ("Insert", 0x2D),
     ("Delete", 0x2E),
     ("Home", 0x24),
@@ -138,6 +336,14 @@ const NAMED_KEYS: &[(&str, u16)] = &[
     ("]", 0xDD),
     ("\\", 0xDC),
 ];
+
+/// Keys that are safe as a hotkey on their own: they are not used for
+/// typing, so taking them over costs little (F1-F24, CapsLock, Pause,
+/// ScrollLock, PrintScreen, Insert, Menu).
+#[must_use]
+pub const fn is_standalone_key(vk: u16) -> bool {
+    matches!(vk, 0x70..=0x87 | 0x14 | 0x13 | 0x91 | 0x2C | 0x2D | 0x5D)
+}
 
 fn key_name(vk: u16) -> Option<String> {
     match vk {
@@ -169,6 +375,11 @@ fn key_code(name: &str) -> Option<u16> {
         "PGDN" => "PageDown",
         "DEL" => "Delete",
         "INS" => "Insert",
+        "CAPS" | "CAPSLOCK" => "CapsLock",
+        "SCROLL" | "SCROLLLOCK" => "ScrollLock",
+        "BREAK" => "Pause",
+        "PRTSC" | "PRINTSCRN" | "PRINTSCREEN" => "PrintScreen",
+        "APPS" | "APPLICATION" | "CONTEXTMENU" => "Menu",
         other => other,
     };
     NAMED_KEYS
@@ -183,8 +394,55 @@ pub fn name_for_vk(vk: u16) -> Option<String> {
     key_name(vk)
 }
 
+/// "Ctrl", "Right Ctrl", "LAlt", "right-win", "AltGr": a modifier key name.
+fn modifier_token(token: &str) -> Option<(Group, Side)> {
+    let normalized: String = token
+        .chars()
+        .filter(|c| !matches!(c, ' ' | '-' | '_'))
+        .collect::<String>()
+        .to_ascii_lowercase();
+    let (side, base) = if let Some(rest) = normalized.strip_prefix("left") {
+        (Side::Left, rest)
+    } else if let Some(rest) = normalized.strip_prefix("right") {
+        (Side::Right, rest)
+    } else if let Some(rest) = normalized.strip_prefix('l').filter(|r| is_modifier_base(r)) {
+        (Side::Left, rest)
+    } else if let Some(rest) = normalized.strip_prefix('r').filter(|r| is_modifier_base(r)) {
+        (Side::Right, rest)
+    } else {
+        (Side::Any, normalized.as_str())
+    };
+    let group = match base {
+        "ctrl" | "control" | "ctl" => Group::Ctrl,
+        "shift" => Group::Shift,
+        "alt" | "option" => Group::Alt,
+        "win" | "windows" | "super" | "meta" | "cmd" => Group::Win,
+        "altgr" if side == Side::Any => return Some((Group::Alt, Side::Right)),
+        _ => return None,
+    };
+    Some((group, side))
+}
+
+fn is_modifier_base(text: &str) -> bool {
+    matches!(
+        text,
+        "ctrl"
+            | "control"
+            | "ctl"
+            | "shift"
+            | "alt"
+            | "option"
+            | "win"
+            | "windows"
+            | "super"
+            | "meta"
+            | "cmd"
+    )
+}
+
 impl Combo {
-    /// Parses `"Ctrl+Win"`, `"Ctrl+Alt+D"`, `"F9"`, case-insensitively.
+    /// Parses `"Ctrl+Win"`, `"Right Ctrl"`, `"Right Alt+D"`, `"F9"`,
+    /// case-insensitively. An empty string is an error (no hotkey).
     pub fn parse(text: &str) -> Result<Self, HotkeyError> {
         let mut modifiers = Modifiers::NONE;
         let mut key = None;
@@ -192,20 +450,11 @@ impl Combo {
         for part in text.split('+') {
             let part = part.trim();
             if part.is_empty() {
-                // "Ctrl++" means Ctrl and the plus key; a plus is not a
-                // supported key, so treat stray separators as empty input.
                 continue;
             }
             any = true;
-            let modifier = match part.to_ascii_lowercase().as_str() {
-                "ctrl" | "control" => Some(Modifiers::CTRL),
-                "shift" => Some(Modifiers::SHIFT),
-                "alt" | "option" => Some(Modifiers::ALT),
-                "win" | "windows" | "super" | "meta" | "cmd" => Some(Modifiers::WIN),
-                _ => None,
-            };
-            if let Some(modifier) = modifier {
-                modifiers = modifiers.union(modifier);
+            if let Some((group, side)) = modifier_token(part) {
+                modifiers = modifiers.union(Modifiers::NONE.with(group, side));
                 continue;
             }
             let code = key_code(part).ok_or_else(|| HotkeyError::UnknownKey(part.to_owned()))?;
@@ -220,11 +469,17 @@ impl Combo {
             return Err(HotkeyError::Empty);
         }
         match key {
-            None if modifiers.count() < 2 => return Err(HotkeyError::NeedsTwoModifiers),
-            Some(code) if modifiers.is_empty() && !(0x70..=0x87).contains(&code) => {
-                return Err(HotkeyError::NeedsModifier)
+            None => {
+                // One modifier alone is allowed, but only for a named side.
+                if let Some((_, Side::Any)) = modifiers.single() {
+                    return Err(HotkeyError::NeedsSide);
+                }
             }
-            _ => {}
+            Some(code) => {
+                if modifiers.is_empty() && !is_standalone_key(code) {
+                    return Err(HotkeyError::NeedsModifier);
+                }
+            }
         }
         Ok(Self { modifiers, key })
     }
@@ -241,14 +496,14 @@ impl fmt::Display for Combo {
             first = false;
             write!(f, "{text}")
         };
-        for (modifier, name) in [
-            (Modifiers::CTRL, "Ctrl"),
-            (Modifiers::ALT, "Alt"),
-            (Modifiers::SHIFT, "Shift"),
-            (Modifiers::WIN, "Win"),
-        ] {
-            if self.modifiers.contains(modifier) {
-                part(f, name)?;
+        for group in Group::ALL {
+            if let Some(side) = self.modifiers.group(group) {
+                let prefix = match side {
+                    Side::Any => "",
+                    Side::Left => "Left ",
+                    Side::Right => "Right ",
+                };
+                part(f, &format!("{prefix}{}", group.name()))?;
             }
         }
         if let Some(name) = self.key.and_then(key_name) {
@@ -338,20 +593,6 @@ pub struct HotkeyFsm {
     last_tap_release: f64,
 }
 
-fn modifier_bit(vk: u16) -> Option<u8> {
-    Some(match vk {
-        VK_LSHIFT | VK_SHIFT => 1,
-        VK_RSHIFT => 2,
-        VK_LCONTROL | VK_CONTROL => 4,
-        VK_RCONTROL => 8,
-        VK_LMENU | VK_MENU => 16,
-        VK_RMENU => 32,
-        VK_LWIN => 64,
-        VK_RWIN => 128,
-        _ => return None,
-    })
-}
-
 impl HotkeyFsm {
     #[must_use]
     pub fn new(push_to_talk: Option<Combo>, hands_free: Option<Combo>) -> Self {
@@ -401,24 +642,6 @@ impl HotkeyFsm {
         if matches!(self.phase, Phase::Ptt { .. } | Phase::HandsFree) {
             self.finish();
         }
-    }
-
-    fn modifiers_down(&self) -> Modifiers {
-        let bits = self.modifier_keys;
-        let mut mods = Modifiers::NONE;
-        if bits & 0b0000_0011 != 0 {
-            mods = mods.union(Modifiers::SHIFT);
-        }
-        if bits & 0b0000_1100 != 0 {
-            mods = mods.union(Modifiers::CTRL);
-        }
-        if bits & 0b0011_0000 != 0 {
-            mods = mods.union(Modifiers::ALT);
-        }
-        if bits & 0b1100_0000 != 0 {
-            mods = mods.union(Modifiers::WIN);
-        }
-        mods
     }
 
     fn nothing_held(&self) -> bool {
@@ -474,7 +697,14 @@ impl HotkeyFsm {
 
     fn hands_free_pressed(&self, vk: u16) -> bool {
         self.hands_free.is_some_and(|combo| {
-            combo.key == Some(vk) && self.modifiers_down() == combo.modifiers && self.key_count == 1
+            if !combo.modifiers.matches(self.modifier_keys) {
+                return false;
+            }
+            match combo.key {
+                Some(key) => vk == key && self.key_count == 1,
+                // A modifier-only toggle: the press that completes it.
+                None => modifier_of(vk).is_some() && self.key_count == 0,
+            }
         })
     }
 
@@ -482,7 +712,7 @@ impl HotkeyFsm {
         let Some(combo) = self.push_to_talk else {
             return false;
         };
-        if self.modifiers_down() != combo.modifiers {
+        if !combo.modifiers.matches(self.modifier_keys) {
             return false;
         }
         match combo.key {
@@ -538,7 +768,7 @@ impl HotkeyFsm {
                     out.push(Action::Start);
                     if self
                         .push_to_talk
-                        .is_some_and(|c| c.modifiers.contains(Modifiers::WIN))
+                        .is_some_and(|c| c.modifiers.has(Group::Win))
                     {
                         out.push(Action::SuppressStartMenu);
                     }
@@ -583,10 +813,7 @@ impl HotkeyFsm {
         out.push(Action::EnterHandsFree);
         out.swallow = true;
         self.swallow_release_of(vk);
-        if self
-            .hands_free
-            .is_some_and(|c| c.modifiers.contains(Modifiers::WIN))
-        {
+        if self.hands_free.is_some_and(|c| c.modifiers.has(Group::Win)) {
             out.push(Action::SuppressStartMenu);
         }
     }
@@ -605,7 +832,7 @@ impl HotkeyFsm {
         match self.phase {
             Phase::Ptt { since, double_tap } => {
                 let combo_still_held = self.push_to_talk.is_some_and(|combo| {
-                    self.modifiers_down() == combo.modifiers
+                    combo.modifiers.matches(self.modifier_keys)
                         && combo.key.is_none_or(|key| self.is_held(key))
                 });
                 if combo_still_held {
@@ -694,7 +921,7 @@ mod tests {
     fn rejects_bad_combos() {
         assert_eq!(Combo::parse(""), Err(HotkeyError::Empty));
         assert_eq!(Combo::parse("  + "), Err(HotkeyError::Empty));
-        assert_eq!(Combo::parse("Ctrl"), Err(HotkeyError::NeedsTwoModifiers));
+        assert_eq!(Combo::parse("Ctrl"), Err(HotkeyError::NeedsSide));
         assert_eq!(Combo::parse("A"), Err(HotkeyError::NeedsModifier));
         assert_eq!(Combo::parse("Ctrl+A+B"), Err(HotkeyError::TooManyKeys));
         assert_eq!(Combo::parse("Ctrl+Esc"), Err(HotkeyError::ReservedKey));
@@ -919,5 +1146,283 @@ mod tests {
             fsm.handle(vk, false, 1.1);
         }
         assert_eq!(fsm.state(), HotkeyState::Idle);
+    }
+
+    // ----- sides and single keys ------------------------------------------
+
+    const RCTRL: u16 = VK_RCONTROL;
+    const RALT: u16 = VK_RMENU;
+
+    #[test]
+    fn parses_sided_modifiers_and_aliases() {
+        for text in [
+            "Right Ctrl",
+            "right ctrl",
+            "RCtrl",
+            "right-control",
+            "RightCtrl",
+            "r_ctrl",
+        ] {
+            let combo = Combo::parse(text).unwrap();
+            assert_eq!(
+                combo.modifiers.single(),
+                Some((Group::Ctrl, Side::Right)),
+                "{text}"
+            );
+            assert_eq!(combo.key, None);
+            assert_eq!(combo.to_string(), "Right Ctrl");
+        }
+        assert_eq!(Combo::parse("Left Alt").unwrap().to_string(), "Left Alt");
+        assert_eq!(Combo::parse("lshift").unwrap().to_string(), "Left Shift");
+        assert_eq!(Combo::parse("AltGr").unwrap().to_string(), "Right Alt");
+        assert_eq!(Combo::parse("Right Win").unwrap().to_string(), "Right Win");
+        assert_eq!(
+            Combo::parse("Right Alt+D").unwrap().to_string(),
+            "Right Alt+D"
+        );
+        assert_eq!(
+            Combo::parse("Right Ctrl+Left Win").unwrap().to_string(),
+            "Right Ctrl+Left Win"
+        );
+        // The arrow keys are still keys, not sides.
+        assert_eq!(Combo::parse("Ctrl+Right").unwrap().key, Some(0x27));
+        assert_eq!(Combo::parse("Ctrl+Left").unwrap().key, Some(0x25));
+    }
+
+    #[test]
+    fn sided_combos_round_trip() {
+        for text in [
+            "Right Ctrl",
+            "Left Ctrl",
+            "Right Alt",
+            "Right Ctrl+Win",
+            "Ctrl+Right Alt+Space",
+            "Left Shift+Right Win+F9",
+            "F9",
+            "CapsLock",
+            "Pause",
+            "ScrollLock",
+            "PrintScreen",
+            "Menu",
+            "Insert",
+        ] {
+            let combo = Combo::parse(text).unwrap();
+            assert_eq!(Combo::parse(&combo.to_string()).unwrap(), combo, "{text}");
+        }
+    }
+
+    #[test]
+    fn single_key_rules() {
+        // A lone modifier needs a named side, or it would fire on every shortcut.
+        assert_eq!(Combo::parse("Ctrl"), Err(HotkeyError::NeedsSide));
+        assert_eq!(Combo::parse("Alt"), Err(HotkeyError::NeedsSide));
+        assert!(Combo::parse("Right Ctrl").is_ok());
+        // Keys used for typing and editing cannot stand alone...
+        for text in [
+            "A",
+            "Space",
+            "Enter",
+            "Tab",
+            "Backspace",
+            "Delete",
+            "Home",
+            "Left",
+            "5",
+        ] {
+            assert_eq!(
+                Combo::parse(text),
+                Err(HotkeyError::NeedsModifier),
+                "{text}"
+            );
+        }
+        // ...but keys nobody types with can.
+        for text in [
+            "F1",
+            "F24",
+            "CapsLock",
+            "Pause",
+            "ScrollLock",
+            "PrintScreen",
+            "Menu",
+            "Insert",
+        ] {
+            assert!(Combo::parse(text).is_ok(), "{text}");
+        }
+        assert_eq!(Combo::parse("Esc"), Err(HotkeyError::ReservedKey));
+        // Clearing a hotkey is an empty string.
+        assert_eq!(Combo::parse(""), Err(HotkeyError::Empty));
+    }
+
+    #[test]
+    fn matching_is_exact_per_side() {
+        let right_ctrl = Combo::parse("Right Ctrl").unwrap().modifiers;
+        let any_ctrl = Combo::parse("Ctrl+Win").unwrap().modifiers;
+        let bit = |vk| modifier_bit(vk).unwrap();
+        assert!(right_ctrl.matches(bit(VK_RCONTROL)));
+        assert!(!right_ctrl.matches(bit(VK_LCONTROL)));
+        assert!(!right_ctrl.matches(bit(VK_RCONTROL) | bit(VK_LCONTROL)));
+        assert!(!right_ctrl.matches(bit(VK_RCONTROL) | bit(VK_LSHIFT)));
+        assert!(any_ctrl.matches(bit(VK_LCONTROL) | bit(VK_RWIN)));
+        assert!(any_ctrl.matches(bit(VK_RCONTROL) | bit(VK_LWIN)));
+        assert!(!any_ctrl.matches(bit(VK_LCONTROL)));
+    }
+
+    #[test]
+    fn capture_keeps_the_side_of_a_lone_modifier() {
+        let bit = |vk| modifier_bit(vk).unwrap();
+        let single = |vk| Modifiers::from_capture(bit(vk), false);
+        assert_eq!(
+            single(VK_RCONTROL).single(),
+            Some((Group::Ctrl, Side::Right))
+        );
+        assert_eq!(
+            single(VK_LCONTROL).single(),
+            Some((Group::Ctrl, Side::Left))
+        );
+        assert_eq!(single(VK_RMENU).single(), Some((Group::Alt, Side::Right)));
+        // In a combination, left means "either side"; right stays right.
+        let ctrl_win = Modifiers::from_capture(bit(VK_LCONTROL) | bit(VK_LWIN), false);
+        assert_eq!(ctrl_win, Modifiers::CTRL.union(Modifiers::WIN));
+        let right_alt_d = Modifiers::from_capture(bit(VK_RMENU), true);
+        assert_eq!(right_alt_d.single(), Some((Group::Alt, Side::Right)));
+        let left_ctrl_d = Modifiers::from_capture(bit(VK_LCONTROL), true);
+        assert_eq!(left_ctrl_d, Modifiers::CTRL);
+        let mixed = Modifiers::from_capture(bit(VK_RCONTROL) | bit(VK_LSHIFT), false);
+        assert_eq!(
+            mixed,
+            Modifiers::NONE
+                .with(Group::Ctrl, Side::Right)
+                .with(Group::Shift, Side::Any)
+        );
+        // Both sides of one family pressed: either.
+        let both = Modifiers::from_capture(bit(VK_LCONTROL) | bit(VK_RCONTROL), false);
+        assert_eq!(both, Modifiers::CTRL);
+    }
+
+    fn right_ctrl_fsm() -> HotkeyFsm {
+        HotkeyFsm::from_strings("Right Ctrl", "Right Ctrl+Space")
+    }
+
+    #[test]
+    fn right_ctrl_alone_is_push_to_talk() {
+        let mut fsm = right_ctrl_fsm();
+        let down = press(&mut fsm, &[RCTRL], 1.0);
+        assert_eq!(all(&down), [Action::Start]);
+        assert!(!down[0].swallow, "modifier keys always pass through");
+        assert_eq!(fsm.state(), HotkeyState::Recording { hands_free: false });
+        // No Start-menu suppression: Win is not involved.
+        assert_eq!(all(&release(&mut fsm, &[RCTRL], 2.0)), [Action::Stop]);
+    }
+
+    #[test]
+    fn the_left_key_does_not_trigger_a_right_only_hotkey() {
+        let mut fsm = right_ctrl_fsm();
+        assert!(all(&press(&mut fsm, &[VK_LCONTROL], 1.0)).is_empty());
+        assert_eq!(fsm.state(), HotkeyState::Idle);
+        // Left held first, then right: still not exactly Right Ctrl.
+        assert!(all(&press(&mut fsm, &[RCTRL], 1.1)).is_empty());
+    }
+
+    #[test]
+    fn right_ctrl_in_a_shortcut_cancels_and_lets_the_shortcut_through() {
+        let mut fsm = right_ctrl_fsm();
+        press(&mut fsm, &[RCTRL], 1.0);
+        let c = press(&mut fsm, &[0x43], 1.1); // Right Ctrl+C
+        assert_eq!(all(&c), [Action::Discard]);
+        assert!(!c[0].swallow, "Ctrl+C must still copy");
+        assert_eq!(fsm.state(), HotkeyState::Idle);
+        assert!(all(&release(&mut fsm, &[0x43, RCTRL], 1.2)).is_empty());
+        // And it works again afterwards.
+        assert_eq!(all(&press(&mut fsm, &[RCTRL], 3.0)), [Action::Start]);
+    }
+
+    #[test]
+    fn right_ctrl_double_tap_and_space_reach_hands_free() {
+        let mut fsm = right_ctrl_fsm();
+        press(&mut fsm, &[RCTRL], 1.0);
+        release(&mut fsm, &[RCTRL], 1.08);
+        press(&mut fsm, &[RCTRL], 1.3);
+        assert_eq!(
+            all(&release(&mut fsm, &[RCTRL], 1.38)),
+            [Action::EnterHandsFree]
+        );
+        assert_eq!(fsm.state(), HotkeyState::Recording { hands_free: true });
+        // Right Ctrl+Space toggles it off.
+        press(&mut fsm, &[RCTRL], 5.0);
+        assert_eq!(all(&press(&mut fsm, &[VK_SPACE], 5.1)), [Action::Stop]);
+    }
+
+    #[test]
+    fn right_alt_alone_works_and_left_alt_does_not() {
+        let mut fsm = HotkeyFsm::from_strings("Right Alt", "");
+        assert!(all(&press(&mut fsm, &[VK_LMENU], 1.0)).is_empty());
+        release(&mut fsm, &[VK_LMENU], 1.1);
+        assert_eq!(all(&press(&mut fsm, &[RALT], 2.0)), [Action::Start]);
+        assert_eq!(all(&release(&mut fsm, &[RALT], 3.0)), [Action::Stop]);
+    }
+
+    #[test]
+    fn a_single_function_key_is_swallowed_and_works() {
+        let mut fsm = HotkeyFsm::from_strings("F9", "");
+        let down = press(&mut fsm, &[0x78], 1.0);
+        assert_eq!(all(&down), [Action::Start]);
+        assert!(down[0].swallow);
+        // Auto-repeat stays swallowed and starts nothing new.
+        let repeat = fsm.handle(0x78, true, 1.3);
+        assert!(repeat.swallow && repeat.actions().next().is_none());
+        let up = fsm.handle(0x78, false, 1.8);
+        assert_eq!(up.actions().collect::<Vec<_>>(), [Action::Stop]);
+        assert!(up.swallow);
+        // With a modifier held, F9 is a different shortcut and is left alone.
+        let mut fsm = HotkeyFsm::from_strings("F9", "");
+        press(&mut fsm, &[CTRL], 5.0);
+        assert!(all(&press(&mut fsm, &[0x78], 5.1)).is_empty());
+    }
+
+    #[test]
+    fn caps_lock_can_be_the_hotkey() {
+        let mut fsm = HotkeyFsm::from_strings("CapsLock", "");
+        let down = press(&mut fsm, &[0x14], 1.0);
+        assert_eq!(all(&down), [Action::Start]);
+        assert!(down[0].swallow, "so it does not toggle caps");
+        assert_eq!(all(&release(&mut fsm, &[0x14], 2.0)), [Action::Stop]);
+    }
+
+    #[test]
+    fn a_modifier_only_hands_free_toggle() {
+        // F9 for push to talk, Right Alt alone to toggle hands-free.
+        let mut fsm = HotkeyFsm::from_strings("F9", "Right Alt");
+        let start = press(&mut fsm, &[RALT], 1.0);
+        assert_eq!(all(&start), [Action::Start, Action::EnterHandsFree]);
+        release(&mut fsm, &[RALT], 1.1);
+        assert_eq!(fsm.state(), HotkeyState::Recording { hands_free: true });
+        assert_eq!(all(&press(&mut fsm, &[RALT], 4.0)), [Action::Stop]);
+        release(&mut fsm, &[RALT], 4.1);
+        assert_eq!(fsm.state(), HotkeyState::Idle);
+    }
+
+    #[test]
+    fn removed_hotkeys_do_nothing() {
+        let mut fsm = HotkeyFsm::from_strings("", "");
+        assert!(all(&press(&mut fsm, &[CTRL, WIN, VK_SPACE, 0x78], 1.0)).is_empty());
+        assert_eq!(fsm.state(), HotkeyState::Idle);
+        // Only hands-free set: push to talk stays disabled.
+        let mut fsm = HotkeyFsm::from_strings("", "Ctrl+Alt+H");
+        press(&mut fsm, &[CTRL, VK_LMENU], 1.0);
+        assert_eq!(
+            all(&press(&mut fsm, &[0x48], 1.1)),
+            [Action::Start, Action::EnterHandsFree]
+        );
+    }
+
+    #[test]
+    fn ctrl_win_still_works_with_either_hand() {
+        let mut fsm = fsm();
+        let down = press(&mut fsm, &[VK_RCONTROL, VK_RWIN], 1.0);
+        assert_eq!(all(&down), [Action::Start, Action::SuppressStartMenu]);
+        assert_eq!(
+            all(&release(&mut fsm, &[VK_RWIN, VK_RCONTROL], 2.0)),
+            [Action::Stop]
+        );
     }
 }
