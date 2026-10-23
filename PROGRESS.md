@@ -1043,3 +1043,26 @@ real microphone, nor in Notepad/VS Code/Chrome/Windows Terminal (see
 - Verified with ~30 fps screen captures at both edges; 4 new renderer tests
   (emerge at both edges, hide is a draw-in at both edges, interruption has no
   jump, resizes still morph).
+
+## Stutter-proof dictation, no check mark (user request, 2026-10-23)
+
+- **No check mark.** `DictationPhase::Done` and the controller's Done phase
+  are gone: after inserting, the pill leaves at once (droplet back to the
+  music pill, or hides). The done tone still plays if tones are on.
+- **The model is not retrained** (Parakeet ships pre-trained; there is no
+  on-device training). Stutters are handled in two places instead:
+  - **Worker: sentences survive pauses.** Silero now cuts at 0.25 s, and the
+    worker glues pieces into one sentence unless the pause is >= 1.0 s
+    (>= 0.45 s once the sentence is 6 s long, so long dictation is still
+    recognised while you talk). Glued pauses are squeezed to 0.15 s of
+    silence, because Parakeet reads a long pause as a full stop ("I want to.
+    I want to finish ..."). Measured with TTS clips containing 0.7-0.8 s
+    stutter blocks: no false full stops; release-to-text 0.22-0.37 s on all
+    clips (was ~0.3-1.2 s). Long clip: no mid-sentence seam, two small word
+    slips ("Praies", "chair").
+  - **Clean-up: `remove_stutters`** (runs with filler removal): repeated
+    words ("I I I want"), restarted phrases up to four words ("I want to I
+    want to go"), broken-off starts ("th the", "wed- Wednesday",
+    "b-b-but"). Keeps deliberate doubles (very very, no no, had had), real
+    hyphenated words (re-read, co-op) and short real words (in inside).
+- `dictate_wav` now also prints the cleaned text (`typed:`).

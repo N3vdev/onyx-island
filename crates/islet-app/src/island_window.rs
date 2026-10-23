@@ -1648,7 +1648,7 @@ impl IslandHost {
             // the bars are white; 11 and 12 borrow a music colour.
             8 => state.dictation = Some(demo_dictation_as(DictationPhase::Loading, false)),
             9 => state.dictation = Some(demo_dictation_as(DictationPhase::Transcribing, false)),
-            10 => state.dictation = Some(demo_dictation_as(DictationPhase::Done, false)),
+            10 => state.dictation = Some(demo_dictation_as(DictationPhase::Recording, true)),
             11 => {
                 state.last_music_accent = Some([224, 149, 94]);
                 state.dictation = Some(demo_dictation_as(DictationPhase::Recording, true));

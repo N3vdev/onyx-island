@@ -233,8 +233,6 @@ pub enum DictationPhase {
     Loading,
     Recording,
     Transcribing,
-    /// The text was inserted; shown briefly as a check mark.
-    Done,
 }
 
 /// Bars in the live waveform; the newest is last.
@@ -346,7 +344,7 @@ impl ContentCard {
     pub fn animates(&self) -> bool {
         match self {
             Self::Media(media) => media.playing,
-            Self::Dictation(dictation) => dictation.phase != DictationPhase::Done,
+            Self::Dictation(_) => true,
             Self::Notification(_) | Self::Agent(_) => false,
         }
     }
@@ -1400,13 +1398,11 @@ mod tests {
         });
         assert!(!state.content().animates());
 
-        // Warming up, recording and transcribing all animate; only the
-        // finished check mark is still.
+        // Warming up, recording and transcribing all animate.
         for (phase, animates) in [
             (DictationPhase::Loading, true),
             (DictationPhase::Recording, true),
             (DictationPhase::Transcribing, true),
-            (DictationPhase::Done, false),
         ] {
             reduce(
                 &mut state,

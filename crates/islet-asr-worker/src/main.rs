@@ -20,14 +20,31 @@ use sherpa_onnx::{
     VadModelConfig, VoiceActivityDetector,
 };
 
-/// Silero settings tuned for dictation: a 0.5 s pause closes an utterance,
-/// and a monologue is cut at 12 s so recognition keeps pace with speech.
+/// Silero settings tuned for dictation. The detector cuts speech into small
+/// pieces at every short pause; `drain` then glues pieces back together into
+/// sentences (see `SENTENCE_PAUSE_S`).
 const VAD_THRESHOLD: f32 = 0.5;
-const VAD_MIN_SILENCE_S: f32 = 0.5;
-const VAD_MIN_SPEECH_S: f32 = 0.25;
+const VAD_MIN_SILENCE_S: f32 = 0.25;
+const VAD_MIN_SPEECH_S: f32 = 0.1;
 const VAD_MAX_SPEECH_S: f32 = 12.0;
 const VAD_WINDOW: i32 = 512;
 const VAD_BUFFER_S: f32 = 60.0;
+
+/// Only a pause this long ends a sentence. Shorter ones (a stutter, a breath,
+/// searching for a word) stay inside it, so the model hears the whole
+/// sentence at once.
+const SENTENCE_PAUSE_S: f32 = 1.0;
+/// ...and the model hears those short pauses as this much silence. Parakeet
+/// reads a long pause as the end of a sentence and puts a full stop there,
+/// which is wrong when the pause was a stutter.
+const JOIN_GAP_S: f32 = 0.15;
+/// Once a sentence is this long, a natural pause of `LONG_SENTENCE_PAUSE_S`
+/// ends it, so long dictation is recognised while you are still talking and
+/// the wait after release stays short.
+const LONG_SENTENCE_S: f32 = 6.0;
+const LONG_SENTENCE_PAUSE_S: f32 = 0.45;
+/// A monologue with no pause at all is still recognised in pieces.
+const MAX_SENTENCE_S: f32 = 15.0;
 
 /// A loaded speech model plus the voice-activity detector that feeds it.
 struct Model {
@@ -40,6 +57,10 @@ struct Dictation {
     texts: Vec<String>,
     /// Audio recognised since the last `Begin`, in milliseconds.
     recognised_ms: u64,
+    /// Speech of the sentence in progress, short pauses squeezed.
+    sentence: Vec<f32>,
+    /// Where the last piece of that sentence ended, in stream samples.
+    sentence_end: i32,
 }
 
 fn main() {
@@ -153,31 +174,58 @@ fn handle(
     }
 }
 
-/// Recognises every utterance the detector has closed. Segments are reported
-/// as they finish, except at `End` where the final reply carries the text.
+/// Collects the pieces the detector has closed into sentences and recognises
+/// each finished sentence. Segments are reported as they finish, except at
+/// `End` where the final reply carries the text.
 fn drain(model: &Model, dictation: &mut Dictation, out: &mut impl Write, ending: bool) {
-    while let Some(segment) = model.vad.front() {
-        let audio_ms = samples_to_ms(segment.samples().len());
-        let started = Instant::now();
-        let text = recognise(&model.recognizer, segment.samples());
-        let decode_ms = started.elapsed().as_millis() as u64;
+    let rate = SAMPLE_RATE as f32;
+    while let Some(piece) = model.vad.front() {
+        let start = piece.start();
+        let pause = start - dictation.sentence_end;
+        let needed = if dictation.sentence.len() as f32 >= LONG_SENTENCE_S * rate {
+            LONG_SENTENCE_PAUSE_S
+        } else {
+            SENTENCE_PAUSE_S
+        };
+        if !dictation.sentence.is_empty() && pause as f32 >= needed * rate {
+            finish_sentence(model, dictation, out, ending);
+        }
+        if !dictation.sentence.is_empty() {
+            let gap = (pause.max(0) as usize).min((JOIN_GAP_S * rate) as usize);
+            dictation.sentence.extend(std::iter::repeat_n(0.0, gap));
+        }
+        dictation.sentence.extend_from_slice(piece.samples());
+        dictation.sentence_end = start + piece.n();
         model.vad.pop();
+        if dictation.sentence.len() as f32 >= MAX_SENTENCE_S * rate {
+            finish_sentence(model, dictation, out, ending);
+        }
+    }
+    if ending && !dictation.sentence.is_empty() {
+        finish_sentence(model, dictation, out, ending);
+    }
+}
 
-        dictation.recognised_ms += audio_ms;
-        if text.is_empty() {
-            continue;
-        }
-        dictation.texts.push(text.clone());
-        if !ending {
-            let reply = Reply::Segment(Segment {
-                text,
-                audio_ms,
-                decode_ms,
-            });
-            if reply.write_to(out).and_then(|()| out.flush()).is_err() {
-                return;
-            }
-        }
+fn finish_sentence(model: &Model, dictation: &mut Dictation, out: &mut impl Write, ending: bool) {
+    let samples = std::mem::take(&mut dictation.sentence);
+    let audio_ms = samples_to_ms(samples.len());
+    let started = Instant::now();
+    let text = recognise(&model.recognizer, &samples);
+    let decode_ms = started.elapsed().as_millis() as u64;
+
+    dictation.recognised_ms += audio_ms;
+    if text.is_empty() {
+        return;
+    }
+    dictation.texts.push(text.clone());
+    if !ending {
+        let reply = Reply::Segment(Segment {
+            text,
+            audio_ms,
+            decode_ms,
+        });
+        // A closed pipe is noticed by the main loop.
+        let _ = reply.write_to(out).and_then(|()| out.flush());
     }
 }
 

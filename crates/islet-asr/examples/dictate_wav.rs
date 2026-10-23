@@ -145,6 +145,15 @@ fn main() {
                     done.tail_decode_ms
                 );
                 println!("text: {}", done.text);
+                let options = islet_core::transcript::TextOptions {
+                    filler_removal: true,
+                    spoken_punctuation: true,
+                    ..Default::default()
+                };
+                println!(
+                    "typed: {}",
+                    islet_core::transcript::clean(&done.text, &options)
+                );
                 break;
             }
             other => panic!("unexpected: {other:?}"),

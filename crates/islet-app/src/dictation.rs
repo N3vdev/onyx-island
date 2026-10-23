@@ -115,7 +115,6 @@ const MIN_SPEECH_SECONDS: f32 = 0.30;
 /// Safety stop for a forgotten hands-free recording.
 const MAX_RECORDING: Duration = Duration::from_secs(10 * 60);
 /// How long the check mark stays up.
-const DONE_VISIBLE: Duration = Duration::from_millis(700);
 /// Audio is forwarded to the worker in chunks of about this many samples.
 const FORWARD_SAMPLES: usize = 480;
 /// Audio held while the model is still loading (about two minutes).
@@ -132,8 +131,6 @@ enum Phase {
     Recording,
     /// The user stopped; waiting for the final text.
     Transcribing,
-    /// Text inserted; the check mark is showing.
-    Done,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -183,7 +180,6 @@ struct Controller {
 
     phase: Phase,
     session: Option<Session>,
-    done_until: Option<Instant>,
     last_used: Instant,
     last_notice: Option<Instant>,
 
@@ -224,7 +220,6 @@ impl Controller {
             loaded_model: String::new(),
             phase: Phase::Idle,
             session: None,
-            done_until: None,
             last_used: Instant::now(),
             last_notice: None,
             sum_squares: 0.0,
@@ -308,9 +303,6 @@ impl Controller {
         let mut deadlines = Vec::with_capacity(3);
         if self.phase == Phase::Recording || self.phase == Phase::Transcribing {
             deadlines.push(self.next_tick);
-        }
-        if let Some(until) = self.done_until {
-            deadlines.push(until);
         }
         if self.phase == Phase::Idle && self.asr.is_running() && !self.config.keep_warm {
             deadlines.push(self.last_used + self.unload_after());
@@ -420,7 +412,6 @@ impl Controller {
             self.recording_ended();
             return;
         }
-        self.done_until = None;
 
         // Setting a hotkey in Islet's own settings window must not start a
         // dictation (and there is nowhere to type into there).
@@ -680,13 +671,6 @@ impl Controller {
         let now = Instant::now();
         self.next_tick = now + TICK;
 
-        if self.done_until.is_some_and(|until| now >= until) {
-            self.done_until = None;
-            if self.phase == Phase::Done {
-                self.phase = Phase::Idle;
-                self.hide();
-            }
-        }
         match self.phase {
             Phase::Recording => {
                 self.update_meter();
@@ -720,7 +704,6 @@ impl Controller {
                     self.mic = None;
                 }
             }
-            Phase::Done => {}
         }
     }
 
@@ -839,10 +822,11 @@ impl Controller {
                 if self.config.tones {
                     tone::play(Tone::Done);
                 }
-                self.phase = Phase::Done;
-                self.done_until = Some(Instant::now() + DONE_VISIBLE);
+                // No "done" mark: the pill simply goes, back to the music
+                // if it was playing.
+                self.phase = Phase::Idle;
                 self.recording_ended();
-                self.send_card();
+                self.hide();
             }
             Err(error) => {
                 tracing::error!(%error, "could not insert the dictated text");
@@ -875,7 +859,6 @@ impl Controller {
                 }
             }
             Phase::Transcribing => DictationPhase::Transcribing,
-            Phase::Done => DictationPhase::Done,
         };
         let (elapsed_ms, hands_free) = self.session.as_ref().map_or((0, false), |session| {
             (

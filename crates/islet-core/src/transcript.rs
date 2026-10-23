@@ -1,7 +1,7 @@
 //! Cleaning up recognised speech before it is typed.
 //!
 //! Parakeet already returns punctuated, capitalised text, so this stage only
-//! does what the model cannot: drop filler words, turn spoken commands into
+//! does what the model cannot: drop filler words and stutters, turn spoken commands into
 //! punctuation, and apply the user's own spellings and snippets. It works on
 //! words with their attached punctuation, so "Um, so" and "claude code." are
 //! handled without regular expressions.
@@ -266,6 +266,147 @@ fn remove_fillers(tokens: Vec<Token>) -> Vec<Token> {
     out
 }
 
+/// Doubled words that people say on purpose ("very very good", "no no",
+/// "what it is is"), so a repeat of them is not treated as a stutter.
+const INTENDED_REPEATS: &[&str] = &[
+    "very", "really", "no", "yes", "yeah", "bye", "ha", "haha", "had", "that", "is", "go", "knock",
+    "tick", "blah", "far", "more", "many", "much", "again", "over",
+];
+
+/// Short real words that may start a longer word without being a stutter
+/// ("a apple" is a mistake, but "in inside", "to today" are sentences).
+const SHORT_WORDS: &[&str] = &[
+    "a", "an", "i", "in", "on", "to", "at", "as", "is", "it", "of", "or", "by", "my", "me", "us",
+    "up", "do", "go", "so", "no", "he", "we", "be", "am", "if", "oh", "ok", "and", "the", "for",
+    "but", "not", "you", "all", "can", "her", "his", "our", "out", "one", "are", "was", "has",
+    "had", "how", "who", "why", "may", "see", "any", "too", "let", "get", "got", "new", "now",
+    "old", "own", "way", "day", "two", "its", "off", "say", "she", "use", "man", "far", "few",
+    "yes", "yet", "car", "her", "him", "end", "run", "set", "put", "per", "pro", "pre", "re", "un",
+    "ex", "co", "de", "non", "sub", "bi", "mid", "con", "dis", "mis", "out", "over",
+];
+
+/// Prefixes that make real hyphenated words ("re-read", "co-op", "pre-pay").
+const HYPHEN_PREFIXES: &[&str] = &[
+    "re", "co", "de", "un", "in", "ex", "bi", "pre", "pro", "non", "sub", "mid", "tri", "anti",
+    "self", "semi", "post", "over", "out", "mis", "dis",
+];
+
+fn plain_word(token: &Token) -> bool {
+    !token.verbatim && !token.word.is_empty() && token.word.chars().all(char::is_alphabetic)
+}
+
+/// "b-b-but" -> "but", "th-the" -> "the"; "re-read", "well-known" stay.
+fn undo_hyphen_stutter(token: &mut Token) {
+    if token.verbatim || !token.word.contains('-') {
+        return;
+    }
+    let parts: Vec<&str> = token.word.split('-').collect();
+    let Some((last, fragments)) = parts.split_last() else {
+        return;
+    };
+    let last_key = last.to_lowercase();
+    let stutter = !fragments.is_empty()
+        && fragments.iter().all(|fragment| {
+            let key = fragment.to_lowercase();
+            !key.is_empty()
+                && key.len() <= 3
+                && key.len() < last_key.len()
+                && last_key.starts_with(&key)
+        })
+        && (fragments.len() >= 2
+            || fragments[0].chars().count() == 1
+            || !HYPHEN_PREFIXES.contains(&fragments[0].to_lowercase().as_str()));
+    if stutter {
+        let capital = token.word.chars().next().is_some_and(char::is_uppercase);
+        token.word = (*last).to_owned();
+        if capital {
+            capitalize(token);
+        }
+    }
+}
+
+/// True when `token` is a broken-off start of `next` ("th the", "wh- what").
+fn is_false_start(token: &Token, next: &Token) -> bool {
+    if !plain_word(token) || !plain_word(next) {
+        return false;
+    }
+    let (key, next_key) = (token.key(), next.key());
+    let cut_off = token.trail.starts_with('-');
+    if !(token.trail.is_empty() || cut_off || token.trail == ",") {
+        return false;
+    }
+    next_key.len() > key.len()
+        && next_key.starts_with(&key)
+        && (cut_off || (key.len() <= 3 && !SHORT_WORDS.contains(&key.as_str())))
+}
+
+/// How many words starting at `index` are said again straight after: a
+/// repeated word or a repeated phrase of up to four words. 0 when none.
+fn repeated_run(tokens: &[Token], index: usize) -> usize {
+    for length in (1..=4).rev() {
+        let Some(second) = tokens.get(index + length..index + 2 * length) else {
+            continue;
+        };
+        let first = &tokens[index..index + length];
+        let same = first
+            .iter()
+            .zip(second)
+            .all(|(a, b)| plain_word(a) && plain_word(b) && a.key() == b.key());
+        // A sentence end inside the first copy means it was said twice on
+        // purpose ("Go. Go."), not a restart.
+        let restarted = first.iter().all(|token| !token.ends_sentence());
+        if same && restarted {
+            if length == 1 && INTENDED_REPEATS.contains(&first[0].key().as_str()) {
+                return 0;
+            }
+            return length;
+        }
+    }
+    0
+}
+
+/// Removes stutters: "I I I want" -> "I want", "I want to I want to go" ->
+/// "I want to go", "th- the" -> "the", "b-b-but" -> "but". The last copy is
+/// kept, and a sentence start keeps its capital.
+fn remove_stutters(tokens: Vec<Token>) -> Vec<Token> {
+    let mut tokens = tokens;
+    for token in &mut tokens {
+        undo_hyphen_stutter(token);
+    }
+    let mut out: Vec<Token> = Vec::with_capacity(tokens.len());
+    let mut index = 0;
+    let mut capital_pending = false;
+    while index < tokens.len() {
+        let skip = match tokens.get(index + 1) {
+            Some(next) if is_false_start(&tokens[index], next) => 1,
+            _ => repeated_run(&tokens, index),
+        };
+        if skip > 0 {
+            let dropped = &tokens[index];
+            let at_clause_start = out
+                .last()
+                .is_none_or(|previous| previous.ends_sentence() || is_break(previous));
+            if at_clause_start && dropped.word.chars().next().is_some_and(char::is_uppercase) {
+                capital_pending = true;
+            }
+            // Keep an opening bracket or quote that was on the dropped word.
+            if !dropped.lead.is_empty() && tokens[index + skip].lead.is_empty() {
+                tokens[index + skip].lead = dropped.lead.clone();
+            }
+            index += skip;
+            continue;
+        }
+        let mut token = tokens[index].clone();
+        if capital_pending {
+            capitalize(&mut token);
+            capital_pending = false;
+        }
+        out.push(token);
+        index += 1;
+    }
+    out
+}
+
 fn capitalize(token: &mut Token) {
     if token.verbatim {
         return;
@@ -326,7 +467,7 @@ pub fn clean(text: &str, options: &TextOptions) -> String {
         apply_phrases(&tokens, &phrases)
     };
     if options.filler_removal {
-        tokens = remove_fillers(tokens);
+        tokens = remove_stutters(remove_fillers(tokens));
     }
     render(&tokens)
 }
@@ -394,6 +535,79 @@ mod tests {
             clean("Do you know the answer?", &o),
             "Do you know the answer?"
         );
+    }
+
+    #[test]
+    fn stuttered_words_and_restarts_are_cleaned() {
+        let o = options();
+        assert_eq!(clean("I I I want to go home.", &o), "I want to go home.");
+        assert_eq!(clean("I, I, I think so.", &o), "I think so.");
+        assert_eq!(clean("Can can you send it?", &o), "Can you send it?");
+        assert_eq!(
+            clean("We need to to finish it.", &o),
+            "We need to finish it."
+        );
+        // A restarted phrase keeps only the last attempt.
+        assert_eq!(
+            clean("I want to I want to go to the store.", &o),
+            "I want to go to the store."
+        );
+        assert_eq!(
+            clean("Can you can you check this?", &o),
+            "Can you check this?"
+        );
+        // Broken-off starts of a word.
+        assert_eq!(
+            clean("Th the meeting is at five.", &o),
+            "The meeting is at five."
+        );
+        assert_eq!(
+            clean("Let's meet on wed- Wednesday.", &o),
+            "Let's meet on Wednesday."
+        );
+        assert_eq!(clean("B-b-but it works.", &o), "But it works.");
+        assert_eq!(clean("It's th-th-the best.", &o), "It's the best.");
+        // Fillers and stutters together.
+        assert_eq!(clean("I, um, I want, uh, want that.", &o), "I want that.");
+        assert_eq!(clean("So um so we go.", &o), "So we go.");
+        // What Parakeet actually returned for stuttered test speech.
+        assert_eq!(
+            clean("The meeting is at five, so please, please be on time.", &o),
+            "The meeting is at five, so please be on time."
+        );
+        assert_eq!(
+            clean("Can can you send me the the report by Friday?", &o),
+            "Can you send me the report by Friday?"
+        );
+    }
+
+    #[test]
+    fn deliberate_repeats_and_real_words_are_kept() {
+        let o = options();
+        assert_eq!(
+            clean("It was very very good.", &o),
+            "It was very very good."
+        );
+        assert_eq!(clean("No no, that's fine.", &o), "No no, that's fine.");
+        assert_eq!(clean("He had had enough.", &o), "He had had enough.");
+        assert_eq!(clean("Go. Go now.", &o), "Go. Go now.");
+        assert_eq!(
+            clean("Please re-read the well-known co-op rules.", &o),
+            "Please re-read the well-known co-op rules."
+        );
+        assert_eq!(
+            clean("Put it in inside the box.", &o),
+            "Put it in inside the box."
+        );
+        assert_eq!(clean("I want to today.", &o), "I want to today.");
+        assert_eq!(
+            clean("Bring a apple and an answer.", &o),
+            "Bring a apple and an answer."
+        );
+        assert_eq!(clean("Room 1 1 is free.", &o), "Room 1 1 is free.");
+        let mut off = options();
+        off.filler_removal = false;
+        assert_eq!(clean("I I want.", &off), "I I want.");
     }
 
     #[test]
@@ -469,10 +683,13 @@ mod tests {
     #[test]
     fn non_english_text_is_left_alone() {
         let o = options();
-        assert_eq!(clean("Привет, как дела?", &o), "Привет, как дела?");
         assert_eq!(
-            clean("Das ist schön — nicht wahr?", &o),
-            "Das ist schön — nicht wahr?"
+            clean("ÐŸÑ€Ð¸Ð²ÐµÑ‚, ÐºÐ°Ðº Ð´ÐµÐ»Ð°?", &o),
+            "ÐŸÑ€Ð¸Ð²ÐµÑ‚, ÐºÐ°Ðº Ð´ÐµÐ»Ð°?"
+        );
+        assert_eq!(
+            clean("Das ist schÃ¶n â€” nicht wahr?", &o),
+            "Das ist schÃ¶n â€” nicht wahr?"
         );
     }
 

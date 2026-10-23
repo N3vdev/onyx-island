@@ -18,6 +18,7 @@ ureq = "2"
 
 [dev-dependencies]
 hound = "3.5"
+islet-core = { path = "../islet-core" }
 
 [[example]]
 name = "dictate_wav"

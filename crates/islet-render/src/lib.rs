@@ -2362,7 +2362,7 @@ impl Gfx {
 
     /// The dictation pill: six bars and nothing else, so it stays small. Bars
     /// follow the voice while recording, breathe while the model warms up,
-    /// and sweep while transcribing; a check mark shows when the text is in.
+    /// and sweep while transcribing. Once the text is in, the pill simply goes.
     /// A faint dot on the left marks a locked-on (hands-free) recording.
     unsafe fn draw_dictation(
         &mut self,
@@ -2378,9 +2378,6 @@ impl Gfx {
         const BAR_WIDTH: f32 = 3.0;
 
         let mid = height * 0.5;
-        if dictation.phase == DictationPhase::Done {
-            return self.draw_check(width * 0.5, mid, accent, alpha);
-        }
 
         let span = (BARS - 1) as f32 * PITCH + BAR_WIDTH;
         let left = (width - span) * 0.5;
@@ -2428,34 +2425,6 @@ impl Gfx {
                 2.2,
                 color(accent, 0.9 * pulse * alpha),
             )?;
-        }
-        Ok(())
-    }
-
-    /// A small check mark in a soft disc.
-    unsafe fn draw_check(
-        &mut self,
-        x: f32,
-        y: f32,
-        accent: [u8; 3],
-        alpha: f32,
-    ) -> RenderResult<()> {
-        self.fill_circle(x, y, 9.0, color(accent, 0.16 * alpha))?;
-        self.set_color(color(accent, alpha));
-        for (from, to) in [((-4.0, 0.5), (-1.2, 3.4)), ((-1.2, 3.4), (4.2, -3.2))] {
-            self.dc.DrawLine(
-                Vector2 {
-                    X: x + from.0,
-                    Y: y + from.1,
-                },
-                Vector2 {
-                    X: x + to.0,
-                    Y: y + to.1,
-                },
-                &self.brush,
-                2.0,
-                None,
-            );
         }
         Ok(())
     }
