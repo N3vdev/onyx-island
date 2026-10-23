@@ -1615,7 +1615,7 @@ impl IslandHost {
             idle_style: self.idle_style,
             ..IslandState::default()
         };
-        match step % 8 {
+        match step % DEMO_STATES {
             0 => {}
             1 => state.media = Some(demo_media()),
             2 => {
@@ -1633,6 +1633,20 @@ impl IslandHost {
             }
             6 => state.dictation = Some(demo_dictation()),
             7 => state.done = Some(demo_done()),
+            // The dictation pill's other looks. With no music behind them
+            // the bars are white; 11 and 12 borrow a music colour.
+            8 => state.dictation = Some(demo_dictation_as(DictationPhase::Loading, false)),
+            9 => state.dictation = Some(demo_dictation_as(DictationPhase::Transcribing, false)),
+            10 => state.dictation = Some(demo_dictation_as(DictationPhase::Done, false)),
+            11 => {
+                state.last_music_accent = Some([224, 149, 94]);
+                state.dictation = Some(demo_dictation_as(DictationPhase::Recording, true));
+            }
+            12 => {
+                state.media = Some(demo_media());
+                state.last_music_accent = Some([224, 149, 94]);
+                state.dictation = Some(demo_dictation());
+            }
             _ => unreachable!(),
         }
         // Debug: every other step, glides down to the bottom edge.
@@ -2117,7 +2131,14 @@ fn demo_done() -> NotificationCard {
     }
 }
 
+/// How many looks `--demo` cycles through.
+pub const DEMO_STATES: usize = 13;
+
 fn demo_dictation() -> DictationCard {
+    demo_dictation_as(DictationPhase::Recording, false)
+}
+
+fn demo_dictation_as(phase: DictationPhase, hands_free: bool) -> DictationCard {
     // A plausible speech waveform: syllable bursts with small pauses.
     let mut bars = [0u8; islet_core::island::DICTATION_BARS];
     for (index, bar) in bars.iter_mut().enumerate() {
@@ -2128,9 +2149,9 @@ fn demo_dictation() -> DictationCard {
     DictationCard {
         elapsed_ms: 7_400,
         level: 0.72,
-        phase: DictationPhase::Recording,
+        phase,
         bars,
-        hands_free: false,
+        hands_free,
     }
 }
 

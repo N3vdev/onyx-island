@@ -1398,7 +1398,7 @@ impl Gfx {
         accent: [u8; 3],
         alpha: f32,
     ) -> RenderResult<()> {
-        if width < 60.0 && height < 60.0 {
+        if width < 60.0 && height < 60.0 && !matches!(card, ContentCard::Dictation(_)) {
             return self.draw_bubble(now, width, height, corner, card, accent, alpha);
         }
         if height < 31.0 && !matches!(card, ContentCard::Dictation(_)) {
@@ -2294,6 +2294,10 @@ impl Gfx {
         )
     }
 
+    /// The dictation pill: six bars and nothing else, so it stays small. Bars
+    /// follow the voice while recording, breathe while the model warms up,
+    /// and sweep while transcribing; a check mark shows when the text is in.
+    /// A faint dot on the left marks a locked-on (hands-free) recording.
     unsafe fn draw_dictation(
         &mut self,
         now: f64,
@@ -2303,126 +2307,66 @@ impl Gfx {
         accent: [u8; 3],
         alpha: f32,
     ) -> RenderResult<()> {
+        const BARS: usize = 6;
+        const PITCH: f32 = 9.0;
+        const BAR_WIDTH: f32 = 3.0;
+
         let mid = height * 0.5;
-        let indicator_x = 22.0;
-
-        // Left: what state we are in.
-        match dictation.phase {
-            DictationPhase::Recording => {
-                let pulse = 0.78 + 0.22 * (now * 5.0).sin() as f32;
-                self.fill_circle(indicator_x, mid, 4.5, color(accent, alpha * pulse))?;
-                if dictation.hands_free {
-                    // A ring marks a locked (hands-free) recording.
-                    let ring = D2D1_ELLIPSE {
-                        point: Vector2 {
-                            X: indicator_x,
-                            Y: mid,
-                        },
-                        radiusX: 9.0,
-                        radiusY: 9.0,
-                    };
-                    self.set_color(color(accent, 0.55 * alpha));
-                    self.dc
-                        .DrawEllipse(&ring, &self.brush, 1.5, None::<&ID2D1StrokeStyle>);
-                }
-            }
-            DictationPhase::Loading | DictationPhase::Transcribing => {
-                self.draw_spinner(indicator_x, mid, now, accent, alpha)?;
-            }
-            DictationPhase::Done => self.draw_check(indicator_x, mid, accent, alpha)?,
+        if dictation.phase == DictationPhase::Done {
+            return self.draw_check(width * 0.5, mid, accent, alpha);
         }
 
-        let wave_left = 42.0;
-        let wave_right = (width - 66.0).max(wave_left + 40.0);
-        match dictation.phase {
-            DictationPhase::Recording | DictationPhase::Transcribing => {
-                let count = DICTATION_BARS;
-                let pitch = (wave_right - wave_left) / count as f32;
-                let max_h = (height - 14.0).max(6.0);
-                for index in 0..count {
-                    let (level, bar_alpha) = if dictation.phase == DictationPhase::Recording {
-                        // Newest bars are brightest.
-                        let level = f32::from(dictation.bars[index]) / 255.0;
-                        (level, 0.45 + 0.5 * (index as f32 / count as f32))
-                    } else {
-                        // A slow shimmer sweeps across while transcribing.
-                        let wave = (now * 5.0 - index as f64 * 0.45).sin() * 0.5 + 0.5;
-                        (0.10 + 0.26 * wave as f32, 0.8)
-                    };
-                    let bar_h = 3.0 + level.clamp(0.0, 1.0) * (max_h - 3.0);
-                    self.fill_round_rect(
-                        wave_left + index as f32 * pitch,
-                        mid - bar_h * 0.5,
-                        3.0,
-                        bar_h,
-                        1.5,
-                        color(accent, bar_alpha * alpha),
-                    )?;
+        let span = (BARS - 1) as f32 * PITCH + BAR_WIDTH;
+        let left = (width - span) * 0.5;
+        let max_h = (height - 12.0).max(6.0);
+        // Each bar is the average of a few of the recent mic readings, newest
+        // on the right, so the bars flow calmly instead of flickering.
+        let group = DICTATION_BARS / BARS;
+        for index in 0..BARS {
+            let (level, bar_alpha) = match dictation.phase {
+                DictationPhase::Recording => {
+                    let from = index * group;
+                    let sum: u32 = dictation.bars[from..from + group]
+                        .iter()
+                        .map(|&value| u32::from(value))
+                        .sum();
+                    let level = sum as f32 / (group as f32 * 255.0);
+                    (level, 0.55 + 0.4 * (index as f32 / (BARS - 1) as f32))
                 }
-            }
-            DictationPhase::Loading => {
-                self.draw_text(
-                    "Warming up\u{2026}",
-                    FormatId::Tucked,
-                    wave_left,
-                    0.0,
-                    (width - wave_left - 16.0).max(10.0),
-                    height,
-                    color([210, 214, 228], 0.9 * alpha),
-                )?;
-            }
-            DictationPhase::Done => {
-                self.draw_text(
-                    "Inserted",
-                    FormatId::Tucked,
-                    wave_left,
-                    0.0,
-                    (width - wave_left - 16.0).max(10.0),
-                    height,
-                    color([210, 214, 228], 0.9 * alpha),
-                )?;
-            }
-        }
-
-        // Right: elapsed time while recording.
-        if dictation.phase == DictationPhase::Recording {
-            self.draw_text(
-                &format_elapsed(dictation.elapsed_ms),
-                FormatId::Timer,
-                width - 62.0,
-                8.0,
-                48.0,
-                height - 16.0,
-                color([255, 255, 255], 0.9 * alpha),
+                DictationPhase::Transcribing => {
+                    let wave = (now * 6.0 - index as f64 * 0.8).sin() * 0.5 + 0.5;
+                    (0.12 + 0.34 * wave as f32, 0.9)
+                }
+                // Loading, and anything else: a slow breathing pulse.
+                _ => {
+                    let breath = (now * 3.2 - index as f64 * 0.55).sin() * 0.5 + 0.5;
+                    (0.08 + 0.3 * breath as f32, 0.75)
+                }
+            };
+            let bar_h = 3.0 + level.clamp(0.0, 1.0) * (max_h - 3.0);
+            self.fill_round_rect(
+                left + index as f32 * PITCH,
+                mid - bar_h * 0.5,
+                BAR_WIDTH,
+                bar_h,
+                BAR_WIDTH * 0.5,
+                color(accent, bar_alpha * alpha),
             )?;
         }
-        Ok(())
-    }
 
-    /// Eight dots chasing each other: "working on it".
-    unsafe fn draw_spinner(
-        &mut self,
-        x: f32,
-        y: f32,
-        now: f64,
-        accent: [u8; 3],
-        alpha: f32,
-    ) -> RenderResult<()> {
-        let head = (now * 10.0) as usize % 8;
-        for index in 0..8usize {
-            let angle = index as f32 * std::f32::consts::TAU / 8.0;
-            let behind = (index + 8 - head) % 8;
-            let strength = 1.0 - behind as f32 / 8.0;
+        if dictation.hands_free && dictation.phase == DictationPhase::Recording {
+            let pulse = 0.65 + 0.35 * (now * 4.0).sin() as f32;
             self.fill_circle(
-                x + angle.cos() * 6.5,
-                y + angle.sin() * 6.5,
-                1.5 + 0.4 * strength,
-                color(accent, (0.18 + 0.8 * strength) * alpha),
+                (left * 0.5).max(5.0),
+                mid,
+                2.2,
+                color(accent, 0.9 * pulse * alpha),
             )?;
         }
         Ok(())
     }
 
+    /// A small check mark in a soft disc.
     unsafe fn draw_check(
         &mut self,
         x: f32,
@@ -2430,7 +2374,7 @@ impl Gfx {
         accent: [u8; 3],
         alpha: f32,
     ) -> RenderResult<()> {
-        self.fill_circle(x, y, 9.0, color(accent, 0.18 * alpha))?;
+        self.fill_circle(x, y, 9.0, color(accent, 0.16 * alpha))?;
         self.set_color(color(accent, alpha));
         for (from, to) in [((-4.0, 0.5), (-1.2, 3.4)), ((-1.2, 3.4), (4.2, -3.2))] {
             self.dc.DrawLine(
@@ -2735,7 +2679,6 @@ enum FormatId {
     Chip,
     Tucked,
     Bubble,
-    Timer,
 }
 
 struct TextFormats {
@@ -2750,7 +2693,6 @@ struct TextFormats {
     chip: IDWriteTextFormat,
     tucked: IDWriteTextFormat,
     bubble: IDWriteTextFormat,
-    timer: IDWriteTextFormat,
 }
 
 impl TextFormats {
@@ -2833,13 +2775,6 @@ impl TextFormats {
                 DWRITE_TEXT_ALIGNMENT_CENTER,
                 DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
             )?,
-            timer: create_format(
-                factory,
-                12.0,
-                DWRITE_FONT_WEIGHT_DEMI_BOLD,
-                DWRITE_TEXT_ALIGNMENT_CENTER,
-                DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
-            )?,
         })
     }
 
@@ -2856,7 +2791,6 @@ impl TextFormats {
             FormatId::Chip => &self.chip,
             FormatId::Tucked => &self.tucked,
             FormatId::Bubble => &self.bubble,
-            FormatId::Timer => &self.timer,
         }
     }
 }
@@ -3147,11 +3081,6 @@ fn ease_out(value: f32) -> f32 {
     1.0 - (1.0 - value).powi(3)
 }
 
-fn format_elapsed(milliseconds: u32) -> String {
-    let seconds = milliseconds / 1000;
-    format!("{}:{:02}", seconds / 60, seconds % 60)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3173,11 +3102,6 @@ mod tests {
     #[test]
     fn empty_hit_region_contains_nothing() {
         assert!(!HitRegion::default().contains(0.0, 0.0));
-    }
-
-    #[test]
-    fn formatting_helpers_are_stable() {
-        assert_eq!(format_elapsed(7_400), "0:07");
     }
 
     #[test]

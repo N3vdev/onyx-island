@@ -34,7 +34,12 @@ pub const COMPACT: PillSize = PillSize::new(220.0, 36.0, 18.0);
 pub const SPLIT_BUBBLE: PillSize = PillSize::new(36.0, 36.0, 18.0);
 pub const NOTIFICATION: PillSize = PillSize::new(380.0, 76.0, 30.0);
 pub const MEDIA: PillSize = PillSize::new(448.0, 112.0, 36.0);
-pub const DICTATION: PillSize = PillSize::new(260.0, 44.0, 22.0);
+/// Small and sleek: just six bars (see the renderer), no text or timer.
+pub const DICTATION: PillSize = PillSize::new(92.0, 32.0, 16.0);
+/// Bar colour of a music pill whose art gave no colour.
+pub const DEFAULT_MEDIA_ACCENT: [u8; 3] = [92, 132, 255];
+/// Dictation bar colour when no music has played yet.
+pub const DICTATION_FALLBACK_ACCENT: [u8; 3] = [255, 255, 255];
 pub const SLIVER: PillSize = PillSize::new(120.0, 6.0, 3.0);
 pub const HIDDEN: PillSize = PillSize::new(0.0, 0.0, 0.0);
 
@@ -389,6 +394,9 @@ pub struct IslandState {
     /// The paused track was closed after the pause delay; ignore paused
     /// updates until something plays again.
     pub media_dismissed: bool,
+    /// The bar colour of the most recent music pill. The dictation pill
+    /// borrows it so the island keeps one colour while you talk.
+    pub last_music_accent: Option<[u8; 3]>,
     /// How long paused media stays before closing.
     pub media_paused_ms: u32,
     pub idle_style: IdleStyle,
@@ -408,6 +416,7 @@ impl Default for IslandState {
             running: None,
             media: None,
             media_dismissed: false,
+            last_music_accent: None,
             media_paused_ms: MEDIA_PAUSED_MS,
             idle_style: IdleStyle::Hidden,
             tucked: false,
@@ -542,7 +551,13 @@ impl IslandState {
             (self.primary_card(), None)
         };
 
-        let accent = primary.as_ref().map_or([120, 128, 150], accent_for_card);
+        let accent = match &primary {
+            Some(ContentCard::Dictation(_)) => {
+                self.last_music_accent.unwrap_or(DICTATION_FALLBACK_ACCENT)
+            }
+            Some(card) => accent_for_card(card),
+            None => [120, 128, 150],
+        };
         ContentSnapshot {
             primary,
             secondary,
@@ -716,6 +731,9 @@ pub fn reduce(state: &mut IslandState, event: IslandEvent, now: f64) -> Vec<Effe
                     None
                 }
             };
+            if let Some(media) = &card {
+                state.last_music_accent = Some(media.accent.unwrap_or(DEFAULT_MEDIA_ACCENT));
+            }
             let mut effects = Vec::new();
             match &card {
                 Some(media) if !media.playing && !was_paused => {
@@ -819,7 +837,7 @@ pub fn reduce(state: &mut IslandState, event: IslandEvent, now: f64) -> Vec<Effe
 
 fn accent_for_card(card: &ContentCard) -> [u8; 3] {
     match card {
-        ContentCard::Media(media) => media.accent.unwrap_or([92, 132, 255]),
+        ContentCard::Media(media) => media.accent.unwrap_or(DEFAULT_MEDIA_ACCENT),
         ContentCard::Notification(notification) => match notification.level {
             AlertLevel::Info => [110, 150, 255],
             AlertLevel::Success => [64, 210, 122],
@@ -831,11 +849,8 @@ fn accent_for_card(card: &ContentCard) -> [u8; 3] {
             AgentState::NeedsInput => [255, 159, 46],
             AgentState::Done => [64, 210, 122],
         },
-        ContentCard::Dictation(dictation) => match dictation.phase {
-            DictationPhase::Done => [64, 210, 122],
-            DictationPhase::Loading | DictationPhase::Transcribing => [140, 160, 255],
-            DictationPhase::Recording => [255, 78, 92],
-        },
+        // Chosen in `IslandState::content` from the last music colour.
+        ContentCard::Dictation(_) => DICTATION_FALLBACK_ACCENT,
     }
 }
 
@@ -1299,6 +1314,65 @@ mod tests {
             kind: TimerKind::DoneExpiry,
             after_ms: DONE_VISIBLE_MS,
         }));
+    }
+
+    #[test]
+    fn dictation_bars_borrow_the_last_music_colour_or_are_white() {
+        let mut state = IslandState::default();
+        let dictation = || {
+            IslandEvent::SetDictation(Some(DictationCard {
+                phase: DictationPhase::Recording,
+                ..DictationCard::default()
+            }))
+        };
+        // No music has ever played: white.
+        reduce(&mut state, dictation(), 0.0);
+        assert_eq!(state.content().accent, DICTATION_FALLBACK_ACCENT);
+        reduce(&mut state, IslandEvent::SetDictation(None), 0.0);
+
+        // Music whose art gave a colour: dictation uses that colour.
+        let mut card = media();
+        card.accent = Some([200, 40, 60]);
+        reduce(&mut state, IslandEvent::SetMedia(Some(card)), 0.0);
+        reduce(&mut state, dictation(), 0.0);
+        assert_eq!(state.content().accent, [200, 40, 60]);
+
+        // The colour is remembered after the music is gone.
+        reduce(&mut state, IslandEvent::SetMedia(None), 0.0);
+        assert!(state.media.is_none());
+        assert_eq!(state.content().accent, [200, 40, 60]);
+        reduce(&mut state, IslandEvent::SetDictation(None), 0.0);
+
+        // Music without a colour used the default blue bars, so dictation does too.
+        reduce(&mut state, IslandEvent::SetMedia(Some(media())), 0.0);
+        reduce(&mut state, dictation(), 0.0);
+        assert_eq!(state.content().accent, DEFAULT_MEDIA_ACCENT);
+    }
+
+    #[test]
+    fn dictation_pill_is_smaller_than_the_music_pill_and_the_music_returns() {
+        const { assert!(DICTATION.width < COMPACT.width && DICTATION.height <= COMPACT.height) };
+        let mut state = IslandState::default();
+        reduce(&mut state, IslandEvent::SetMedia(Some(media())), 0.0);
+        assert_eq!(state.layout(), LayoutTarget::single(COMPACT));
+        reduce(
+            &mut state,
+            IslandEvent::SetDictation(Some(DictationCard::default())),
+            0.0,
+        );
+        assert_eq!(state.layout(), LayoutTarget::single(DICTATION));
+        reduce(&mut state, IslandEvent::SetDictation(None), 0.0);
+        assert_eq!(state.layout(), LayoutTarget::single(COMPACT));
+
+        // With no music the island hides again afterwards.
+        let mut quiet = IslandState::default();
+        reduce(
+            &mut quiet,
+            IslandEvent::SetDictation(Some(DictationCard::default())),
+            0.0,
+        );
+        reduce(&mut quiet, IslandEvent::SetDictation(None), 0.0);
+        assert_eq!(quiet.layout(), LayoutTarget::HIDDEN);
     }
 
     #[test]

@@ -994,3 +994,27 @@ real microphone, nor in Notepad/VS Code/Chrome/Windows Terminal (see
   pill returns. Tests: hotkey 35, island 127 (core).
 - Note: Esc is only intercepted while recording, as before; pressing it during
   "transcribing" does nothing.
+
+## Sleek dictation pill (user request, 2026-10-23)
+
+- The dictation pill is now small: 92x32 dp (was 260x44), **six bars and
+  nothing else**: no timer, no dot, no text. With music playing the music pill
+  shrinks into it with the existing spring morph (content blurs out, bars
+  fade in; first movement ~170 ms after the press, small pill by ~300 ms), and
+  grows back to the music pill when dictation ends. With no music it grows
+  from nothing and hides again afterwards.
+- **Colour.** `IslandState::last_music_accent` remembers the bar colour of the
+  most recent music pill (the art colour, or the default blue when the art gave
+  none) even after the music stops; dictation bars use it, white if there has
+  never been music. Unit-tested.
+- **Looks.** Recording: each bar averages four recent mic readings, newest on
+  the right (calm flow, no flicker). Warming up: bars breathe. Transcribing:
+  bars sweep. Done: a small check mark. Hands-free: a faint pulsing dot at the
+  left edge (the only extra mark; it is how a locked-on recording is told
+  apart from a held one).
+- `--demo` now cycles 13 looks (added: warming up, transcribing, done,
+  hands-free with a music colour, dictation over music).
+- Verified on a real run with music playing (isolated config, fake mic): music
+  pill -> shrink -> six orange bars -> Esc -> "Stopped" -> music pill back.
+  Not visually verified: the no-music hide-after-done path (covered by a
+  layout test); it needs a real insertion into a window.

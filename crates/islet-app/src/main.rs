@@ -100,7 +100,7 @@ fn run(paths: Paths) -> Result<(), Box<dyn std::error::Error>> {
             demo = true;
         } else if let Some(value) = arg.strip_prefix("--demo-state=") {
             match value.parse::<usize>() {
-                Ok(step) => demo_state = Some(step % 8),
+                Ok(step) => demo_state = Some(step % island_window::DEMO_STATES),
                 Err(_) => eprintln!("ignoring invalid --demo-state value: {value}"),
             }
         }
