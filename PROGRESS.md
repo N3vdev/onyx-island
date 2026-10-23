@@ -660,13 +660,42 @@ the shell is tapered.
 ## A Helvetica-like voice
 
 All island text now uses **Inter**, a Helvetica-style grotesque with the full
-weight range, so the title/sub/tiny hierarchy is preserved. `create_format`
-falls back to Segoe UI when the family is missing.
+weight range, so the title/sub/tiny hierarchy is preserved. Segoe UI remains
+the system fallback when the family is absent.
 
 The compact media tile is now a **circle**: its radius is `art * 0.5` (12 dp on
 the 24 dp tile), which is the pill's 18 dp corner clamped to the tile, so the
 art sits concentric with the pill's rounded ends. Window-only captures of the
-compact pill and the expanded card confirm the new face and the circular art;
-the expanded card keeps its 12 dp squircle so the album cover still reads as
-cover art.
+compact pill and the expanded card confirm the new face and the circular art.
+
+## The expanded player
+
+The hovered player is now a full 400 x 168 card built around a 120 dp cover
+(18, 24, radius 26) and a single text column at x = 154. Title (Inter 17 dp
+demi-bold), artist (12 dp), a source chip, a hairline timeline and one control
+row replace the old sparse layout: nothing floats in dead space, and the
+timeline and volume track share the same 378 dp right edge.
+
+**Source chip.** The app name sits in a soft pill with a small north-east
+arrow. Pressing the cover, the title block or the chip calls
+`open_media_source`, which activates the running window first, then tries the
+Spotify URI, the `shell:AppsFolder` AUMID, the executable and finally the AUMID
+again. The chip makes that affordance visible instead of hiding it in the art.
+
+**Volume.** A speaker glyph and a 68 dp slider sit at the right end of the
+control row, aligned with the transport's centre line. `volume_fraction`
+mirrors `scrub_fraction`: a press on the row starts a capture drag, the slider
+follows the cursor and clamps at both ends, and clicking the speaker mutes.
+`islet-audio::VolumeHandle` owns a named worker thread with its own COM
+apartment and `IAudioEndpointVolume`; the UI only sends `Set`/`Refresh` over a
+channel and reads an atomic, so hovering never blocks on Core Audio and an idle
+island wakes no threads. The slider is hidden when the endpoint cannot be read.
+While the player is visible the hover poll refreshes the value, so hardware
+volume keys move the knob too; the drag itself skips that sync.
+
+**Verification.** The full workspace test suite (including new chip and volume
+hit tests), clippy `-D warnings` and `cargo fmt --check` are green.
+Window-only captures of the demo state show the new card; a scripted mouse drag
+from 25% to 75% moved the knob with the cursor, and a probe read the endpoint,
+wrote the same value back and read it again (0.9676).
 

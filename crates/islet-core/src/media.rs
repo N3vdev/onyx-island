@@ -293,6 +293,8 @@ pub enum MediaAction {
     Next,
     /// Seek to a fraction of the track, 0..=1.
     Seek(f32),
+    /// Open or activate the source music application.
+    OpenApp,
 }
 
 /// Layout of the expanded media view, relative to the pill's top-left, in
@@ -301,16 +303,31 @@ pub enum MediaAction {
 pub mod expanded {
     use super::Rect;
 
-    pub const ART: Rect = Rect::new(18.0, 18.0, 78.0, 78.0);
-    pub const ART_RADIUS: f32 = 16.0;
-    pub const TEXT_X: f32 = 112.0;
-    pub const SCRUBBER_Y: f32 = 96.0;
-    pub const SCRUBBER_HEIGHT: f32 = 4.0;
+    /// A large cover in the left column; the card is 400x168.
+    pub const ART: Rect = Rect::new(18.0, 24.0, 120.0, 120.0);
+    pub const ART_RADIUS: f32 = 26.0;
+    pub const TEXT_X: f32 = 154.0;
+    pub const TITLE_Y: f32 = 15.0;
+    pub const TITLE_HEIGHT: f32 = 25.0;
+    pub const ARTIST_Y: f32 = 43.0;
+    pub const ARTIST_HEIGHT: f32 = 18.0;
+    pub const CHIP_Y: f32 = 69.0;
+    pub const CHIP_HEIGHT: f32 = 21.0;
+    pub const SCRUBBER_Y: f32 = 102.0;
+    pub const SCRUBBER_HEIGHT: f32 = 3.0;
     /// Vertical slack around the thin scrubber for comfortable clicking.
-    pub const SCRUBBER_HIT_SLOP: f32 = 9.0;
-    pub const CONTROLS_Y: f32 = 136.0;
-    pub const CONTROL_SPACING: f32 = 52.0;
+    pub const SCRUBBER_HIT_SLOP: f32 = 8.0;
+    pub const TIMES_Y: f32 = 109.0;
+    pub const TIMES_HEIGHT: f32 = 12.0;
+    pub const CONTROLS_Y: f32 = 143.0;
+    pub const CONTROL_SPACING: f32 = 44.0;
     pub const CONTROL_HIT_RADIUS: f32 = 20.0;
+    pub const VOLUME_TRACK_WIDTH: f32 = 68.0;
+    pub const VOLUME_TRACK_HEIGHT: f32 = 4.0;
+    pub const VOLUME_MARGIN: f32 = 22.0;
+    /// Gap between the speaker glyph and the start of the track.
+    pub const VOLUME_ICON_GAP: f32 = 15.0;
+    pub const VOLUME_HIT_SLOP: f32 = 11.0;
 
     #[must_use]
     pub fn scrubber(pill_width: f32) -> Rect {
@@ -332,6 +349,50 @@ pub mod expanded {
             (center + CONTROL_SPACING, CONTROLS_Y),
         ]
     }
+
+    /// The source chip under the artist: the app name plus an "open" arrow.
+    #[must_use]
+    pub fn chip(pill_width: f32, source: &str) -> Rect {
+        let estimate = source.chars().count() as f32 * 5.9;
+        let max = (pill_width - TEXT_X - 24.0).max(64.0);
+        Rect::new(
+            TEXT_X,
+            CHIP_Y,
+            (estimate + 40.0).clamp(64.0, max),
+            CHIP_HEIGHT,
+        )
+    }
+
+    /// The volume slider track, right-aligned with the card's margin.
+    #[must_use]
+    pub fn volume_track(pill_width: f32) -> Rect {
+        Rect::new(
+            pill_width - VOLUME_MARGIN - VOLUME_TRACK_WIDTH,
+            CONTROLS_Y - VOLUME_TRACK_HEIGHT * 0.5,
+            VOLUME_TRACK_WIDTH,
+            VOLUME_TRACK_HEIGHT,
+        )
+    }
+
+    /// Centre of the speaker glyph left of the volume track.
+    #[must_use]
+    pub fn volume_icon_center(pill_width: f32) -> (f32, f32) {
+        (volume_track(pill_width).x - VOLUME_ICON_GAP, CONTROLS_Y)
+    }
+
+    /// Clickable region for the album art.
+    pub const ART_HIT: Rect = Rect::new(12.0, 18.0, 132.0, 132.0);
+
+    /// Clickable region for the title, artist and source chip.
+    #[must_use]
+    pub fn title_area(pill_width: f32) -> Rect {
+        Rect::new(
+            TEXT_X - 6.0,
+            8.0,
+            (pill_width - TEXT_X - 8.0).max(40.0),
+            SCRUBBER_Y - SCRUBBER_HIT_SLOP - 8.0,
+        )
+    }
 }
 
 /// Maps a point inside the expanded media pill to an action.
@@ -350,7 +411,13 @@ pub fn expanded_action_at(x: f32, y: f32, pill_width: f32) -> Option<MediaAction
     if hit(next) {
         return Some(MediaAction::Next);
     }
-    scrub_fraction(x, y, pill_width, false).map(MediaAction::Seek)
+    if let Some(fraction) = scrub_fraction(x, y, pill_width, false) {
+        return Some(MediaAction::Seek(fraction));
+    }
+    if expanded::ART_HIT.contains(x, y) || expanded::title_area(pill_width).contains(x, y) {
+        return Some(MediaAction::OpenApp);
+    }
+    None
 }
 
 /// Fraction along the scrubber for `x`. With `dragging`, any `y` is accepted
@@ -364,6 +431,21 @@ pub fn scrub_fraction(x: f32, y: f32, pill_width: f32, dragging: bool) -> Option
         && y >= bar.y - slop
         && y <= bar.bottom() + slop;
     (dragging || inside).then(|| ((x - bar.x) / bar.width).clamp(0.0, 1.0))
+}
+
+/// Fraction along the volume slider for `x`, or `None` when the point is
+/// outside the slider and its speaker button. With `dragging`, any `y` is
+/// accepted and `x` is clamped, so a drag can leave the row without stopping.
+/// Clicking the speaker itself yields 0 (mute).
+#[must_use]
+pub fn volume_fraction(x: f32, y: f32, pill_width: f32, dragging: bool) -> Option<f32> {
+    let track = expanded::volume_track(pill_width);
+    let (icon_x, center_y) = expanded::volume_icon_center(pill_width);
+    let slop = expanded::VOLUME_HIT_SLOP;
+    let inside = x >= icon_x - 14.0
+        && x <= track.right() + slop
+        && (center_y - slop..=center_y + slop).contains(&y);
+    (dragging || inside).then(|| ((x - track.x) / track.width).clamp(0.0, 1.0))
 }
 
 pub const BAR_COUNT: usize = 5;
@@ -672,9 +754,50 @@ mod tests {
             Some(MediaAction::Seek(fraction)) => assert!((fraction - 0.25).abs() < 1e-4),
             other => panic!("expected seek, got {other:?}"),
         }
-        // The art and empty space do nothing.
-        assert_eq!(expanded_action_at(40.0, 40.0, width), None);
+        // The art, title and source chip open the app. Empty space does nothing.
+        assert_eq!(
+            expanded_action_at(40.0, 40.0, width),
+            Some(MediaAction::OpenApp)
+        );
+        assert_eq!(
+            expanded_action_at(150.0, 30.0, width),
+            Some(MediaAction::OpenApp)
+        );
+        let chip = expanded::chip(width, "Spotify");
+        assert_eq!(
+            expanded_action_at(chip.x + 6.0, chip.y + 8.0, width),
+            Some(MediaAction::OpenApp)
+        );
         assert_eq!(expanded_action_at(380.0, 160.0, width), None);
+    }
+
+    #[test]
+    fn volume_slider_hit_testing() {
+        let width = 400.0;
+        let track = expanded::volume_track(width);
+        let somewhere = track.y + track.height * 0.5;
+
+        match volume_fraction(track.x + track.width * 0.3, somewhere, width, false) {
+            Some(fraction) => assert!((fraction - 0.3).abs() < 1e-4),
+            None => panic!("expected a volume fraction"),
+        }
+        // The speaker button mutes.
+        let (icon_x, _) = expanded::volume_icon_center(width);
+        assert_eq!(volume_fraction(icon_x, somewhere, width, false), Some(0.0));
+        // Away from the row, a press is not captured.
+        assert_eq!(
+            volume_fraction(track.x, somewhere - 40.0, width, false),
+            None
+        );
+        // A drag keeps steering and clamps at both ends.
+        assert_eq!(
+            volume_fraction(track.x - 80.0, -500.0, width, true),
+            Some(0.0)
+        );
+        assert_eq!(
+            volume_fraction(track.right() + 80.0, -500.0, width, true),
+            Some(1.0)
+        );
     }
 
     #[test]

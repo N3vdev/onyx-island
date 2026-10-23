@@ -230,6 +230,8 @@ pub struct MediaCard {
     pub accent: Option<[u8; 3]>,
     /// Scrubber position while the user drags it, 0..=1.
     pub scrub: Option<f32>,
+    /// System output volume, 0..=1, when it can be read.
+    pub volume: Option<f32>,
 }
 
 impl MediaCard {
@@ -800,6 +802,7 @@ mod tests {
             art: None,
             accent: None,
             scrub: None,
+            volume: None,
         }
     }
 

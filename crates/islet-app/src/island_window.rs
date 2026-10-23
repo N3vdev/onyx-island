@@ -5,22 +5,24 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 
 use crossbeam_channel::{unbounded, Receiver, RecvTimeoutError, Sender};
-use islet_audio::Loopback;
+use islet_audio::{Loopback, VolumeHandle};
 use islet_core::config::{IdleStyle, MonitorChoice, ScreenPosition};
 use islet_core::island::{
     arrange, reduce, AgentCard, AgentState, AlertLevel, ContentSnapshot, DictationCard,
     DictationPhase, Effect, IslandEvent, IslandState, LayoutTarget, MediaCard, NotificationCard,
     TimerKind,
 };
-use islet_core::media::{expanded_action_at, scrub_fraction, BarLevels, MediaAction, Timeline};
+use islet_core::media::{
+    expanded_action_at, scrub_fraction, volume_fraction, BarLevels, MediaAction, Timeline,
+};
 use islet_core::music::MusicFilter;
 use islet_core::{Config, Rect};
 use islet_media::{MediaCommand, MediaInfo, MediaService};
 use islet_render::{HitRegion, Renderer, RendererConfig};
 
 use crate::occlusion;
-use windows::core::{s, w, Result as WinResult};
-use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::core::{s, w, Result as WinResult, PCWSTR};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::Graphics::Dwm::DwmFlush;
 use windows::Win32::Graphics::Gdi::{
     CombineRgn, CreateRectRgn, CreateRoundRectRgn, DeleteObject, GetMonitorInfoW, MonitorFromPoint,
@@ -28,22 +30,28 @@ use windows::Win32::Graphics::Gdi::{
     MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, RGN_OR,
 };
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+use windows::Win32::System::Threading::{
+    AttachThreadInput, GetCurrentThreadId, OpenProcess, QueryFullProcessImageNameW,
+    PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
+};
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
 };
 use windows::Win32::UI::Shell::{
-    SHAppBarMessage, SHQueryUserNotificationState, ABM_NEW, ABM_REMOVE, ABN_FULLSCREENAPP,
-    APPBARDATA, QUNS_BUSY, QUNS_RUNNING_D3D_FULL_SCREEN,
+    SHAppBarMessage, SHQueryUserNotificationState, ShellExecuteW, ABM_NEW, ABM_REMOVE,
+    ABN_FULLSCREENAPP, APPBARDATA, QUNS_BUSY, QUNS_RUNNING_D3D_FULL_SCREEN,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DefWindowProcW, GetCursorPos, GetForegroundWindow, GetWindowLongPtrW, GetWindowRect, KillTimer,
-    PostMessageW, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, GWLP_USERDATA,
+    BringWindowToTop, DefWindowProcW, EnumWindows, GetCursorPos, GetForegroundWindow,
+    GetWindowLongPtrW, GetWindowLongW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
+    GetWindowThreadProcessId, IsIconic, IsWindowVisible, KillTimer, PostMessageW,
+    SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, GWLP_USERDATA,
     GWL_EXSTYLE, HTCLIENT, HTTRANSPARENT, HWND_TOPMOST, MA_NOACTIVATE, SWP_NOACTIVATE,
-    SWP_NOOWNERZORDER, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE, WINDOWPOS, WM_APP,
-    WM_CAPTURECHANGED, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_NCHITTEST, WM_SETTINGCHANGE, WM_TIMER,
-    WM_WINDOWPOSCHANGING, WS_EX_TRANSPARENT,
+    SWP_NOOWNERZORDER, SWP_NOZORDER, SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWNOACTIVATE,
+    SW_SHOWNORMAL, WINDOWPOS, WM_APP, WM_CAPTURECHANGED, WM_DISPLAYCHANGE, WM_DPICHANGED,
+    WM_ERASEBKGND, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_NCHITTEST,
+    WM_SETTINGCHANGE, WM_TIMER, WM_WINDOWPOSCHANGING, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
 };
 
 pub const WINDOW_LOGICAL_WIDTH: f32 = 440.0;
@@ -182,10 +190,12 @@ pub struct IslandHost {
     media_rx: Receiver<Option<MediaInfo>>,
     last_media: Option<MediaInfo>,
     loopback: Option<Loopback>,
+    volume: Option<VolumeHandle>,
     real_bars: bool,
     color_tint: bool,
     music_filter: MusicFilter,
     scrubbing: bool,
+    volume_dragging: bool,
     tuck_enabled: bool,
     window_events: Option<occlusion::WindowEvents>,
     occlusion_pending: bool,
@@ -223,6 +233,13 @@ impl IslandHost {
             .name("islet-render".to_owned())
             .spawn(move || render_thread(renderer_config, render_hit, render_bars, rx, notify))?;
         let (media_tx, media_rx) = unbounded();
+        let volume = match VolumeHandle::start() {
+            Ok(handle) => Some(handle),
+            Err(error) => {
+                tracing::warn!(%error, "could not start the volume thread");
+                None
+            }
+        };
 
         let mut host = Box::new(Self {
             hwnd,
@@ -263,10 +280,12 @@ impl IslandHost {
             media_rx,
             last_media: None,
             loopback: None,
+            volume,
             real_bars: config.media.real_bars,
             color_tint: config.media.color_tint,
             music_filter: music_filter(&config),
             scrubbing: false,
+            volume_dragging: false,
             tuck_enabled: config.general.tuck_behind_windows,
             window_events: None,
             occlusion_pending: false,
@@ -394,6 +413,14 @@ impl IslandHost {
                 }
                 Some(LRESULT(0))
             }
+            WM_MOUSEMOVE if self.volume_dragging => {
+                if let Some((x, y, width)) = self.media_point(lparam) {
+                    if let Some(fraction) = volume_fraction(x, y, width, true) {
+                        self.set_volume(fraction);
+                    }
+                }
+                Some(LRESULT(0))
+            }
             WM_MOUSEMOVE => {
                 self.track_mouse();
                 let inside = self.cursor_inside();
@@ -406,7 +433,7 @@ impl IslandHost {
             }
             WM_MOUSELEAVE => {
                 self.tracking_mouse = false;
-                if !self.scrubbing {
+                if !self.scrubbing && !self.volume_dragging {
                     self.dispatch(IslandEvent::HoverLeave);
                 }
                 Some(LRESULT(0))
@@ -421,6 +448,18 @@ impl IslandHost {
                             SetCapture(self.hwnd);
                         }
                         self.set_scrub(Some(fraction));
+                    } else if let Some(fraction) = self
+                        .state
+                        .media
+                        .as_ref()
+                        .and_then(|media| media.volume)
+                        .and_then(|_| volume_fraction(x, y, width, false))
+                    {
+                        self.volume_dragging = true;
+                        unsafe {
+                            SetCapture(self.hwnd);
+                        }
+                        self.set_volume(fraction);
                     }
                 }
                 Some(LRESULT(0))
@@ -428,6 +467,8 @@ impl IslandHost {
             WM_LBUTTONUP => {
                 if self.scrubbing {
                     self.finish_scrub(true);
+                } else if self.volume_dragging {
+                    self.finish_volume();
                 } else if let Some(action) = self
                     .media_point(lparam)
                     .and_then(|(x, y, width)| expanded_action_at(x, y, width))
@@ -441,6 +482,8 @@ impl IslandHost {
             WM_CAPTURECHANGED => {
                 if self.scrubbing {
                     self.finish_scrub(false);
+                } else if self.volume_dragging {
+                    self.finish_volume();
                 }
                 Some(LRESULT(0))
             }
@@ -622,6 +665,7 @@ impl IslandHost {
             .as_ref()
             .and_then(|media| media.scrub)
             .filter(|_| self.scrubbing);
+        let volume = self.volume.as_ref().and_then(VolumeHandle::read);
         let card = self.last_media.as_ref().map(|info| MediaCard {
             title: info.title.clone(),
             artist: info.artist.clone(),
@@ -636,6 +680,7 @@ impl IslandHost {
             art: info.art.clone(),
             accent: info.accent.filter(|_| self.color_tint),
             scrub,
+            volume,
         });
         self.dispatch(IslandEvent::SetMedia(card));
     }
@@ -714,9 +759,66 @@ impl IslandHost {
         }
     }
 
+    /// Moves the slider and the system volume together; the worker writes the
+    /// device on its own thread.
+    fn set_volume(&mut self, value: f32) {
+        let value = value.clamp(0.0, 1.0);
+        if self.demo.is_none() {
+            if let Some(handle) = &self.volume {
+                handle.set(value);
+            }
+        }
+        if let Some(mut media) = self.state.media.clone() {
+            if media.volume != Some(value) {
+                media.volume = Some(value);
+                self.dispatch(IslandEvent::SetMedia(Some(media)));
+            }
+        }
+    }
+
+    fn finish_volume(&mut self) {
+        self.volume_dragging = false;
+        unsafe {
+            let _ = ReleaseCapture();
+        }
+    }
+
+    /// Follows volume changes made elsewhere (media keys, the Windows mixer)
+    /// while the player is on screen. Nothing is polled while it is hidden.
+    fn sync_volume(&mut self) {
+        if self.volume_dragging || self.demo.is_some() {
+            return;
+        }
+        let Some(handle) = &self.volume else {
+            return;
+        };
+        if !self.state.expanded
+            || !matches!(
+                self.state.primary_card(),
+                Some(islet_core::ContentCard::Media(_))
+            )
+        {
+            return;
+        }
+        handle.refresh();
+        let Some(value) = handle.read() else {
+            return;
+        };
+        if let Some(mut media) = self.state.media.clone() {
+            if media.volume != Some(value) {
+                media.volume = Some(value);
+                self.dispatch(IslandEvent::SetMedia(Some(media)));
+            }
+        }
+    }
+
     /// Sends a transport command and updates the card optimistically, so
     /// the island reacts before the app reports back.
     fn media_action(&mut self, action: MediaAction) {
+        if action == MediaAction::OpenApp {
+            self.open_current_media_app();
+            return;
+        }
         let Some(mut media) = self.state.media.clone() else {
             return;
         };
@@ -740,12 +842,19 @@ impl IslandHost {
                 timeline.sampled_at = now;
                 MediaCommand::Seek(timeline.position)
             }
+            MediaAction::OpenApp => unreachable!(),
         };
         media.scrub = None;
         if let Some(service) = &self.media {
             service.send(command);
         }
         self.dispatch(IslandEvent::SetMedia(Some(media)));
+    }
+
+    fn open_current_media_app(&self) {
+        if let Some(info) = &self.last_media {
+            open_media_source(&info.app_id, &info.source);
+        }
     }
 
     /// Runs the poll timer only while something needs it, so an idle island
@@ -999,6 +1108,7 @@ impl IslandHost {
                 });
             }
         }
+        self.sync_volume();
         self.update_poll_timer();
     }
 
@@ -1616,6 +1726,7 @@ fn demo_media() -> MediaCard {
         art: None,
         accent: None,
         scrub: None,
+        volume: Some(0.66),
     }
 }
 
@@ -1651,4 +1762,201 @@ fn demo_dictation() -> DictationCard {
         level: 0.72,
         phase: DictationPhase::Recording,
     }
+}
+
+fn open_media_source(app_id: &str, source: &str) {
+    if app_id.is_empty() && source.is_empty() {
+        return;
+    }
+
+    if try_activate_window(app_id, source) {
+        return;
+    }
+
+    let lower_app = app_id.to_ascii_lowercase();
+    let lower_source = source.to_ascii_lowercase();
+
+    if (lower_app.contains("spotify") || lower_source.contains("spotify"))
+        && shell_execute("spotify:")
+    {
+        return;
+    }
+
+    if app_id.contains('!') {
+        let uri = format!("shell:AppsFolder\\{app_id}");
+        if shell_execute(&uri) {
+            return;
+        }
+    }
+
+    if (app_id.ends_with(".exe") || app_id.contains('\\') || app_id.contains('/'))
+        && shell_execute(app_id)
+    {
+        return;
+    }
+
+    if !app_id.is_empty() {
+        let uri = format!("shell:AppsFolder\\{app_id}");
+        if shell_execute(&uri) {
+            return;
+        }
+        let _ = shell_execute(app_id);
+    }
+}
+
+fn shell_execute(target: &str) -> bool {
+    let wide: Vec<u16> = target.encode_utf16().chain(std::iter::once(0)).collect();
+    let result = unsafe {
+        ShellExecuteW(
+            None,
+            w!("open"),
+            PCWSTR(wide.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    result.0 as usize > 32
+}
+
+struct WindowFinder {
+    needles: Vec<String>,
+    found: Option<HWND>,
+}
+
+fn try_activate_window(app_id: &str, source: &str) -> bool {
+    let mut needles = Vec::new();
+    let lower_source = source.to_ascii_lowercase();
+    let lower_app = app_id.to_ascii_lowercase();
+
+    if !lower_source.is_empty() {
+        needles.push(lower_source.clone());
+    }
+
+    let base = lower_app.rsplit(['\\', '/']).next().unwrap_or(&lower_app);
+    let base = base.split('!').next().unwrap_or(base);
+    let base = base.split('_').next().unwrap_or(base);
+    let base = base.strip_suffix(".exe").unwrap_or(base);
+    if !base.is_empty() && !needles.iter().any(|n| n == base) {
+        needles.push(base.to_owned());
+    }
+
+    if (lower_app.contains("spotify") || lower_source.contains("spotify"))
+        && !needles.iter().any(|n| n == "spotify")
+    {
+        needles.push("spotify".to_owned());
+    }
+
+    if needles.is_empty() {
+        return false;
+    }
+
+    let mut finder = WindowFinder {
+        needles,
+        found: None,
+    };
+
+    unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> windows::core::BOOL {
+        let finder = &mut *(lparam.0 as *mut WindowFinder);
+        if is_candidate_window(hwnd, &finder.needles) {
+            finder.found = Some(hwnd);
+            return false.into();
+        }
+        true.into()
+    }
+
+    unsafe {
+        let _ = EnumWindows(
+            Some(enum_proc),
+            LPARAM(std::ptr::addr_of_mut!(finder) as isize),
+        );
+    }
+
+    if let Some(hwnd) = finder.found {
+        unsafe {
+            if IsIconic(hwnd).as_bool() {
+                let _ = ShowWindow(hwnd, SW_RESTORE);
+            } else {
+                let _ = ShowWindow(hwnd, SW_SHOW);
+            }
+
+            let foreground = GetForegroundWindow();
+            let foreground_thread = GetWindowThreadProcessId(foreground, None);
+            let target_thread = GetWindowThreadProcessId(hwnd, None);
+            let current_thread = GetCurrentThreadId();
+
+            if foreground_thread != 0 && foreground_thread != target_thread {
+                let _ = AttachThreadInput(current_thread, foreground_thread, true);
+                let _ = AttachThreadInput(current_thread, target_thread, true);
+                let _ = SetForegroundWindow(hwnd);
+                let _ = BringWindowToTop(hwnd);
+                let _ = AttachThreadInput(current_thread, target_thread, false);
+                let _ = AttachThreadInput(current_thread, foreground_thread, false);
+            } else {
+                let _ = SetForegroundWindow(hwnd);
+            }
+        }
+        return true;
+    }
+
+    false
+}
+
+unsafe fn is_candidate_window(hwnd: HWND, needles: &[String]) -> bool {
+    if !IsWindowVisible(hwnd).as_bool() && !IsIconic(hwnd).as_bool() {
+        return false;
+    }
+
+    let mut pid = 0;
+    GetWindowThreadProcessId(hwnd, Some(&mut pid));
+    if pid == 0 || pid == std::process::id() {
+        return false;
+    }
+
+    let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+    if ex_style & WS_EX_TOOLWINDOW.0 != 0 {
+        return false;
+    }
+
+    // 1. Process image name.
+    if let Ok(process) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+        let mut path_buf = [0u16; 1024];
+        let mut size = path_buf.len() as u32;
+        let success = QueryFullProcessImageNameW(
+            process,
+            PROCESS_NAME_FORMAT(0),
+            windows::core::PWSTR(path_buf.as_mut_ptr()),
+            &mut size,
+        )
+        .is_ok();
+        let _ = CloseHandle(process);
+
+        if success && size > 0 {
+            let path = String::from_utf16_lossy(&path_buf[..size as usize]).to_ascii_lowercase();
+            let file_name = path.rsplit(['\\', '/']).next().unwrap_or(&path);
+            for needle in needles {
+                if file_name.contains(needle) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    // 2. Window title.
+    let title_len = GetWindowTextLengthW(hwnd);
+    if title_len > 0 {
+        let mut title_buf = vec![0u16; (title_len + 1) as usize];
+        let copied = GetWindowTextW(hwnd, &mut title_buf);
+        if copied > 0 {
+            let title =
+                String::from_utf16_lossy(&title_buf[..copied as usize]).to_ascii_lowercase();
+            for needle in needles {
+                if title.contains(needle) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
 }

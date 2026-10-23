@@ -50,10 +50,10 @@ use windows::Win32::Graphics::DirectWrite::{
     DWriteCreateFactory, IDWriteFactory, IDWriteFontCollection, IDWriteTextFormat,
     IDWriteTextLayout, DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL,
     DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT, DWRITE_FONT_WEIGHT_BOLD,
-    DWRITE_FONT_WEIGHT_DEMI_BOLD, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
-    DWRITE_PARAGRAPH_ALIGNMENT_NEAR, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING,
-    DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_CHARACTER,
-    DWRITE_WORD_WRAPPING_NO_WRAP,
+    DWRITE_FONT_WEIGHT_DEMI_BOLD, DWRITE_FONT_WEIGHT_MEDIUM, DWRITE_FONT_WEIGHT_NORMAL,
+    DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_NEAR,
+    DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_ALIGNMENT_TRAILING,
+    DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_CHARACTER, DWRITE_WORD_WRAPPING_NO_WRAP,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
@@ -82,7 +82,6 @@ const HAIRLINE_COLOR: D2D1_COLOR_F = D2D1_COLOR_F {
 const BAR_LEVELS_MAX_AGE_MS: u64 = 250;
 /// Album-art brushes kept around (current track plus a transition partner).
 const ART_CACHE_SIZE: usize = 3;
-const DEFAULT_ACCENT_TEXT: [u8; 3] = [146, 153, 172];
 
 /// How long a hidden island keeps its D3D/D2D device before releasing it.
 const GRAPHICS_RELEASE_DELAY: f64 = 15.0;
@@ -1533,38 +1532,23 @@ impl Gfx {
         let text_w = (width - text_x - 20.0).max(40.0);
         self.draw_text(
             &media.title,
-            FormatId::Title,
+            FormatId::MediaTitle,
             text_x,
-            20.0,
+            expanded::TITLE_Y,
             text_w,
-            24.0,
+            expanded::TITLE_HEIGHT,
             color([255, 255, 255], 0.98 * alpha),
         )?;
         self.draw_text(
             &media.artist,
-            FormatId::Sub,
+            FormatId::MediaArtist,
             text_x,
-            45.0,
+            expanded::ARTIST_Y,
             text_w,
-            18.0,
+            expanded::ARTIST_HEIGHT,
             color([177, 185, 204], 0.92 * alpha),
         )?;
-        self.draw_text(
-            &media.source.to_uppercase(),
-            FormatId::Tiny,
-            text_x,
-            66.0,
-            text_w,
-            14.0,
-            color(
-                if media.accent.is_some() {
-                    accent
-                } else {
-                    DEFAULT_ACCENT_TEXT
-                },
-                0.95 * alpha,
-            ),
-        )?;
+        self.draw_source_chip(&media.source, media.accent.is_some(), accent, width, alpha)?;
 
         if let Some(timeline) = media.timeline.filter(|timeline| timeline.duration > 0.0) {
             let bar = expanded::scrubber(width);
@@ -1593,7 +1577,7 @@ impl Gfx {
                 self.fill_circle(
                     bar.x + bar.width * progress,
                     bar.y + bar.height * 0.5,
-                    6.0,
+                    5.5,
                     color([255, 255, 255], alpha),
                 )?;
             }
@@ -1602,18 +1586,18 @@ impl Gfx {
                 &format_clock(position),
                 FormatId::Tiny,
                 bar.x,
-                bar.bottom() + 5.0,
+                expanded::TIMES_Y,
                 60.0,
-                12.0,
+                expanded::TIMES_HEIGHT,
                 label,
             )?;
             self.draw_text(
                 &format!("-{}", format_clock(timeline.duration - position)),
                 FormatId::TinyRight,
                 bar.right() - 60.0,
-                bar.bottom() + 5.0,
+                expanded::TIMES_Y,
                 60.0,
-                12.0,
+                expanded::TIMES_HEIGHT,
                 label,
             )?;
         }
@@ -1634,7 +1618,190 @@ impl Gfx {
             alpha,
         )?;
         self.draw_transport(next.0, next.1, TransportIcon::Next, accent, alpha)?;
+
+        if let Some(volume) = media.volume {
+            self.draw_volume(volume, width, alpha)?;
+        }
         Ok(())
+    }
+
+    /// Source name in a soft pill with an "open" arrow: pressing it brings the
+    /// playing app to the front.
+    unsafe fn draw_source_chip(
+        &mut self,
+        source: &str,
+        tinted: bool,
+        accent: [u8; 3],
+        pill_width: f32,
+        alpha: f32,
+    ) -> RenderResult<()> {
+        if source.is_empty() {
+            return Ok(());
+        }
+        let chip = expanded::chip(pill_width, source);
+        let (fill, ink) = if tinted {
+            (color(accent, 0.14 * alpha), color(accent, 0.96 * alpha))
+        } else {
+            (
+                color([255, 255, 255], 0.065 * alpha),
+                color([188, 196, 214], 0.92 * alpha),
+            )
+        };
+        self.fill_round_rect(
+            chip.x,
+            chip.y,
+            chip.width,
+            chip.height,
+            chip.height * 0.5,
+            fill,
+        )?;
+        self.draw_text(
+            source,
+            FormatId::Chip,
+            chip.x + 11.0,
+            chip.y + 4.0,
+            (chip.width - 32.0).max(10.0),
+            14.0,
+            ink,
+        )?;
+        // A small north-east arrow, so the chip reads as "opens the app".
+        let ax = chip.right() - 13.0;
+        let ay = chip.center().1;
+        self.set_color(ink);
+        self.dc.DrawLine(
+            Vector2 {
+                X: ax - 3.0,
+                Y: ay + 3.0,
+            },
+            Vector2 {
+                X: ax + 3.0,
+                Y: ay - 3.0,
+            },
+            &self.brush,
+            1.3,
+            None,
+        );
+        self.dc.DrawLine(
+            Vector2 {
+                X: ax + 0.2,
+                Y: ay - 3.0,
+            },
+            Vector2 {
+                X: ax + 3.0,
+                Y: ay - 3.0,
+            },
+            &self.brush,
+            1.3,
+            None,
+        );
+        self.dc.DrawLine(
+            Vector2 {
+                X: ax + 3.0,
+                Y: ay - 3.0,
+            },
+            Vector2 {
+                X: ax + 3.0,
+                Y: ay + 0.2,
+            },
+            &self.brush,
+            1.3,
+            None,
+        );
+        Ok(())
+    }
+
+    /// Speaker button and a slim volume slider. At zero the waves turn into a
+    /// cross, so mute reads at a glance.
+    unsafe fn draw_volume(&mut self, volume: f32, pill_width: f32, alpha: f32) -> RenderResult<()> {
+        let track = expanded::volume_track(pill_width);
+        let (cx, cy) = expanded::volume_icon_center(pill_width);
+        let ink = color([220, 225, 238], 0.72 * alpha);
+        let volume = volume.clamp(0.0, 1.0);
+
+        self.fill_polygon(
+            &[
+                Vector2 {
+                    X: cx - 7.0,
+                    Y: cy - 3.4,
+                },
+                Vector2 {
+                    X: cx - 2.5,
+                    Y: cy - 3.4,
+                },
+                Vector2 {
+                    X: cx + 2.5,
+                    Y: cy - 7.2,
+                },
+                Vector2 {
+                    X: cx + 2.5,
+                    Y: cy + 7.2,
+                },
+                Vector2 {
+                    X: cx - 2.5,
+                    Y: cy + 3.4,
+                },
+                Vector2 {
+                    X: cx - 7.0,
+                    Y: cy + 3.4,
+                },
+            ],
+            ink,
+        )?;
+        if volume > 0.005 {
+            self.stroke_arc(cx + 2.5, cy, 5.2, -52.0, 52.0, 1.4, ink)?;
+            self.stroke_arc(cx + 2.5, cy, 8.8, -46.0, 46.0, 1.4, ink)?;
+        } else {
+            self.set_color(ink);
+            self.dc.DrawLine(
+                Vector2 {
+                    X: cx + 7.0,
+                    Y: cy - 3.0,
+                },
+                Vector2 {
+                    X: cx + 12.0,
+                    Y: cy + 3.0,
+                },
+                &self.brush,
+                1.5,
+                None,
+            );
+            self.dc.DrawLine(
+                Vector2 {
+                    X: cx + 12.0,
+                    Y: cy - 3.0,
+                },
+                Vector2 {
+                    X: cx + 7.0,
+                    Y: cy + 3.0,
+                },
+                &self.brush,
+                1.5,
+                None,
+            );
+        }
+
+        self.fill_round_rect(
+            track.x,
+            track.y,
+            track.width,
+            track.height,
+            track.height * 0.5,
+            color([255, 255, 255], 0.16 * alpha),
+        )?;
+        self.fill_round_rect(
+            track.x,
+            track.y,
+            (track.width * volume).max(track.height),
+            track.height,
+            track.height * 0.5,
+            color([255, 255, 255], 0.86 * alpha),
+        )?;
+        self.fill_circle(
+            track.x + track.width * volume,
+            track.y + track.height * 0.5,
+            4.0,
+            color([255, 255, 255], 0.96 * alpha),
+        )
     }
 
     /// Album art clipped to a rounded rect, or a tinted placeholder.
@@ -1745,30 +1912,30 @@ impl Gfx {
                 self.set_color(color([220, 225, 238], 0.72 * alpha));
                 self.dc.DrawLine(
                     Vector2 {
-                        X: x + 5.0,
-                        Y: y - 7.0,
+                        X: x + 5.5,
+                        Y: y - 8.0,
                     },
-                    Vector2 { X: x - 2.0, Y: y },
+                    Vector2 { X: x - 2.5, Y: y },
                     &self.brush,
-                    2.0,
+                    2.2,
                     None,
                 );
                 self.dc.DrawLine(
-                    Vector2 { X: x - 2.0, Y: y },
+                    Vector2 { X: x - 2.5, Y: y },
                     Vector2 {
-                        X: x + 5.0,
-                        Y: y + 7.0,
+                        X: x + 5.5,
+                        Y: y + 8.0,
                     },
                     &self.brush,
-                    2.0,
+                    2.2,
                     None,
                 );
                 self.fill_round_rect(
-                    x + 7.0,
-                    y - 7.0,
-                    2.0,
-                    14.0,
-                    1.0,
+                    x + 7.5,
+                    y - 8.0,
+                    2.2,
+                    16.0,
+                    1.1,
                     color([220, 225, 238], 0.72 * alpha),
                 )?;
             }
@@ -1776,85 +1943,85 @@ impl Gfx {
                 self.set_color(color([220, 225, 238], 0.72 * alpha));
                 self.dc.DrawLine(
                     Vector2 {
-                        X: x - 5.0,
-                        Y: y - 7.0,
+                        X: x - 5.5,
+                        Y: y - 8.0,
                     },
-                    Vector2 { X: x + 2.0, Y: y },
+                    Vector2 { X: x + 2.5, Y: y },
                     &self.brush,
-                    2.0,
+                    2.2,
                     None,
                 );
                 self.dc.DrawLine(
-                    Vector2 { X: x + 2.0, Y: y },
+                    Vector2 { X: x + 2.5, Y: y },
                     Vector2 {
-                        X: x - 5.0,
-                        Y: y + 7.0,
+                        X: x - 5.5,
+                        Y: y + 8.0,
                     },
                     &self.brush,
-                    2.0,
+                    2.2,
                     None,
                 );
                 self.fill_round_rect(
-                    x - 9.0,
-                    y - 7.0,
-                    2.0,
-                    14.0,
-                    1.0,
+                    x - 9.7,
+                    y - 8.0,
+                    2.2,
+                    16.0,
+                    1.1,
                     color([220, 225, 238], 0.72 * alpha),
                 )?;
             }
             TransportIcon::PlayPause(playing) => {
-                self.fill_circle(x, y, 14.0, color([255, 255, 255], 0.12 * alpha))?;
+                self.fill_circle(x, y, 16.0, color([255, 255, 255], 0.12 * alpha))?;
                 if playing {
                     self.fill_round_rect(
-                        x - 4.0,
-                        y - 6.0,
-                        3.0,
-                        12.0,
-                        1.5,
+                        x - 4.6,
+                        y - 7.0,
+                        3.4,
+                        14.0,
+                        1.7,
                         color([255, 255, 255], 0.9 * alpha),
                     )?;
                     self.fill_round_rect(
-                        x + 1.0,
-                        y - 6.0,
-                        3.0,
-                        12.0,
-                        1.5,
+                        x + 1.2,
+                        y - 7.0,
+                        3.4,
+                        14.0,
+                        1.7,
                         color([255, 255, 255], 0.9 * alpha),
                     )?;
                 } else {
                     self.set_color(color([255, 255, 255], 0.9 * alpha));
                     self.dc.DrawLine(
                         Vector2 {
-                            X: x - 4.0,
-                            Y: y - 6.0,
+                            X: x - 4.5,
+                            Y: y - 7.0,
                         },
-                        Vector2 { X: x + 6.0, Y: y },
+                        Vector2 { X: x + 7.0, Y: y },
                         &self.brush,
-                        2.0,
+                        2.2,
                         None,
                     );
                     self.dc.DrawLine(
-                        Vector2 { X: x + 6.0, Y: y },
+                        Vector2 { X: x + 7.0, Y: y },
                         Vector2 {
-                            X: x - 4.0,
-                            Y: y + 6.0,
+                            X: x - 4.5,
+                            Y: y + 7.0,
                         },
                         &self.brush,
-                        2.0,
+                        2.2,
                         None,
                     );
                     self.dc.DrawLine(
                         Vector2 {
-                            X: x - 4.0,
-                            Y: y + 6.0,
+                            X: x - 4.5,
+                            Y: y + 7.0,
                         },
                         Vector2 {
-                            X: x - 4.0,
-                            Y: y - 6.0,
+                            X: x - 4.5,
+                            Y: y - 7.0,
                         },
                         &self.brush,
-                        2.0,
+                        2.2,
                         None,
                     );
                 }
@@ -2276,6 +2443,57 @@ impl Gfx {
         Ok(())
     }
 
+    /// Fills a closed polygon. Used for glyphs that are clearer as outlines
+    /// than as rectangles (the speaker cone).
+    unsafe fn fill_polygon(&mut self, points: &[Vector2], color: D2D1_COLOR_F) -> RenderResult<()> {
+        if points.len() < 3 || color.a <= 0.001 {
+            return Ok(());
+        }
+        let geometry = self.factory.CreatePathGeometry()?;
+        let sink = geometry.Open()?;
+        sink.SetFillMode(D2D1_FILL_MODE_WINDING);
+        sink.BeginFigure(points[0], D2D1_FIGURE_BEGIN_FILLED);
+        sink.AddLines(&points[1..]);
+        sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+        sink.Close()?;
+        self.set_color(color);
+        self.dc.FillGeometry(&geometry, &self.brush, None);
+        Ok(())
+    }
+
+    /// Draws a circular arc as short segments, for the speaker's sound waves.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn stroke_arc(
+        &mut self,
+        cx: f32,
+        cy: f32,
+        radius: f32,
+        from_deg: f32,
+        to_deg: f32,
+        width: f32,
+        color: D2D1_COLOR_F,
+    ) -> RenderResult<()> {
+        if radius <= 0.0 || color.a <= 0.001 {
+            return Ok(());
+        }
+        self.set_color(color);
+        const STEPS: usize = 8;
+        let mut previous = None;
+        for step in 0..=STEPS {
+            let t = step as f32 / STEPS as f32;
+            let angle = (from_deg + (to_deg - from_deg) * t).to_radians();
+            let point = Vector2 {
+                X: cx + radius * angle.cos(),
+                Y: cy + radius * angle.sin(),
+            };
+            if let Some(previous) = previous {
+                self.dc.DrawLine(previous, point, &self.brush, width, None);
+            }
+            previous = Some(point);
+        }
+        Ok(())
+    }
+
     unsafe fn present(&mut self) -> RenderResult<()> {
         self.swap_chain
             .Present(0, DXGI_PRESENT(0))
@@ -2343,8 +2561,11 @@ enum FormatId {
     CompactSub,
     Title,
     Sub,
+    MediaTitle,
+    MediaArtist,
     Tiny,
     TinyRight,
+    Chip,
     Tucked,
     Bubble,
     Timer,
@@ -2355,8 +2576,11 @@ struct TextFormats {
     compact_sub: IDWriteTextFormat,
     title: IDWriteTextFormat,
     sub: IDWriteTextFormat,
+    media_title: IDWriteTextFormat,
+    media_artist: IDWriteTextFormat,
     tiny: IDWriteTextFormat,
     tiny_right: IDWriteTextFormat,
+    chip: IDWriteTextFormat,
     tucked: IDWriteTextFormat,
     bubble: IDWriteTextFormat,
     timer: IDWriteTextFormat,
@@ -2393,6 +2617,20 @@ impl TextFormats {
                 DWRITE_TEXT_ALIGNMENT_LEADING,
                 DWRITE_PARAGRAPH_ALIGNMENT_NEAR,
             )?,
+            media_title: create_format(
+                factory,
+                17.0,
+                DWRITE_FONT_WEIGHT_DEMI_BOLD,
+                DWRITE_TEXT_ALIGNMENT_LEADING,
+                DWRITE_PARAGRAPH_ALIGNMENT_NEAR,
+            )?,
+            media_artist: create_format(
+                factory,
+                12.0,
+                DWRITE_FONT_WEIGHT_NORMAL,
+                DWRITE_TEXT_ALIGNMENT_LEADING,
+                DWRITE_PARAGRAPH_ALIGNMENT_NEAR,
+            )?,
             tiny: create_format(
                 factory,
                 9.0,
@@ -2405,6 +2643,13 @@ impl TextFormats {
                 9.0,
                 DWRITE_FONT_WEIGHT_NORMAL,
                 DWRITE_TEXT_ALIGNMENT_TRAILING,
+                DWRITE_PARAGRAPH_ALIGNMENT_NEAR,
+            )?,
+            chip: create_format(
+                factory,
+                11.0,
+                DWRITE_FONT_WEIGHT_MEDIUM,
+                DWRITE_TEXT_ALIGNMENT_LEADING,
                 DWRITE_PARAGRAPH_ALIGNMENT_NEAR,
             )?,
             tucked: create_format(
@@ -2437,8 +2682,11 @@ impl TextFormats {
             FormatId::CompactSub => &self.compact_sub,
             FormatId::Title => &self.title,
             FormatId::Sub => &self.sub,
+            FormatId::MediaTitle => &self.media_title,
+            FormatId::MediaArtist => &self.media_artist,
             FormatId::Tiny => &self.tiny,
             FormatId::TinyRight => &self.tiny_right,
+            FormatId::Chip => &self.chip,
             FormatId::Tucked => &self.tucked,
             FormatId::Bubble => &self.bubble,
             FormatId::Timer => &self.timer,
