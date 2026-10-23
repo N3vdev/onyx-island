@@ -572,23 +572,45 @@ pub fn show(app: &mut SettingsApp, ui: &mut egui::Ui) {
             app,
             ui,
             HotkeyTarget::PushToTalk,
-            "Push to talk",
-            "Hold to record, release to insert. Tap twice to lock it on.",
+            "Hotkey",
+            "Hold to speak, release to insert. Press Esc while recording to cancel.",
         );
         divider(ui);
-        hotkey_row(
-            app,
+        row(
             ui,
-            HotkeyTarget::HandsFree,
-            "Hands-free",
-            "Press once to start, again to stop. Esc cancels any recording.",
+            "Hands-free mode",
+            "Use a second hotkey that starts recording on one press and stops it on the next.",
+            |ui| {
+                toggle(
+                    ui,
+                    &mut app.config.dictation.hands_free_enabled,
+                    "Hands-free mode",
+                );
+            },
         );
+        if app.config.dictation.hands_free_enabled {
+            divider(ui);
+            hotkey_row(
+                app,
+                ui,
+                HotkeyTarget::HandsFree,
+                "Hands-free hotkey",
+                "Press once to start, press again to stop. Esc cancels.",
+            );
+        } else if app
+            .dictation_ui
+            .capture
+            .as_ref()
+            .is_some_and(|capture| capture.target == HotkeyTarget::HandsFree)
+        {
+            app.dictation_ui.capture = None;
+        }
         if let Some(error) = &app.dictation_ui.capture_error {
             ui.label(RichText::new(error).small().color(DANGER));
         }
-        let nothing_set = app.config.dictation.push_to_talk.trim().is_empty()
-            && app.config.dictation.hands_free.trim().is_empty();
-        if nothing_set {
+        let hands_free_usable = app.config.dictation.hands_free_enabled
+            && !app.config.dictation.hands_free.trim().is_empty();
+        if app.config.dictation.push_to_talk.trim().is_empty() && !hands_free_usable {
             ui.label(
                 RichText::new("No hotkey is set, so dictation can't be started.")
                     .small()

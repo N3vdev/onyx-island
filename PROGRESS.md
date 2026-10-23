@@ -969,3 +969,28 @@ real microphone, nor in Notepad/VS Code/Chrome/Windows Terminal (see
   could not be clicked by automation (its logic is unit-tested). A later
   automated run was disrupted when focus moved to another window while keys
   were being sent, so it did not re-confirm the final text in the test box.
+
+## Simpler hotkey model (user request, 2026-10-23)
+
+- **One hotkey, hold only.** The main hotkey is now just "Hotkey": hold to
+  speak, release to insert. The tap-twice-to-lock path is gone (two quick taps
+  are just two discarded taps). Config key stays `dictation.push_to_talk`.
+- **Hands-free is a toggle.** `dictation.hands_free_enabled` (default off). When
+  on, Settings shows a second "Hands-free hotkey" (press to start, press again
+  to stop); when off, that hotkey is not even installed in the keyboard hook.
+  Existing configs get the toggle off. The hold-then-press-the-hands-free-key
+  upgrade still works while it is on.
+- **Esc cancels with a message.** Esc while recording (including "Warming up")
+  discards the audio and shows a "Stopped" pill. It has its own action
+  (`Action::Cancel`); accidental taps and "this was another shortcut" still
+  discard silently.
+- **Notices take over the pill.** A transient notice used to be squeezed into
+  the small satellite bubble while music played (an unreadable "i"). It now
+  replaces the pill for its few seconds, and info-level notices ("Stopped")
+  last 2.5 s instead of 4.
+- Verified with the real keyboard hook in an isolated config directory (the
+  user's config was untouched): hold shows "Warming up..." then the recording
+  pill, Esc swaps it for "Stopped / Islet", nothing is inserted, and the music
+  pill returns. Tests: hotkey 35, island 127 (core).
+- Note: Esc is only intercepted while recording, as before; pressing it during
+  "transcribing" does nothing.

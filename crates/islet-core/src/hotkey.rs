@@ -27,8 +27,6 @@ pub const VK_RWIN: u16 = 0x5C;
 
 /// A press shorter than this is an accidental tap, not a dictation.
 pub const MIN_HOLD_SECONDS: f64 = 0.25;
-/// Two taps within this window start hands-free dictation.
-pub const DOUBLE_TAP_SECONDS: f64 = 0.4;
 
 /// Which side of the keyboard a modifier must be pressed on.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -518,12 +516,17 @@ impl fmt::Display for Combo {
 pub enum Action {
     /// Begin recording.
     Start,
-    /// A hold or double-tap turned into hands-free recording.
+    /// A hold turned into hands-free recording (or the hands-free hotkey
+    /// started one).
     EnterHandsFree,
     /// Finish: transcribe and insert.
     Stop,
-    /// Throw the recording away.
+    /// Throw the recording away without a word: an accidental tap, or the
+    /// press turned out to be part of another shortcut.
     Discard,
+    /// The user pressed Esc to throw the recording away. Same effect as
+    /// `Discard`, but worth telling them about.
+    Cancel,
     /// Send a harmless key so Windows does not open the Start menu when the
     /// Win key is released.
     SuppressStartMenu,
@@ -560,7 +563,6 @@ enum Phase {
     /// The push-to-talk combo is held and recording.
     Ptt {
         since: f64,
-        double_tap: bool,
     },
     HandsFree,
     /// A dictation ended or was interrupted; ignore keys until all are up.
@@ -590,7 +592,6 @@ pub struct HotkeyFsm {
     /// Keys whose key-up must also be swallowed.
     swallowed: [u16; 4],
     phase: Phase,
-    last_tap_release: f64,
 }
 
 impl HotkeyFsm {
@@ -605,7 +606,6 @@ impl HotkeyFsm {
             key_count: 0,
             swallowed: [0; 4],
             phase: Phase::Idle,
-            last_tap_release: f64::NEG_INFINITY,
         }
     }
 
@@ -748,7 +748,7 @@ impl HotkeyFsm {
 
         let recording = matches!(self.phase, Phase::Ptt { .. } | Phase::HandsFree);
         if vk == VK_ESCAPE && recording {
-            out.push(Action::Discard);
+            out.push(Action::Cancel);
             out.swallow = true;
             self.swallow_release_of(vk);
             self.finish();
@@ -760,11 +760,7 @@ impl HotkeyFsm {
                 if self.hands_free_pressed(vk) {
                     self.begin_hands_free(vk, &mut out);
                 } else if self.push_to_talk_triggered(vk) {
-                    let double_tap = now - self.last_tap_release <= DOUBLE_TAP_SECONDS;
-                    self.phase = Phase::Ptt {
-                        since: now,
-                        double_tap,
-                    };
+                    self.phase = Phase::Ptt { since: now };
                     out.push(Action::Start);
                     if self
                         .push_to_talk
@@ -830,7 +826,7 @@ impl HotkeyFsm {
         }
 
         match self.phase {
-            Phase::Ptt { since, double_tap } => {
+            Phase::Ptt { since } => {
                 let combo_still_held = self.push_to_talk.is_some_and(|combo| {
                     combo.modifiers.matches(self.modifier_keys)
                         && combo.key.is_none_or(|key| self.is_held(key))
@@ -838,20 +834,15 @@ impl HotkeyFsm {
                 if combo_still_held {
                     return out;
                 }
+                // Hold to speak: a real hold ends with a Stop; a quick tap is
+                // an accident and is dropped silently.
                 let held_for = now - since;
-                if held_for >= MIN_HOLD_SECONDS {
-                    out.push(Action::Stop);
-                    self.last_tap_release = f64::NEG_INFINITY;
-                    self.finish();
-                } else if double_tap {
-                    self.phase = Phase::HandsFree;
-                    out.push(Action::EnterHandsFree);
-                    self.last_tap_release = f64::NEG_INFINITY;
+                out.push(if held_for >= MIN_HOLD_SECONDS {
+                    Action::Stop
                 } else {
-                    out.push(Action::Discard);
-                    self.last_tap_release = now;
-                    self.finish();
-                }
+                    Action::Discard
+                });
+                self.finish();
             }
             Phase::Blocked => {
                 if self.nothing_held() {
@@ -977,34 +968,41 @@ mod tests {
     }
 
     #[test]
-    fn double_tap_enters_hands_free_and_the_combo_stops_it() {
+    fn push_to_talk_is_hold_only_so_taps_never_lock_it_on() {
         let mut fsm = fsm();
-        press(&mut fsm, &[CTRL, WIN], 1.0);
-        release(&mut fsm, &[WIN, CTRL], 1.1);
+        // Two quick taps in a row: each is dropped, neither starts hands-free.
+        for t in [1.0, 1.3] {
+            press(&mut fsm, &[CTRL, WIN], t);
+            let up = release(&mut fsm, &[WIN, CTRL], t + 0.08);
+            assert_eq!(all(&up), [Action::Discard]);
+            assert_eq!(fsm.state(), HotkeyState::Idle);
+        }
+    }
 
-        // Second tap within the window.
-        let second = press(&mut fsm, &[CTRL, WIN], 1.3);
-        assert_eq!(all(&second), [Action::Start, Action::SuppressStartMenu]);
-        let up = release(&mut fsm, &[WIN, CTRL], 1.4);
-        assert_eq!(all(&up), [Action::EnterHandsFree]);
+    #[test]
+    fn the_hands_free_hotkey_toggles_on_its_own() {
+        let mut fsm = HotkeyFsm::from_strings("Ctrl+Win", "Ctrl+Alt+H");
+        press(&mut fsm, &[CTRL, VK_LMENU], 1.0);
+        let on = press(&mut fsm, &[0x48], 1.1);
+        assert_eq!(all(&on), [Action::Start, Action::EnterHandsFree]);
+        release(&mut fsm, &[0x48, VK_LMENU, CTRL], 1.2);
         assert_eq!(fsm.state(), HotkeyState::Recording { hands_free: true });
-
-        // Ctrl+Win+Space stops it.
-        press(&mut fsm, &[CTRL, WIN], 5.0);
-        let stop = press(&mut fsm, &[VK_SPACE], 5.1);
-        assert_eq!(all(&stop), [Action::Stop]);
-        assert!(stop[0].swallow);
+        press(&mut fsm, &[CTRL, VK_LMENU], 5.0);
+        assert_eq!(all(&press(&mut fsm, &[0x48], 5.1)), [Action::Stop]);
         assert_eq!(fsm.state(), HotkeyState::Idle);
     }
 
     #[test]
-    fn taps_too_far_apart_are_not_a_double_tap() {
-        let mut fsm = fsm();
+    fn with_hands_free_off_space_does_nothing_special() {
+        // An empty hands-free hotkey is how the toggle being off reaches the
+        // state machine.
+        let mut fsm = HotkeyFsm::from_strings("Ctrl+Win", "");
         press(&mut fsm, &[CTRL, WIN], 1.0);
-        release(&mut fsm, &[WIN, CTRL], 1.1);
-        press(&mut fsm, &[CTRL, WIN], 3.0);
-        let up = release(&mut fsm, &[WIN, CTRL], 3.1);
-        assert_eq!(all(&up), [Action::Discard]);
+        let space = press(&mut fsm, &[VK_SPACE], 1.3);
+        // Space joins the hold, so it cancels the push-to-talk and passes through.
+        assert_eq!(all(&space), [Action::Discard]);
+        assert!(!space[0].swallow);
+        assert_eq!(fsm.state(), HotkeyState::Idle);
     }
 
     #[test]
@@ -1065,7 +1063,7 @@ mod tests {
 
         press(&mut fsm, &[CTRL, WIN], 1.0);
         let esc = fsm.handle(VK_ESCAPE, true, 1.5);
-        assert_eq!(esc.actions().collect::<Vec<_>>(), [Action::Discard]);
+        assert_eq!(esc.actions().collect::<Vec<_>>(), [Action::Cancel]);
         assert!(esc.swallow);
         assert!(fsm.handle(VK_ESCAPE, false, 1.6).swallow);
         assert_eq!(fsm.state(), HotkeyState::Idle);
@@ -1337,15 +1335,14 @@ mod tests {
     }
 
     #[test]
-    fn right_ctrl_double_tap_and_space_reach_hands_free() {
+    fn right_ctrl_hold_then_space_reaches_hands_free() {
         let mut fsm = right_ctrl_fsm();
         press(&mut fsm, &[RCTRL], 1.0);
-        release(&mut fsm, &[RCTRL], 1.08);
-        press(&mut fsm, &[RCTRL], 1.3);
         assert_eq!(
-            all(&release(&mut fsm, &[RCTRL], 1.38)),
+            all(&press(&mut fsm, &[VK_SPACE], 1.5)),
             [Action::EnterHandsFree]
         );
+        release(&mut fsm, &[VK_SPACE, RCTRL], 1.6);
         assert_eq!(fsm.state(), HotkeyState::Recording { hands_free: true });
         // Right Ctrl+Space toggles it off.
         press(&mut fsm, &[RCTRL], 5.0);

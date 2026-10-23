@@ -12,6 +12,17 @@ use crate::media::{ArtImage, Timeline};
 pub const HOVER_EXPAND_MS: u32 = 250;
 pub const HOVER_COLLAPSE_MS: u32 = 400;
 pub const DONE_VISIBLE_MS: u32 = 4_000;
+/// Plain information ("Stopped") is brief; it is not news worth four seconds.
+pub const INFO_VISIBLE_MS: u32 = 2_500;
+
+/// How long a transient notice stays on the island.
+#[must_use]
+pub const fn visible_ms(level: AlertLevel) -> u32 {
+    match level {
+        AlertLevel::Info => INFO_VISIBLE_MS,
+        _ => DONE_VISIBLE_MS,
+    }
+}
 /// Default delay before paused media closes (`media.pause_hide_seconds`).
 pub const MEDIA_PAUSED_MS: u32 = 5 * 1_000;
 pub const SPLIT_GAP_DP: f32 = 6.0;
@@ -471,6 +482,14 @@ impl IslandState {
         (main, bubble)
     }
 
+    /// Two activities share the island as a main pill plus a small bubble.
+    /// A transient notice never goes in the bubble (a lone icon cannot say
+    /// "Stopped" or "Claude finished"), so it takes over the pill for its few
+    /// seconds instead.
+    fn splits(&self) -> bool {
+        self.persistent_count() >= 2 && self.done.is_none()
+    }
+
     #[must_use]
     pub fn layout(&self) -> LayoutTarget {
         if self.dictation.is_some() {
@@ -480,7 +499,7 @@ impl IslandState {
         // Out of the way of the window behind; hovering expands as usual.
         // The pill keeps its normal shape and just docks at the other edge.
         if self.tucked && !self.expanded {
-            if self.persistent_count() >= 2 {
+            if self.splits() {
                 return LayoutTarget::split(COMPACT, SPLIT_BUBBLE);
             }
             if self.primary_kind().is_some() {
@@ -497,7 +516,7 @@ impl IslandState {
             };
         }
 
-        if self.persistent_count() >= 2 {
+        if self.splits() {
             return LayoutTarget::split(COMPACT, SPLIT_BUBBLE);
         }
 
@@ -752,11 +771,15 @@ pub fn reduce(state: &mut IslandState, event: IslandEvent, now: f64) -> Vec<Effe
             }
             state.done = card;
             if state.done.is_some() {
-                state.done_deadline = Some(now + f64::from(DONE_VISIBLE_MS) / 1000.0);
+                let visible = state
+                    .done
+                    .as_ref()
+                    .map_or(DONE_VISIBLE_MS, |card| visible_ms(card.level));
+                state.done_deadline = Some(now + f64::from(visible) / 1000.0);
                 let mut effects = Effect::changed();
                 effects.push(Effect::ArmTimer {
                     kind: TimerKind::DoneExpiry,
-                    after_ms: DONE_VISIBLE_MS,
+                    after_ms: visible,
                 });
                 effects
             } else {
@@ -1223,6 +1246,59 @@ mod tests {
             false,
         );
         assert_eq!(frame.bubble, None);
+    }
+
+    #[test]
+    fn a_transient_notice_takes_over_instead_of_hiding_in_the_bubble() {
+        let mut state = IslandState::default();
+        reduce(&mut state, IslandEvent::SetMedia(Some(media())), 0.0);
+        reduce(&mut state, IslandEvent::SetRunning(Some(agent())), 0.0);
+        assert_eq!(state.layout(), LayoutTarget::split(COMPACT, SPLIT_BUBBLE));
+
+        // A "Stopped"-style notice arrives: one readable pill, no bubble.
+        reduce(
+            &mut state,
+            IslandEvent::SetDone(Some(notification(AlertLevel::Info))),
+            1.0,
+        );
+        assert_eq!(state.layout(), LayoutTarget::single(COMPACT));
+        let content = state.content();
+        assert!(matches!(
+            content.primary,
+            Some(ContentCard::Notification(_))
+        ));
+        assert!(content.secondary.is_none());
+
+        // When it expires the music and the agent share the island again.
+        reduce(&mut state, IslandEvent::Tick { now: 6.0 }, 6.0);
+        assert_eq!(state.layout(), LayoutTarget::split(COMPACT, SPLIT_BUBBLE));
+    }
+
+    #[test]
+    fn info_notices_are_brief_and_others_stay_four_seconds() {
+        let mut state = IslandState::default();
+        let effects = reduce(
+            &mut state,
+            IslandEvent::SetDone(Some(notification(AlertLevel::Info))),
+            10.0,
+        );
+        assert!(effects.contains(&Effect::ArmTimer {
+            kind: TimerKind::DoneExpiry,
+            after_ms: INFO_VISIBLE_MS,
+        }));
+        assert!(reduce(&mut state, IslandEvent::Tick { now: 12.4 }, 12.4).is_empty());
+        assert!(!reduce(&mut state, IslandEvent::Tick { now: 12.5 }, 12.5).is_empty());
+        assert!(state.done.is_none());
+
+        let effects = reduce(
+            &mut state,
+            IslandEvent::SetDone(Some(notification(AlertLevel::Error))),
+            20.0,
+        );
+        assert!(effects.contains(&Effect::ArmTimer {
+            kind: TimerKind::DoneExpiry,
+            after_ms: DONE_VISIBLE_MS,
+        }));
     }
 
     #[test]

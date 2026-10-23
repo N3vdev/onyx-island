@@ -95,6 +95,15 @@ pub fn spawn(
     })
 }
 
+/// The hands-free hotkey text, or nothing while hands-free mode is off.
+fn hands_free_hotkey(config: &DictationConfig) -> &str {
+    if config.hands_free_enabled {
+        &config.hands_free
+    } else {
+        ""
+    }
+}
+
 /// How often the pill's clock and waveform update while recording.
 const TICK: Duration = Duration::from_millis(33);
 /// A press must last this long before anything is shown or played. Taps of
@@ -193,7 +202,7 @@ impl Controller {
         ui: Sender<UiUpdate>,
         notify: Arc<dyn Fn() + Send + Sync>,
     ) -> Self {
-        let hook = match KeyboardHook::start(&config.push_to_talk, &config.hands_free) {
+        let hook = match KeyboardHook::start(&config.push_to_talk, hands_free_hotkey(&config)) {
             Ok(hook) => Some(hook),
             Err(error) => {
                 tracing::error!(%error, "dictation hotkeys are unavailable");
@@ -315,7 +324,7 @@ impl Controller {
 
     fn apply_config(&mut self, config: DictationConfig) {
         if let Some(hook) = &self.hook {
-            hook.set_combos(&config.push_to_talk, &config.hands_free);
+            hook.set_combos(&config.push_to_talk, hands_free_hotkey(&config));
         }
         self.text_options = TextOptions::from_config(&config);
 
@@ -394,6 +403,13 @@ impl Controller {
             }
             Action::Stop => self.stop(),
             Action::Discard => self.discard(),
+            Action::Cancel => {
+                // Esc while recording: throw the audio away and say so.
+                if self.phase == Phase::Recording {
+                    self.discard();
+                    self.notice("Stopped", "Recording discarded.", AlertLevel::Info);
+                }
+            }
             Action::SuppressStartMenu => islet_input::suppress_start_menu(),
         }
     }

@@ -81,7 +81,11 @@ pub enum IdleStyle {
 pub struct DictationConfig {
     pub enabled: bool,
     pub push_to_talk: String,
+    /// Hotkey that starts recording on one press and stops it on the next.
+    /// Only active while `hands_free_enabled` is on.
     pub hands_free: String,
+    /// Hands-free mode: off by default, so the one hotkey is hold-to-speak.
+    pub hands_free_enabled: bool,
     pub filler_removal: bool,
     pub spoken_punctuation: bool,
     pub injection: InjectionMethod,
@@ -172,6 +176,7 @@ impl Default for DictationConfig {
             enabled: true,
             push_to_talk: "Ctrl+Win".to_owned(),
             hands_free: "Ctrl+Win+Space".to_owned(),
+            hands_free_enabled: false,
             filler_removal: true,
             spoken_punctuation: true,
             injection: InjectionMethod::Clipboard,
