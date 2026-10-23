@@ -1018,3 +1018,5 @@ real microphone, nor in Notepad/VS Code/Chrome/Windows Terminal (see
   pill -> shrink -> six orange bars -> Esc -> "Stopped" -> music pill back.
   Not visually verified: the no-music hide-after-done path (covered by a
   layout test); it needs a real insertion into a window.
+
+- Island outline: the pill and bubble outline is now 1 dip wide at 17% white (was 0.75 dip at 7.5%), so the black island stays visible on dark windows. Checked magnified on a dark backdrop.

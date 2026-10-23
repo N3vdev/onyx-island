@@ -73,12 +73,15 @@ const FRAME_COLOR: D2D1_COLOR_F = D2D1_COLOR_F {
     b: 0.0,
     a: 1.0,
 };
+/// A thin white outline so the black pill stays visible on dark windows.
 const HAIRLINE_COLOR: D2D1_COLOR_F = D2D1_COLOR_F {
     r: 1.0,
     g: 1.0,
     b: 1.0,
-    a: 0.075,
+    a: 0.17,
 };
+/// Outline thickness in dips (one physical pixel at 100% scaling).
+const HAIRLINE_WIDTH: f32 = 1.0;
 /// Real visualizer levels older than this fall back to procedural bars.
 const BAR_LEVELS_MAX_AGE_MS: u64 = 250;
 /// Album-art brushes kept around (current track plus a transition partner).
@@ -1265,8 +1268,12 @@ impl Gfx {
             a: HAIRLINE_COLOR.a * alpha,
             ..HAIRLINE_COLOR
         });
-        self.dc
-            .DrawGeometry(&geometry, &self.brush, 0.75, None::<&ID2D1StrokeStyle>);
+        self.dc.DrawGeometry(
+            &geometry,
+            &self.brush,
+            HAIRLINE_WIDTH,
+            None::<&ID2D1StrokeStyle>,
+        );
         self.dc.SetTransform(&Matrix3x2::identity());
         Ok(())
     }
