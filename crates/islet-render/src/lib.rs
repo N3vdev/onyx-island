@@ -528,6 +528,9 @@ struct Sample {
     inset: f32,
     /// 0 = top edge, 1 = bottom edge. Animated when the island docks.
     anchor: f32,
+    /// 0 = drawn into the screen edge (hidden), 1 = the resting pill. Above 1
+    /// while an appearing pill overshoots, which swells it slightly.
+    presence: f32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -547,7 +550,15 @@ struct Animator {
     gap: Spring,
     inset: Spring,
     anchor: Spring,
+    presence: Spring,
 }
+
+/// Below this the droplet is invisible, so the pill's size can jump to a new
+/// one without anyone seeing it.
+const PRESENCE_UNSEEN: f64 = 0.04;
+/// A hide aims a little past "gone", so the droplet slips through the edge at
+/// speed instead of creeping the last few pixels.
+const PRESENCE_GONE: f64 = -0.12;
 
 impl Animator {
     fn new(target: LayoutTarget, anchor: f64, now: f64) -> Self {
@@ -569,6 +580,7 @@ impl Animator {
             // Also starts at rest: a fresh window should already be at the
             // configured edge, not fly there from the other one.
             anchor: Spring::new(anchor, anchor, SpringParams::DOCK, now),
+            presence: Spring::new(PRESENCE_GONE, PRESENCE_GONE, SpringParams::RECEDE, now),
         };
         animator.set_target(target, now);
         animator
@@ -582,7 +594,22 @@ impl Animator {
         retarget(&mut self.anchor, target, SpringParams::DOCK, now);
     }
 
+    /// Showing and hiding are one motion on `presence`: the pill keeps its
+    /// shape and is drawn into (or wells out of) the screen edge as a
+    /// droplet. Size changes while visible are the usual spring morph.
     fn set_target(&mut self, target: LayoutTarget, now: f64) {
+        if !target.visible {
+            // Keep the last shape so the hide is the show played backwards.
+            retarget(&mut self.presence, PRESENCE_GONE, SpringParams::RECEDE, now);
+            return;
+        }
+        if self.presence.position(now) < PRESENCE_UNSEEN {
+            // Coming back from hidden: start at the new shape, so the only
+            // motion is the droplet growing out of the edge.
+            self.jump_to(target, now);
+        }
+        retarget(&mut self.presence, 1.0, SpringParams::EMERGE, now);
+
         let old_area = self.main_width.target() * self.main_height.target();
         let new_area = f64::from(target.main.width) * f64::from(target.main.height);
         let params = if new_area >= old_area {
@@ -590,12 +617,7 @@ impl Animator {
         } else {
             SpringParams::COLLAPSE
         };
-        // Closing to hidden is its own fluid motion (see DISMISS_*).
-        let (width_params, height_params) = if target.visible {
-            (params, params)
-        } else {
-            (SpringParams::DISMISS_WIDTH, SpringParams::DISMISS_HEIGHT)
-        };
+        let (width_params, height_params) = (params, params);
 
         retarget(
             &mut self.main_width,
@@ -644,6 +666,22 @@ impl Animator {
         );
     }
 
+    fn jump_to(&mut self, target: LayoutTarget, now: f64) {
+        let bubble = target.bubble.unwrap_or(PillSize::new(0.0, 0.0, 0.0));
+        for (spring, value) in [
+            (&mut self.main_width, target.main.width),
+            (&mut self.main_height, target.main.height),
+            (&mut self.main_corner, target.main.corner),
+            (&mut self.bubble_width, bubble.width),
+            (&mut self.bubble_height, bubble.height),
+            (&mut self.bubble_corner, bubble.corner),
+            (&mut self.gap, target.gap),
+            (&mut self.inset, target.inset),
+        ] {
+            spring.reset(f64::from(value), f64::from(value), now);
+        }
+    }
+
     fn sample(&self, now: f64) -> Sample {
         Sample {
             main_width: self.main_width.position(now).max(0.0) as f32,
@@ -655,6 +693,7 @@ impl Animator {
             gap: self.gap.position(now).max(0.0) as f32,
             inset: self.inset.position(now).max(0.0) as f32,
             anchor: self.anchor.position(now).clamp(0.0, 1.0) as f32,
+            presence: self.presence.position(now).clamp(0.0, 1.2) as f32,
         }
     }
 
@@ -670,6 +709,9 @@ impl Animator {
             && self.bubble_corner.is_settled(now)
             && self.gap.is_settled(now)
             && self.inset.is_settled(now)
+            && self
+                .presence
+                .is_settled_with(now, TRAVEL_SETTLE_PHASE, TRAVEL_SETTLE_VELOCITY)
             && self
                 .anchor
                 .is_settled_with(now, TRAVEL_SETTLE_PHASE, TRAVEL_SETTLE_VELOCITY)
@@ -727,11 +769,14 @@ struct FrameGeometry {
 /// completely slipped through it.
 fn droplet_geometry(sample: &Sample, window_width: f32, window_height: f32) -> FrameGeometry {
     let anchor = sample.anchor.clamp(0.0, 1.0);
-    let (top, fullness) = if anchor <= 0.5 {
+    let (top, travel) = if anchor <= 0.5 {
         (true, 1.0 - anchor / 0.5)
     } else {
         (false, (anchor - 0.5) / 0.5)
     };
+    // Appearing and travelling are the same droplet: both scale how far the
+    // pill has come out of its edge.
+    let fullness = travel * sample.presence.clamp(0.0, 1.0);
     let frame = arrange_at(
         PillSize::new(sample.main_width, sample.main_height, sample.main_corner),
         Some(PillSize::new(
@@ -746,11 +791,25 @@ fn droplet_geometry(sample: &Sample, window_width: f32, window_height: f32) -> F
         if top { 0.0 } else { 1.0 },
     );
     if fullness >= 1.0 {
+        // The overshoot of an appearing pill is a soft swell away from the
+        // edge, like a drop settling, rather than a jump past its size.
+        let bloom = (sample.presence - 1.0).max(0.0);
+        let swell = |rect: Rect| {
+            squeeze(
+                rect,
+                1.0 + bloom * 0.9,
+                1.0 + bloom * 1.4,
+                top,
+                window_width,
+                window_height,
+                1.0,
+            )
+        };
         return FrameGeometry {
-            main: frame.main,
-            main_corner: frame.main_corner,
-            bubble: frame.bubble,
-            bubble_corner: frame.bubble_corner,
+            main: swell(frame.main),
+            main_corner: frame.main_corner * (1.0 + bloom * 0.9),
+            bubble: frame.bubble.map(swell),
+            bubble_corner: frame.bubble_corner * (1.0 + bloom * 0.9),
             taper: 0.0,
             taper_top: top,
             shell_alpha: 1.0,
@@ -3168,6 +3227,100 @@ mod tests {
         assert!((animator.sample(4.4).anchor).abs() < 0.012);
     }
 
+    fn shown_animator(top: bool) -> Animator {
+        let mut animator = Animator::new(LayoutTarget::HIDDEN, if top { 0.0 } else { 1.0 }, 0.0);
+        animator.set_target(LayoutTarget::single(islet_core::island::COMPACT), 0.0);
+        animator
+    }
+
+    fn geometry_of(animator: &Animator, now: f64) -> FrameGeometry {
+        droplet_geometry(&animator.sample(now), 440.0, 1080.0)
+    }
+
+    #[test]
+    fn appearing_wells_out_of_its_edge_as_a_droplet() {
+        let compact = islet_core::island::COMPACT;
+        for top in [true, false] {
+            let animator = shown_animator(top);
+            // It is already the pill's width class from the first frame: the
+            // motion is the droplet, not a zero-size pill growing.
+            assert_eq!(animator.sample(0.0).main_width, compact.width);
+            let first = geometry_of(&animator, 0.0);
+            assert_eq!(first.shell_alpha, 0.0, "starts invisible");
+
+            let early = geometry_of(&animator, 0.08);
+            assert!(early.taper > 0.5, "starts as a leaf: {early:?}");
+            assert_eq!(early.taper_top, top);
+            // Flush with its own edge while it comes through.
+            if top {
+                assert!(early.main.y.abs() < 1e-3, "{early:?}");
+            } else {
+                assert!((early.main.bottom() - 1080.0).abs() < 1e-3, "{early:?}");
+            }
+
+            // It swells slightly past its size and settles back.
+            let widest = (0..60)
+                .map(|step| geometry_of(&animator, f64::from(step) * 0.01).main.width)
+                .fold(0.0_f32, f32::max);
+            assert!(
+                widest > compact.width + 1.0,
+                "expected a soft swell: {widest}"
+            );
+            assert!(widest < compact.width * 1.08, "swell too big: {widest}");
+            assert!(animator.is_settled(1.4));
+            let rest = geometry_of(&animator, 1.4);
+            assert!((rest.main.width - compact.width).abs() < 0.5);
+            assert_eq!(rest.taper, 0.0);
+        }
+    }
+
+    #[test]
+    fn hiding_keeps_the_shape_and_draws_it_back_into_the_edge() {
+        let compact = islet_core::island::COMPACT;
+        for top in [true, false] {
+            let mut animator = shown_animator(top);
+            animator.set_target(LayoutTarget::HIDDEN, 2.0);
+            // The size springs do not collapse; only the droplet does.
+            assert_eq!(animator.sample(2.3).main_width, compact.width);
+            let mut previous_height = f32::MAX;
+            for step in 0..40 {
+                let geometry = geometry_of(&animator, 2.0 + f64::from(step) * 0.02);
+                assert!(
+                    geometry.main.height <= previous_height + 1e-3,
+                    "only ever drawn in at step {step}"
+                );
+                assert_eq!(geometry.taper_top, top);
+                previous_height = geometry.main.height;
+            }
+            assert_eq!(geometry_of(&animator, 2.6).shell_alpha, 0.0, "gone");
+            assert!(animator.is_settled(3.2));
+        }
+    }
+
+    #[test]
+    fn an_interrupted_hide_reverses_without_a_jump() {
+        let mut animator = shown_animator(true);
+        animator.set_target(LayoutTarget::HIDDEN, 2.0);
+        let before = geometry_of(&animator, 2.12);
+        animator.set_target(LayoutTarget::single(islet_core::island::COMPACT), 2.12);
+        let after = geometry_of(&animator, 2.12);
+        assert!((before.main.width - after.main.width).abs() < 1e-3);
+        assert!((before.main.height - after.main.height).abs() < 1e-3);
+        assert!(animator.is_settled(3.6));
+        assert_eq!(geometry_of(&animator, 3.6).taper, 0.0);
+    }
+
+    #[test]
+    fn a_resize_while_visible_is_still_a_morph() {
+        let mut animator = shown_animator(true);
+        animator.set_target(LayoutTarget::single(islet_core::island::DICTATION), 2.0);
+        // Halfway through, it is between the two sizes and fully present.
+        let mid = geometry_of(&animator, 2.12);
+        assert!(mid.main.width < islet_core::island::COMPACT.width);
+        assert!(mid.main.width > islet_core::island::DICTATION.width);
+        assert_eq!(mid.shell_alpha, 1.0);
+    }
+
     fn sample_at(anchor: f32) -> Sample {
         Sample {
             main_width: 220.0,
@@ -3179,6 +3332,7 @@ mod tests {
             gap: 0.0,
             inset: 8.0,
             anchor,
+            presence: 1.0,
         }
     }
 

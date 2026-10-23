@@ -31,15 +31,16 @@ impl SpringParams {
         response: 0.36,
         damping: 0.90,
     };
-    /// Closing to hidden, horizontal axis: contracts quickly...
-    pub const DISMISS_WIDTH: Self = Self {
-        response: 0.34,
-        damping: 0.92,
+    /// Appearing: the island wells out of the screen edge as a droplet and
+    /// swells into the pill, overshooting a touch before it settles.
+    pub const EMERGE: Self = Self {
+        response: 0.60,
+        damping: 0.72,
     };
-    /// ...while the vertical axis lags, so the pill gathers into a round
-    /// droplet before it shrinks away.
-    pub const DISMISS_HEIGHT: Self = Self {
-        response: 0.52,
+    /// Disappearing: the same droplet played backwards, drawn into the edge.
+    /// Critically damped, so it never bounces back out once it is gone.
+    pub const RECEDE: Self = Self {
+        response: 0.50,
         damping: 1.0,
     };
     /// A snappy pulse for arriving notifications.

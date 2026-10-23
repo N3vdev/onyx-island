@@ -1020,3 +1020,26 @@ real microphone, nor in Notepad/VS Code/Chrome/Windows Terminal (see
   layout test); it needs a real insertion into a window.
 
 - Island outline: the pill and bubble outline is now 1 dip wide at 17% white (was 0.75 dip at 7.5%), so the black island stays visible on dark windows. Checked magnified on a dark backdrop.
+
+## Droplet show and hide (user request, 2026-10-23)
+
+- Appearing and disappearing are now the same droplet motion the island uses
+  to travel between edges, at **both the top and the bottom**. A new
+  `presence` spring (0 = drawn into the edge, 1 = resting pill) scales the
+  droplet's fullness together with the travel phase.
+- **Show:** the pill keeps its final size from the first frame (no growing
+  from zero); it wells out of its edge as a flush leaf, rounds into the pill
+  and swells ~3% away from the edge before settling (`SpringParams::EMERGE`,
+  0.60 s / 0.72). Content un-blurs as it fills.
+- **Hide:** the exact reverse. The shape stays frozen while the content blurs,
+  the pill gathers into a leaf and sinks into its edge (`RECEDE`, 0.50 s,
+  critically damped, aiming at -0.12 so it slips through instead of creeping
+  the last pixels). Gone in ~0.2 s after it starts gathering.
+- An interrupted hide or show reverses from where it is (one spring, no
+  jump). Size changes while visible (music -> dictation, expand) are the usual
+  morph. Replaced `DISMISS_WIDTH`/`DISMISS_HEIGHT`.
+- Debug: `ISLET_DEMO_STEPS=0,1` with `--demo` cycles only the listed looks
+  (here hidden <-> music every 3 s) to watch the motion.
+- Verified with ~30 fps screen captures at both edges; 4 new renderer tests
+  (emerge at both edges, hide is a draw-in at both edges, interruption has no
+  jump, resizes still morph).

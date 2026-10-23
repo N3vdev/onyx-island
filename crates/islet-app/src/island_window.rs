@@ -1611,11 +1611,22 @@ impl IslandHost {
 
     fn demo_advance(&mut self) {
         let step = self.demo.as_ref().map_or(0, |demo| demo.step);
+        // Debug: `ISLET_DEMO_STEPS=0,1` cycles only those looks (here: hidden
+        // and music, to watch the island appear and disappear).
+        let look = std::env::var("ISLET_DEMO_STEPS")
+            .ok()
+            .map(|list| {
+                list.split(',')
+                    .filter_map(|item| item.trim().parse::<usize>().ok())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|looks| !looks.is_empty())
+            .map_or(step, |looks| looks[step % looks.len()]);
         let mut state = IslandState {
             idle_style: self.idle_style,
             ..IslandState::default()
         };
-        match step % DEMO_STATES {
+        match look % DEMO_STATES {
             0 => {}
             1 => state.media = Some(demo_media()),
             2 => {
