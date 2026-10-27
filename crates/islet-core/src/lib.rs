@@ -12,8 +12,11 @@ pub mod media;
 pub mod music;
 pub mod spring;
 pub mod transcript;
+pub mod tween;
+pub mod widgets;
 
 pub use config::Config;
 pub use geometry::Rect;
 pub use island::{ContentCard, ContentSnapshot, IslandEvent, IslandState, LayoutTarget, PillSize};
 pub use spring::{Spring, SpringParams};
+pub use tween::{Ease, Tween};

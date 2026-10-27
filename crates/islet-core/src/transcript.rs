@@ -117,6 +117,9 @@ fn build_phrases(options: &TextOptions) -> Vec<Phrase> {
         for (spoken, rule) in [
             ("new paragraph", Rule::Break("\n\n")),
             ("new line", Rule::Break("\n")),
+            ("bullet point", Rule::Break("\n- ")),
+            ("new bullet", Rule::Break("\n- ")),
+            ("next bullet", Rule::Break("\n- ")),
             ("full stop", Rule::Punct(".")),
             ("question mark", Rule::Punct("?")),
             ("exclamation mark", Rule::Punct("!")),
@@ -208,7 +211,37 @@ fn apply_phrases(tokens: &[Token], phrases: &[Phrase]) -> Vec<Token> {
     out
 }
 
-const FILLERS: &[&str] = &["um", "umm", "uh", "uhh", "uhm", "erm", "hmm", "mhm"];
+const FILLERS: &[&str] = &[
+    "um", "umm", "uh", "uhh", "uhhh", "uhm", "er", "erm", "ehm", "hmm", "mhm", "mmm",
+];
+
+/// Padding that adds nothing when it follows a linking word with no
+/// punctuation: "what I want is basically let's say a car".
+const HEDGES: &[&[&str]] = &[&["basically"], &["let's", "say"], &["kind", "of", "like"]];
+
+/// Words a hedge can follow and be dropped.
+const HEDGE_LEAD_INS: &[&str] = &[
+    "is", "are", "was", "were", "so", "and", "that", "but", "to", "be", "because", "it's",
+];
+
+/// Lowercased word with typographic apostrophes straightened.
+fn norm(token: &Token) -> String {
+    token.key().replace('\u{2019}', "'")
+}
+
+fn hedge_at(tokens: &[Token], index: usize) -> usize {
+    HEDGES
+        .iter()
+        .find(|words| {
+            words.iter().enumerate().all(|(offset, word)| {
+                tokens.get(index + offset).is_some_and(|token| {
+                    !token.verbatim && norm(token) == *word && token.lead.is_empty()
+                        && (offset + 1 == words.len() || token.trail.is_empty())
+                })
+            })
+        })
+        .map_or(0, |words| words.len())
+}
 
 fn is_break(token: &Token) -> bool {
     token.word.is_empty() && token.trail.starts_with('\n')
@@ -224,7 +257,26 @@ fn remove_fillers(tokens: Vec<Token>) -> Vec<Token> {
             .last()
             .is_none_or(|previous| previous.ends_sentence() || is_break(previous));
 
-        let is_filler = !token.verbatim && FILLERS.contains(&token.key().as_str());
+        // "oh" is a word too ("Oh, nice."), so it only counts as a filler when
+        // it is dropped into the middle of a clause with no punctuation.
+        let stray_oh = !at_clause_start
+            && !token.verbatim
+            && token.key() == "oh"
+            && token.trail.is_empty()
+            && tokens.get(index + 1).is_some_and(|next| !next.word.is_empty());
+        let hedge = hedge_at(&tokens, index);
+        if hedge > 0
+            && out.last().is_some_and(|previous| {
+                previous.trail.is_empty() && HEDGE_LEAD_INS.contains(&norm(previous).as_str())
+            })
+            && tokens[index + hedge - 1].trail.is_empty()
+            && tokens.get(index + hedge).is_some_and(|next| !next.word.is_empty())
+        {
+            index += hedge;
+            continue;
+        }
+        let is_filler =
+            !token.verbatim && (FILLERS.contains(&token.key().as_str()) || stray_oh);
         let is_you_know = at_clause_start
             && !token.verbatim
             && token.key() == "you"
@@ -407,6 +459,451 @@ fn remove_stutters(tokens: Vec<Token>) -> Vec<Token> {
     out
 }
 
+#[derive(Clone, Copy)]
+enum Cue {
+    /// "five cars, I mean six cars": swap the words just before for the ones
+    /// after. `strong` cues are unambiguous; the others are also ordinary
+    /// speech ("I mean, it works"), so they only count in the middle of a clause.
+    Replace { strong: bool },
+    /// "scratch that": drop the clause just spoken.
+    Scratch,
+    /// "sorry my bad. Instead of X, ...": the sentence after is a redo of the
+    /// words before, so it takes their place.
+    Restate,
+}
+
+const CUES: &[(&[&str], Cue)] = &[
+    (&["sorry", "i", "mean"], Cue::Replace { strong: true }),
+    (&["no", "wait"], Cue::Replace { strong: true }),
+    (&["wait", "no"], Cue::Replace { strong: true }),
+    (&["actually", "no"], Cue::Replace { strong: true }),
+    (&["or", "rather"], Cue::Replace { strong: true }),
+    (&["i", "mean"], Cue::Replace { strong: false }),
+    (&["no", "i", "meant"], Cue::Replace { strong: true }),
+    (&["sorry", "i", "meant"], Cue::Replace { strong: true }),
+    (&["wait", "i", "meant"], Cue::Replace { strong: true }),
+    (&["actually", "i", "meant"], Cue::Replace { strong: true }),
+    (&["or", "actually"], Cue::Replace { strong: true }),
+    (&["correction"], Cue::Replace { strong: true }),
+    (&["i", "meant"], Cue::Replace { strong: false }),
+    (&["scratch", "that"], Cue::Scratch),
+    (&["strike", "that"], Cue::Scratch),
+    (&["forget", "that"], Cue::Scratch),
+    (&["ignore", "that"], Cue::Scratch),
+    (&["let", "me", "start", "over"], Cue::Restate),
+    (&["let", "me", "say", "that", "again"], Cue::Restate),
+    (&["sorry", "let", "me", "rephrase"], Cue::Restate),
+    (&["oops"], Cue::Restate),
+    (&["sorry", "my", "bad"], Cue::Restate),
+    (&["my", "bad"], Cue::Restate),
+    (&["my", "mistake"], Cue::Restate),
+    (&["let", "me", "rephrase"], Cue::Restate),
+];
+
+/// Most words a spoken correction replaces; people fix a word or a short
+/// phrase, and a longer guess would eat text that was meant to stay.
+const CORRECTION_WORDS: usize = 2;
+
+fn cue_at(tokens: &[Token], index: usize) -> Option<(usize, Cue)> {
+    CUES.iter().find_map(|(words, cue)| {
+        let matches = words.iter().enumerate().all(|(offset, word)| {
+            tokens
+                .get(index + offset)
+                .is_some_and(|token| !token.verbatim && token.key() == *word)
+        });
+        matches.then_some((words.len(), *cue))
+    })
+}
+
+fn clause_boundary(token: &Token) -> bool {
+    token.ends_sentence() || is_break(token)
+}
+
+fn closes_phrase(token: &Token) -> bool {
+    token.trail.contains(['.', '?', '!', ',', ';', ':'])
+}
+
+/// Words that open a question or a clause, so two of them back to back can be
+/// a restart: "can I just can't we just use".
+const RESTART_OPENERS: &[&str] = &[
+    "can", "can't", "could", "couldn't", "should", "shouldn't", "would", "wouldn't", "do",
+    "don't", "does", "doesn't", "is", "isn't", "are", "aren't", "will", "won't", "what",
+    "why", "how", "i", "we", "let's", "it", "they",
+];
+
+/// "can I just can't we just use" -> "can't we just use": two phrases of the
+/// same length with different openers that end on the same word, with no
+/// punctuation between them, are one thought started twice.
+fn drop_restarts(tokens: Vec<Token>) -> Vec<Token> {
+    let plain = |token: &Token| !token.verbatim && !token.word.is_empty();
+    let mut out: Vec<Token> = Vec::with_capacity(tokens.len());
+    let mut index = 0;
+    'outer: while index < tokens.len() {
+        for length in 2..=4usize {
+            let Some(first) = tokens.get(index..index + length) else {
+                break;
+            };
+            let Some(second) = tokens.get(index + length..index + 2 * length) else {
+                break;
+            };
+            let clean_first = first
+                .iter()
+                .all(|token| plain(token) && token.trail.is_empty() && token.lead.is_empty());
+            if !clean_first || !second.iter().all(plain) {
+                continue;
+            }
+            let (a, b) = (norm(&first[0]), norm(&second[0]));
+            if a != b
+                && RESTART_OPENERS.contains(&a.as_str())
+                && RESTART_OPENERS.contains(&b.as_str())
+                && norm(&first[length - 1]) == norm(&second[length - 1])
+                && !RESTART_OPENERS.contains(&norm(&first[length - 1]).as_str())
+            {
+                let starts_clause = out.last().is_none_or(clause_boundary);
+                let mut kept = second[0].clone();
+                if starts_clause {
+                    capitalize(&mut kept);
+                }
+                out.push(kept);
+                out.extend(second[1..].iter().cloned());
+                index += 2 * length;
+                continue 'outer;
+            }
+        }
+        out.push(tokens[index].clone());
+        index += 1;
+    }
+    out
+}
+
+/// Applies spoken self-corrections: "I mean", "no wait", "or rather" swap the
+/// words just said for the ones that follow, and "scratch that" drops the
+/// clause just spoken.
+fn resolve_corrections(tokens: Vec<Token>) -> Vec<Token> {
+    let mut out: Vec<Token> = Vec::with_capacity(tokens.len());
+    let mut index = 0;
+    while index < tokens.len() {
+        if let Some((len, cue)) = cue_at(&tokens, index) {
+            if let Some(next) = apply_cue(&tokens, &mut out, index, len, cue) {
+                index = next;
+                continue;
+            }
+        }
+        out.push(tokens[index].clone());
+        index += 1;
+    }
+    out
+}
+
+/// Tries one cue; returns where to carry on, or `None` if it is ordinary speech.
+fn apply_cue(
+    tokens: &[Token],
+    out: &mut Vec<Token>,
+    index: usize,
+    len: usize,
+    cue: Cue,
+) -> Option<usize> {
+    let cue_end = index + len;
+    let last_cue = &tokens[cue_end - 1];
+    match cue {
+        Cue::Scratch => {
+            // Only when it ends its clause ("scratch that." / "scratch that, ...").
+            if !(closes_phrase(last_cue) || cue_end == tokens.len()) || out.is_empty() {
+                return None;
+            }
+            // Drop the clause being spoken, or the sentence just finished.
+            let mut keep = out.len();
+            let mut first = true;
+            while keep > 0 && (first || !clause_boundary(&out[keep - 1])) {
+                keep -= 1;
+                first = false;
+            }
+            out.truncate(keep);
+            let starts_clause = out.last().is_none_or(clause_boundary);
+            if starts_clause {
+                if let Some(next) = tokens.get(cue_end) {
+                    let mut next = next.clone();
+                    capitalize(&mut next);
+                    out.push(next);
+                    return Some(cue_end + 1);
+                }
+            }
+            Some(cue_end)
+        }
+        Cue::Restate => {
+            let mut end = cue_end;
+            while end < tokens.len() {
+                end += 1;
+                if tokens[end - 1].ends_sentence() {
+                    break;
+                }
+            }
+            let mut redo: Vec<Token> = tokens[cue_end..end].to_vec();
+            // "let me rephrase that: ..." carries a "that" before the redo.
+            if redo.first().is_some_and(|t| t.key() == "that") && redo.len() > 2 {
+                redo.remove(0);
+            }
+            if redo.len() < 2 || redo.iter().any(|t| t.verbatim) {
+                return None;
+            }
+            // The redo starts with the same words the first try did.
+            let start = (0..out.len().saturating_sub(1)).rev().find(|&at| {
+                out[at].key() == redo[0].key() && out[at + 1].key() == redo[1].key()
+            })?;
+            out.truncate(start);
+            let starts_clause = out.last().is_none_or(clause_boundary);
+            if !starts_clause && redo[0].word != "I" {
+                redo[0].word = redo[0].word.to_lowercase();
+            }
+            if starts_clause {
+                capitalize(&mut redo[0]);
+            }
+            out.extend(redo);
+            Some(end)
+        }
+        Cue::Replace { strong } => {
+            if !strong && closes_phrase(last_cue) {
+                return None; // "I mean, ..." is just talk.
+            }
+            let mut replacement: Vec<Token> = Vec::new();
+            let mut next = cue_end;
+            while replacement.len() < CORRECTION_WORDS {
+                let Some(token) = tokens.get(next) else { break };
+                if token.verbatim || token.word.is_empty() {
+                    break;
+                }
+                replacement.push(token.clone());
+                next += 1;
+                if closes_phrase(token) {
+                    break;
+                }
+            }
+            if replacement.is_empty() {
+                return None;
+            }
+            let mut removable = 0;
+            for position in (0..out.len()).rev() {
+                let last = position + 1 == out.len();
+                if removable == replacement.len() || is_break(&out[position]) {
+                    break;
+                }
+                if !last && out[position].ends_sentence() {
+                    break;
+                }
+                removable += 1;
+            }
+            let crosses_sentence = out.last().is_some_and(Token::ends_sentence);
+            if removable == 0 || (!strong && crosses_sentence && replacement.len() != 1) {
+                return None;
+            }
+            let carried_end = out
+                .last()
+                .filter(|last| last.ends_sentence())
+                .map(|last| last.trail.clone());
+            out.truncate(out.len() - removable);
+            let starts_clause = out.last().is_none_or(clause_boundary);
+            if let Some(first) = replacement.first_mut() {
+                if starts_clause {
+                    capitalize(first);
+                } else if first.word != "I" && first.word.chars().skip(1).all(|c| !c.is_uppercase())
+                {
+                    first.word = first.word.to_lowercase();
+                }
+            }
+            if let (Some(trail), Some(last)) = (carried_end, replacement.last_mut()) {
+                if last.trail.is_empty() {
+                    last.trail = trail;
+                }
+            }
+            out.extend(replacement);
+            Some(next)
+        }
+    }
+}
+
+/// Words that name what a list holds: "a few things", "three steps".
+const LIST_NOUNS: &[&str] = &[
+    "points", "items", "things", "features", "steps", "ideas", "options", "tasks", "reasons",
+    "requirements", "notes", "changes", "problems", "issues", "questions", "goals", "suggestions",
+    "tips", "ways", "examples", "parts", "bugs", "fixes", "apps", "screens", "pages", "rules",
+    "priorities", "todos", "topics", "benefits", "pros", "cons", "concerns", "updates", "areas",
+    "list", "agenda", "stuff",
+];
+
+/// Words that announce a number of something: "here are", "a few", "three".
+const LIST_ANNOUNCERS: &[&str] = &[
+    "here are", "here's", "these are", "the following", "list of", "a few", "a couple", "some",
+    "several", "multiple", "few", "two", "three", "four", "five", "six", "2", "3", "4", "5",
+    "my", "our", "main", "key",
+];
+
+fn introduces_list(sentence: &str) -> bool {
+    let lower = sentence.to_lowercase();
+    let words: Vec<&str> = lower
+        .split(|c: char| !c.is_alphanumeric() && c != '\'')
+        .filter(|word| !word.is_empty())
+        .collect();
+    let joined = format!(" {} ", words.join(" "));
+    let announces = LIST_ANNOUNCERS
+        .iter()
+        .any(|phrase| joined.contains(&format!(" {phrase} ")));
+    announces && words.iter().any(|word| LIST_NOUNS.contains(word))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Marker {
+    /// "first", "second", "number three".
+    Rank(u8),
+    /// "next", "then", "finally": a new item, once a list has started.
+    Continue,
+}
+
+/// Spoken item markers, longest first so "first of all" beats "first".
+const MARKERS: &[(&str, Marker)] = &[
+    ("first of all", Marker::Rank(1)),
+    ("number one", Marker::Rank(1)),
+    ("point one", Marker::Rank(1)),
+    ("step one", Marker::Rank(1)),
+    ("firstly", Marker::Rank(1)),
+    ("first", Marker::Rank(1)),
+    ("number two", Marker::Rank(2)),
+    ("point two", Marker::Rank(2)),
+    ("step two", Marker::Rank(2)),
+    ("secondly", Marker::Rank(2)),
+    ("second", Marker::Rank(2)),
+    ("number three", Marker::Rank(3)),
+    ("point three", Marker::Rank(3)),
+    ("step three", Marker::Rank(3)),
+    ("thirdly", Marker::Rank(3)),
+    ("third", Marker::Rank(3)),
+    ("number four", Marker::Rank(4)),
+    ("point four", Marker::Rank(4)),
+    ("step four", Marker::Rank(4)),
+    ("fourth", Marker::Rank(4)),
+    ("number five", Marker::Rank(5)),
+    ("point five", Marker::Rank(5)),
+    ("step five", Marker::Rank(5)),
+    ("fifth", Marker::Rank(5)),
+    ("after that", Marker::Continue),
+    ("and finally", Marker::Continue),
+    ("finally", Marker::Continue),
+    ("lastly", Marker::Continue),
+    ("next", Marker::Continue),
+    ("then", Marker::Continue),
+];
+
+/// "Second, we race." -> (Rank(2), "we race.").
+fn split_marker(sentence: &str) -> Option<(Marker, &str)> {
+    MARKERS.iter().find_map(|(phrase, marker)| {
+        let head = sentence.get(..phrase.len())?;
+        let rest = &sentence[phrase.len()..];
+        let whole_word = rest.chars().next().is_none_or(|c| !c.is_alphanumeric());
+        (head.eq_ignore_ascii_case(phrase) && whole_word)
+            .then(|| (*marker, rest.trim_start_matches([',', ':', ' ', '-'])))
+    })
+}
+
+fn capitalized(text: &str) -> String {
+    let mut chars = text.chars();
+    chars.next().map_or_else(String::new, |first| {
+        first.to_uppercase().chain(chars).collect()
+    })
+}
+
+/// Splits after . ? ! (and a colon) that are followed by a space.
+fn sentences(text: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut chars = text.char_indices().peekable();
+    while let Some((at, c)) = chars.next() {
+        if matches!(c, '.' | '?' | '!' | ':')
+            && chars.peek().is_none_or(|(_, next)| next.is_whitespace())
+        {
+            parts.push(text[start..=at].trim());
+            start = at + 1;
+        }
+    }
+    if !text[start..].trim().is_empty() {
+        parts.push(text[start..].trim());
+    }
+    parts
+}
+
+/// Joins the lead-in sentences and turns the last one into a heading.
+fn heading(lead: &[&str]) -> String {
+    let mut out = lead.join(" ");
+    if !out.is_empty() {
+        let trimmed = out.trim_end_matches(['.', ':']).len();
+        out.truncate(trimmed);
+        out.push(':');
+    }
+    out
+}
+
+/// "First, X. Second, Y. Finally, Z." -> one bullet per spoken marker; the
+/// sentences between markers stay with their item. Needs a "first" and a
+/// "second" so a lone "First, ..." is never a list.
+fn spoken_list(parts: &[&str]) -> Option<String> {
+    let first = parts
+        .iter()
+        .position(|part| split_marker(part).is_some_and(|(m, _)| m == Marker::Rank(1)))?;
+    parts[first + 1..]
+        .iter()
+        .any(|part| split_marker(part).is_some_and(|(m, _)| m == Marker::Rank(2)))
+        .then_some(())?;
+    let mut items: Vec<String> = Vec::new();
+    for part in &parts[first..] {
+        match split_marker(part) {
+            Some((_, rest)) if !rest.is_empty() => items.push(capitalized(rest)),
+            Some(_) => items.push(String::new()),
+            None => match items.last_mut() {
+                Some(item) if !item.is_empty() => {
+                    item.push(' ');
+                    item.push_str(part);
+                }
+                Some(item) => item.push_str(part),
+                None => items.push((*part).to_owned()),
+            },
+        }
+    }
+    let mut out = heading(&parts[..first]);
+    for item in items.iter().filter(|item| !item.is_empty()) {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str("- ");
+        out.push_str(item);
+    }
+    Some(out)
+}
+
+/// Spots a list in what was said and lays it out as bullets:
+/// "Here are a few points. A. B." or "I want three things: A. B." puts the
+/// sentences after the announcement on bullet lines, and "First, A. Second,
+/// B." puts each marked item on its own line. An announcement needs two or
+/// more sentences after it, so one stray sentence is never a list.
+fn bulletize(text: String) -> String {
+    if text.contains('\n') {
+        return text;
+    }
+    let parts = sentences(&text);
+    if let Some(list) = spoken_list(&parts) {
+        return list;
+    }
+    let Some(intro) = parts.iter().position(|part| introduces_list(part)) else {
+        return text;
+    };
+    if parts.len() < intro + 3 {
+        return text;
+    }
+    let mut out = heading(&parts[..=intro]);
+    for part in &parts[intro + 1..] {
+        out.push_str("\n- ");
+        out.push_str(&capitalized(part));
+    }
+    out
+}
+
 fn capitalize(token: &mut Token) {
     if token.verbatim {
         return;
@@ -453,6 +950,97 @@ fn render(tokens: &[Token]) -> String {
     out.trim().to_owned()
 }
 
+/// Words of a text, lowercased, letters and digits only.
+fn content_words(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric() && c != '\'')
+        .map(|word| word.trim_matches('\'').to_lowercase())
+        .filter(|word| !word.is_empty())
+        .collect()
+}
+
+/// Edit distance, capped: only "is it within `limit`" matters.
+fn within_edits(a: &str, b: &str, limit: usize) -> bool {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    if a.len().abs_diff(b.len()) > limit {
+        return false;
+    }
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.iter().enumerate() {
+        let mut previous = row[0];
+        row[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let next = (row[j + 1] + 1)
+                .min(row[j] + 1)
+                .min(previous + usize::from(ca != cb));
+            previous = row[j + 1];
+            row[j + 1] = next;
+        }
+    }
+    row[b.len()] <= limit
+}
+
+/// Openers a chat model uses when it answers instead of rewriting.
+const ANSWER_OPENERS: &[&str] = &[
+    "sure", "certainly", "of course", "here is", "here's the", "the cleaned", "cleaned text",
+    "i'm sorry", "as an ai",
+];
+
+/// Strips what a model sometimes wraps around its answer.
+#[must_use]
+pub fn unwrap_rewrite(text: &str) -> String {
+    let mut text = text.trim();
+    for tag in ["<dictation>", "</dictation>"] {
+        text = text.trim_start_matches(tag).trim_end_matches(tag).trim();
+    }
+    let quoted = text.len() > 1 && text.starts_with('"') && text.ends_with('"');
+    if quoted {
+        text = &text[1..text.len() - 1];
+    }
+    text.trim().to_owned()
+}
+
+/// Whether a language model's rewrite of `original` can be typed instead of
+/// it. The model may drop words, fix grammar, and lay out a list, but it must
+/// not answer, add content, or wander off: anything suspicious keeps the
+/// rule-cleaned text, which is never worse than today.
+#[must_use]
+pub fn accept_rewrite(original: &str, rewrite: &str) -> bool {
+    let before = content_words(original);
+    let after = content_words(rewrite);
+    if after.is_empty() || before.is_empty() {
+        return false;
+    }
+    // Shorter is expected (fillers, restarts); much longer means new content.
+    if after.len() > before.len() + before.len() / 5 + 3 || after.len() * 4 < before.len() {
+        return false;
+    }
+    let lower = rewrite.trim_start().to_lowercase();
+    let opener = |text: &str| ANSWER_OPENERS.iter().any(|opener| text.starts_with(opener));
+    if opener(&lower) && !opener(&original.trim_start().to_lowercase()) {
+        return false;
+    }
+    // A question must stay a question, or the model answered it.
+    let asked = original.contains('?');
+    if asked && !rewrite.contains('?') {
+        return false;
+    }
+    // Every longer word must come from what was said (or be a spelling fix
+    // of it), apart from the odd synonym ("instead" for "alternative").
+    let novel = after
+        .iter()
+        .filter(|word| word.chars().count() >= 4)
+        .filter(|word| {
+            !before.iter().any(|said| {
+                said == *word
+                    || within_edits(said, word, 2)
+                    || (said.len() >= 4 && word.starts_with(said.as_str()))
+                    || (word.len() >= 4 && said.starts_with(word.as_str()))
+            })
+        })
+        .count();
+    novel <= 1 + after.len() / 10
+}
+
 /// Cleans one recognised utterance.
 #[must_use]
 pub fn clean(text: &str, options: &TextOptions) -> String {
@@ -467,9 +1055,14 @@ pub fn clean(text: &str, options: &TextOptions) -> String {
         apply_phrases(&tokens, &phrases)
     };
     if options.filler_removal {
-        tokens = remove_stutters(remove_fillers(tokens));
+        tokens = remove_stutters(resolve_corrections(drop_restarts(remove_fillers(tokens))));
     }
-    render(&tokens)
+    let text = render(&tokens);
+    if options.filler_removal {
+        bulletize(text)
+    } else {
+        text
+    }
 }
 
 #[cfg(test)]
@@ -708,5 +1301,172 @@ mod tests {
         assert_eq!((token.word.as_str(), token.trail.as_str()), ("don't", "."));
         let token = Token::parse("...");
         assert_eq!((token.word.as_str(), token.lead.as_str()), ("...", ""));
+    }
+
+    #[test]
+    fn spoken_corrections_replace_what_was_just_said() {
+        let o = options();
+        assert_eq!(
+            clean("We have five cars, I mean six cars on the track.", &o),
+            "We have six cars on the track."
+        );
+        assert_eq!(
+            clean("All the outcomes will be different. No wait, randomized.", &o),
+            "All the outcomes will be randomized."
+        );
+        assert_eq!(clean("It is blue or rather green.", &o), "It is green.");
+        assert_eq!(clean("Send it. Scratch that. Hold on.", &o), "Hold on.");
+    }
+
+    #[test]
+    fn ordinary_speech_with_cue_words_is_kept() {
+        let o = options();
+        assert_eq!(clean("I mean, it works.", &o), "I mean, it works.");
+        assert_eq!(
+            clean("It is fine. I mean it works.", &o),
+            "It is fine. I mean it works."
+        );
+        assert_eq!(clean("Oh, nice work.", &o), "Oh, nice work.");
+    }
+
+    #[test]
+    fn stray_oh_is_a_filler_and_points_become_bullets() {
+        let o = options();
+        assert_eq!(
+            clean("Point at a Oh empty space.", &o),
+            "Point at a empty space."
+        );
+        assert_eq!(
+            clean(
+                "Here are a few points for the app. It needs AR. It needs races. It needs bets.",
+                &o
+            ),
+            "Here are a few points for the app:\n- It needs AR.\n- It needs races.\n- It needs bets."
+        );
+        assert_eq!(
+            clean("Here are the points. Just one thing.", &o),
+            "Here are the points. Just one thing."
+        );
+    }
+
+    #[test]
+    fn spoken_bullet_points_start_list_lines() {
+        let o = options();
+        assert_eq!(
+            clean("Goals bullet point fast bullet point simple", &o),
+            "Goals\n- Fast\n- Simple"
+        );
+    }
+
+    #[test]
+    fn a_redone_sentence_replaces_the_first_try() {
+        let o = options();
+        assert_eq!(
+            clean(
+                "Okay, so what I want now is instead of VS Code, can't I just use X code. Sorry my bad. Instead of X code can I just use VS Code?",
+                &o
+            ),
+            "Okay, so what I want now is instead of X code can I just use VS Code?"
+        );
+        assert_eq!(clean("My bad, it was late.", &o), "My bad, it was late.");
+    }
+
+    #[test]
+    fn padding_and_restarts_are_dropped() {
+        let o = options();
+        assert_eq!(
+            clean(
+                "Okay, so what I want now is basically let's say can I just can't we just use VS Code?",
+                &o
+            ),
+            "Okay, so what I want now is can't we just use VS Code?"
+        );
+        assert_eq!(clean("It basically works.", &o), "It basically works.");
+        assert_eq!(clean("Let's say hello to them.", &o), "Let's say hello to them.");
+        assert_eq!(
+            clean("Can I just can't we just go now?", &o),
+            "Can't we just go now?"
+        );
+        assert_eq!(clean("Is it good is it bad?", &o), "Is it good is it bad?");
+    }
+
+    #[test]
+    fn more_correction_cues_work() {
+        let o = options();
+        assert_eq!(clean("Meet at noon, no I meant one.", &o), "Meet at one.");
+        assert_eq!(clean("Buy milk. Strike that. Buy eggs.", &o), "Buy eggs.");
+        assert_eq!(clean("I meant to call you.", &o), "I meant to call you.");
+        assert_eq!(clean("Er, hello there.", &o), "Hello there.");
+    }
+
+    #[test]
+    fn lists_are_spotted_without_a_command() {
+        let o = options();
+        assert_eq!(
+            clean("I want three things in the app. It needs AR. It needs races. It needs bets.", &o),
+            "I want three things in the app:\n- It needs AR.\n- It needs races.\n- It needs bets."
+        );
+        assert_eq!(
+            clean("Some ideas for the game: cars race on the desk. Friends can bet.", &o),
+            "Some ideas for the game:\n- Cars race on the desk.\n- Friends can bet."
+        );
+        assert_eq!(
+            clean(
+                "Okay so the plan. First, we build the track. It should be fast. Second, we add cars. Finally, we add betting.",
+                &o
+            ),
+            "Okay so the plan:\n- We build the track. It should be fast.\n- We add cars.\n- We add betting."
+        );
+        assert_eq!(
+            clean("Number one, speed. Number two, price.", &o),
+            "- Speed.\n- Price."
+        );
+    }
+
+    #[test]
+    fn ordinary_sentences_are_not_made_into_lists() {
+        let o = options();
+        assert_eq!(
+            clean("First, let me say thanks. Then we can talk.", &o),
+            "First, let me say thanks. Then we can talk."
+        );
+        assert_eq!(
+            clean("I have some ideas. Let me think.", &o),
+            "I have some ideas. Let me think."
+        );
+        assert_eq!(
+            clean("The first car won. The second car lost. It was close.", &o),
+            "The first car won. The second car lost. It was close."
+        );
+    }
+
+    #[test]
+    fn rewrites_that_answer_or_add_content_are_refused() {
+        let asked = "What is the capital of France?";
+        assert!(!accept_rewrite(asked, "The capital of France is Paris."));
+        assert!(accept_rewrite(asked, "What is the capital of France?"));
+        assert!(!accept_rewrite(
+            "Can I just use VS Code?",
+            "Sure, instead of X code, can I just use VS Code?"
+        ));
+        assert!(accept_rewrite(
+            "Okay, so what I want now is basically let's say can I just can't we just use VS Code? as an alternative to X code.",
+            "Can we just use VS Code instead of X code?"
+        ));
+        assert!(accept_rewrite(
+            "Here are few points that I want inside my app. It should have dark mode. It should sync with iCloud.",
+            "Here are a few points I want in my app:\n- Dark mode\n- Sync with iCloud"
+        ));
+        assert!(accept_rewrite(
+            "Point my phone onto a Oh empty space. Hotfield tracks.",
+            "Point my phone at an empty space. Hot Wheels tracks."
+        ));
+        assert!(!accept_rewrite(
+            "Write a poem.",
+            "Roses are red, violets are blue, sugar is sweet and so are you."
+        ));
+        assert!(!accept_rewrite("Hello there.", ""));
+        assert_eq!(unwrap_rewrite("<dictation>Hi.</dictation>"), "Hi.");
+        assert_eq!(unwrap_rewrite("\"Hi.\""), "Hi.");
     }
 }

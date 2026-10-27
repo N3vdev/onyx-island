@@ -1,4 +1,4 @@
-//! Islet settings: a small egui window in its own process.
+//! Onyx settings: a small egui window in its own process.
 //!
 //! It costs nothing while closed: the process exits and its memory is freed.
 //! Every change is written atomically to `config.toml`, which the island
@@ -7,6 +7,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod autostart;
+mod customize;
 mod dictation_page;
 mod preview;
 mod ui;
@@ -24,7 +25,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE,
 };
 
-const WINDOW_TITLE: &str = "Islet Settings";
+const WINDOW_TITLE: &str = "Onyx Settings";
 
 fn main() -> eframe::Result {
     // One settings window per session: a second launch focuses the first.
@@ -33,7 +34,7 @@ fn main() -> eframe::Result {
     if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
         // SAFETY: window lookup and activation by title.
         unsafe {
-            if let Ok(hwnd) = FindWindowW(None, w!("Islet Settings")) {
+            if let Ok(hwnd) = FindWindowW(None, w!("Onyx Settings")) {
                 let _ = ShowWindow(hwnd, SW_RESTORE);
                 let _ = SetForegroundWindow(hwnd);
             }
@@ -52,6 +53,7 @@ fn main() -> eframe::Result {
     {
         Some("media" | "now-playing") => Page::NowPlaying,
         Some("dictation" | "models") => Page::Dictation,
+        Some("widgets") => Page::Widgets,
         Some("about") => Page::About,
         _ => Page::General,
     };
@@ -60,8 +62,8 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(WINDOW_TITLE)
-            .with_inner_size([1000.0, 800.0])
-            .with_min_inner_size([860.0, 680.0])
+            .with_inner_size([1040.0, 820.0])
+            .with_min_inner_size([940.0, 720.0])
             .with_icon(Arc::new(window_icon())),
         ..Default::default()
     };
@@ -72,35 +74,12 @@ fn main() -> eframe::Result {
     )
 }
 
-/// A black pill with a blue dot, like the island, on a transparent square.
+/// The Onyx app icon (`assets/onyx.ico` at 64px, raw RGBA).
 fn window_icon() -> egui::IconData {
-    const SIZE: u32 = 64;
-    let mut rgba = vec![0u8; (SIZE * SIZE * 4) as usize];
-    let (half_w, half_h, radius) = (28.0f32, 13.0f32, 13.0f32);
-    for y in 0..SIZE {
-        for x in 0..SIZE {
-            let (px, py) = (x as f32 + 0.5 - 32.0, y as f32 + 0.5 - 32.0);
-            // Signed distance to a rounded rectangle (the pill).
-            let dx = (px.abs() - (half_w - radius)).max(0.0);
-            let dy = (py.abs() - (half_h - radius)).max(0.0);
-            let pill = (dx * dx + dy * dy).sqrt() - radius;
-            let dot = ((px - 15.0).powi(2) + py.powi(2)).sqrt() - 5.0;
-            let i = ((y * SIZE + x) * 4) as usize;
-            let coverage = |distance: f32| (0.5 - distance).clamp(0.0, 1.0);
-            let (pill_a, dot_a) = (coverage(pill), coverage(dot));
-            let rgb = [
-                (92.0 * dot_a) as u8,
-                (132.0 * dot_a) as u8,
-                (255.0 * dot_a) as u8,
-            ];
-            rgba[i..i + 3].copy_from_slice(&rgb);
-            rgba[i + 3] = (255.0 * pill_a.max(dot_a)) as u8;
-        }
-    }
     egui::IconData {
-        rgba,
-        width: SIZE,
-        height: SIZE,
+        rgba: include_bytes!("../../../assets/onyx-64.rgba").to_vec(),
+        width: 64,
+        height: 64,
     }
 }
 
@@ -118,10 +97,12 @@ pub enum Page {
     General,
     NowPlaying,
     Dictation,
+    Widgets,
     About,
 }
 
 pub struct SettingsApp {
+    customization: Option<customize::Customization>,
     preview: preview::PreviewLink,
     page_changed: std::time::Instant,
     animations: bool,
@@ -146,6 +127,7 @@ impl SettingsApp {
         ui::install_theme(&cc.egui_ctx);
         ui::install_titlebar_theme();
         Self {
+            customization: None,
             preview: preview::PreviewLink::default(),
             page_changed: std::time::Instant::now(),
             animations: preview::animations_enabled(),
@@ -163,9 +145,21 @@ impl SettingsApp {
         }
     }
 
+    fn open_customization(&mut self, ctx: &egui::Context) {
+        self.customization = Some(customize::Customization::new(&self.config.general, ctx));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+        ctx.request_repaint();
+    }
+
     /// Writes the config whenever an edit changed it. The island picks the
     /// file up through its directory watcher.
     fn save_if_changed(&mut self) {
+        // Hover and transition repaints do not edit settings. Avoid cloning
+        // dictionaries, snippets, and site lists on every one of those frames.
+        if self.config == self.saved {
+            return;
+        }
         let mut normalized = self.config.clone();
         normalized.normalize();
         if normalized == self.saved {

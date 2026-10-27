@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use crossbeam_channel::{unbounded, Receiver, RecvTimeoutError, Sender};
 use islet_audio::{Loopback, VolumeHandle};
-use islet_core::config::{IdleStyle, MonitorChoice, ScreenPosition};
+use islet_core::config::{IdleGlance, IdleStyle, MonitorChoice};
 use islet_core::island::{
     arrange, reduce, AgentCard, AgentState, AlertLevel, ContentSnapshot, DictationCard,
     DictationPhase, Effect, IslandEvent, IslandState, LayoutTarget, MediaCard, NotificationCard,
@@ -17,6 +17,7 @@ use islet_core::media::{
     MediaHover, Timeline,
 };
 use islet_core::music::MusicFilter;
+use islet_core::widgets::{self, WidgetHover};
 use islet_core::{Config, Rect};
 use islet_media::{MediaCommand, MediaInfo, MediaService};
 use islet_render::{HitRegion, Renderer, RendererConfig};
@@ -40,7 +41,8 @@ use windows::Win32::System::Threading::{
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+    GetFocus, GetKeyState, ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE,
+    TRACKMOUSEEVENT, VK_CONTROL, VK_DELETE, VK_ESCAPE, VK_F9, VK_LWIN, VK_MENU, VK_RWIN,
 };
 use windows::Win32::UI::Shell::{
     SHAppBarMessage, SHQueryUserNotificationState, ShellExecuteW, ABM_NEW, ABM_REMOVE,
@@ -51,17 +53,19 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowLongPtrW, GetWindowLongW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
     GetWindowThreadProcessId, IsIconic, IsWindowVisible, KillTimer, PostMessageW,
     SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, GWLP_USERDATA,
-    GWL_EXSTYLE, HTCLIENT, HTTRANSPARENT, HWND_TOPMOST, MA_NOACTIVATE, SWP_NOACTIVATE,
+    GWL_EXSTYLE, HTCLIENT, HTTRANSPARENT, HWND_TOPMOST, MA_ACTIVATE, MA_NOACTIVATE, SWP_NOACTIVATE,
     SWP_NOOWNERZORDER, SWP_NOZORDER, SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWNOACTIVATE,
-    SW_SHOWNORMAL, WINDOWPOS, WM_APP, WM_CAPTURECHANGED, WM_DISPLAYCHANGE, WM_DPICHANGED,
-    WM_ERASEBKGND, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_NCHITTEST,
-    WM_SETTINGCHANGE, WM_TIMER, WM_WINDOWPOSCHANGING, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
+    SW_SHOWNORMAL, WINDOWPOS, WM_APP, WM_APPCOMMAND, WM_CAPTURECHANGED, WM_CHAR, WM_DISPLAYCHANGE, WM_DPICHANGED,
+    WM_ERASEBKGND, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCHITTEST, WM_SETTINGCHANGE, WM_TIMER, WM_WINDOWPOSCHANGING,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetAncestor, IsWindow, RemovePropW, SetPropW, GA_ROOT, HWND_NOTOPMOST,
 };
 
-pub const WINDOW_LOGICAL_WIDTH: f32 = 488.0;
+/// Room for the expanded player plus the second player's bubble beside it.
+pub const WINDOW_LOGICAL_WIDTH: f32 = 720.0;
 pub const WINDOW_LOGICAL_HEIGHT: f32 = 200.0;
 
 const TIMER_HOVER_EXPAND: usize = 1;
@@ -72,6 +76,31 @@ const TIMER_DEMO: usize = 5;
 const TIMER_MEDIA_PAUSED: usize = 6;
 const TIMER_OCCLUSION: usize = 7;
 const TIMER_PREVIEW_HANDOFF: usize = 8;
+const TIMER_EMPTY_CHECK: usize = 9;
+const TIMER_MEDIA_CONDENSE: usize = 10;
+const TIMER_STATS: usize = 11;
+const TIMER_CLOCK: usize = 12;
+const TIMER_RESUME: usize = 13;
+/// After this long without a media session, play is sent to the relaunched
+/// player's window directly (Spotify reports no session until it plays).
+const RESUME_NUDGE_AFTER: std::time::Duration = std::time::Duration::from_secs(4);
+/// How long a relaunched player has to show up before resuming is dropped.
+const RESUME_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Full readings while the stats widget is on screen.
+const STATS_VISIBLE_MS: u32 = 1_000;
+/// CPU only, for the hot-CPU glow, while it is not.
+const STATS_BACKGROUND_MS: u32 = 2_000;
+/// While an app is behind the island, how often to look again at whether
+/// the space under it is empty (tabs open, a title changes). Only runs then.
+const EMPTY_CHECK_MS: u32 = 1_500;
+/// The ring that must be empty: this much all round the small resting pill,
+/// beyond its own edge, in DIPs. Never the opened size.
+const EMPTY_MARGIN_DP: f32 = 2.0;
+/// The island's own edge (its 1px outline) just outside the pill, skipped:
+/// the ring starts beyond it.
+const OWN_EDGE_DP: f32 = 1.0;
+/// With the hot-CPU halo lit, the island's own glow reaches this far out.
+const OWN_GLOW_DP: f32 = 5.0;
 /// Window moves arrive in bursts (dragging); check what is behind after this.
 const OCCLUSION_DEBOUNCE_MS: u32 = 120;
 const WM_MOUSELEAVE: u32 = 0x02A3;
@@ -95,12 +124,6 @@ const DEMO_INTERVAL_MS: u32 = 3_000;
 const POLL_HOVER_MS: u32 = 100;
 /// Monitor re-check for the opt-in "follow cursor" mode.
 const POLL_FOLLOW_MS: u32 = 500;
-/// Content-only animation (media bars, dictation waveform) is capped at the
-/// rate its data updates. Shape morphs and transitions run at full vblank.
-const CONTENT_FRAME_INTERVAL: f64 = 1.0 / 30.0;
-/// Accept a vblank this early relative to the content deadline, so 60 Hz
-/// lands on every second vblank rather than every third.
-const CONTENT_FRAME_SLACK: f64 = 0.004;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct WindowLayout {
@@ -135,6 +158,7 @@ enum RenderCommand {
     Depart,
     Arrive,
     MediaHover(Option<MediaHover>),
+    WidgetHover(Option<WidgetHover>),
     Snapshot {
         target: LayoutTarget,
         content: Box<ContentSnapshot>,
@@ -159,6 +183,7 @@ struct Demo {
 pub struct IslandHost {
     preview: Option<HWND>,
     preview_pending: Option<Option<HWND>>,
+    appearance: [f32; 4],
     hwnd: HWND,
     shared: Arc<RwLock<Config>>,
     state: IslandState,
@@ -201,9 +226,19 @@ pub struct IslandHost {
     region: Option<WindowRegion>,
     bars: Arc<BarLevels>,
     media: Option<MediaService>,
-    media_tx: Sender<Option<MediaInfo>>,
-    media_rx: Receiver<Option<MediaInfo>>,
-    last_media: Option<MediaInfo>,
+    media_tx: Sender<Vec<MediaInfo>>,
+    media_rx: Receiver<Vec<MediaInfo>>,
+    /// Active players, first-started first.
+    last_media: Vec<MediaInfo>,
+    /// App id of the player the user last opened from the bubble. It keeps
+    /// the pill after the island collapses (the two swap places) until the
+    /// user switches back or that player goes away.
+    media_focus: Option<String>,
+    /// Last "pointer is on the island" value sent to the media service.
+    media_held: bool,
+    /// The current left-button press began on a settled island, so its
+    /// release may act as a click.
+    press_armed: bool,
     dictation: Option<DictationHandle>,
     dictation_tx: Sender<UiUpdate>,
     dictation_rx: Receiver<UiUpdate>,
@@ -215,7 +250,26 @@ pub struct IslandHost {
     scrubbing: bool,
     volume_dragging: bool,
     media_hover: Option<MediaHover>,
+    widget_hover: Option<WidgetHover>,
+    /// A focus lease acquired only by a calculator click or wheel selection.
+    calculator_return_focus: Option<HWND>,
+    calculator_accepts_focus: bool,
+    widget_scroll: widgets::ScrollGate,
+    /// The last song played, shown paused when no player is open.
+    remembered: Option<crate::last_music::Remembered>,
+    /// The player was relaunched to resume the remembered song: press play
+    /// once its session shows up.
+    resume_pending: Option<(String, Instant)>,
+    /// Present while the stats widget is enabled.
+    stats_sampler: Option<crate::sysstats::Sampler>,
+    stats_interval: Option<u32>,
     tuck_enabled: bool,
+    /// Stay at the configured edge while the app behind shows nothing there.
+    stay_over_empty: bool,
+    /// The previous reading of that space while an app is behind. A move
+    /// either way during re-checks takes two agreeing readings in a row, so
+    /// a passing tooltip or a flicker never bounces the island.
+    empty_reading: Option<bool>,
     window_events: Option<occlusion::WindowEvents>,
     occlusion_pending: bool,
     warned_disconnected: bool,
@@ -229,8 +283,7 @@ impl IslandHost {
         demo_state: Option<usize>,
     ) -> WinResult<Box<Self>> {
         let config = read_config(&shared);
-        let layout =
-            compute_window_layout(&config, config.general.position == ScreenPosition::Top)?;
+        let layout = compute_window_layout(&config, config.general.position.home_is_top())?;
         apply_window_layout(hwnd, layout)?;
 
         let hit = Arc::new(Mutex::new(HitRegion::default()));
@@ -264,10 +317,23 @@ impl IslandHost {
         let mut host = Box::new(Self {
             preview: None,
             preview_pending: None,
+            appearance: [
+                config.general.top_margin_percent,
+                config.general.bottom_margin_percent,
+                config.general.top_expanded_scale,
+                config.general.bottom_expanded_scale,
+            ],
             hwnd,
             shared,
             state: IslandState {
+                calculator: config.widgets.calculator.then(widgets::Calculator::default),
+                stats: config
+                    .widgets
+                    .system_stats
+                    .then(widgets::SystemStats::default),
                 idle_style: config.general.idle_style,
+                expand_on: config.general.expand_on,
+                glance: config.general.always_on.then_some(config.general.glance),
                 ..IslandState::default()
             },
             hit,
@@ -300,7 +366,10 @@ impl IslandHost {
             media: None,
             media_tx,
             media_rx,
-            last_media: None,
+            last_media: Vec::new(),
+            media_focus: None,
+            media_held: false,
+            press_armed: false,
             dictation: None,
             dictation_tx,
             dictation_rx,
@@ -312,7 +381,17 @@ impl IslandHost {
             scrubbing: false,
             volume_dragging: false,
             media_hover: None,
-            tuck_enabled: config.general.tuck_behind_windows,
+            widget_hover: None,
+            calculator_return_focus: None,
+            calculator_accepts_focus: false,
+            widget_scroll: widgets::ScrollGate::default(),
+            stats_sampler: needs_sampler(&config).then(crate::sysstats::Sampler::new),
+            remembered: crate::last_music::load(&crate::paths::Paths::discover().data_dir),
+            resume_pending: None,
+            stats_interval: None,
+            tuck_enabled: config.general.position.docks_over_apps(),
+            stay_over_empty: config.general.stay_over_empty_space,
+            empty_reading: None,
             window_events: None,
             occlusion_pending: false,
             warned_disconnected: false,
@@ -322,8 +401,13 @@ impl IslandHost {
         host.register_appbar();
         host.send_snapshot();
         host.update_poll_timer();
+        host.update_stats_timer();
+        host.update_clock();
         if config.media.enabled && demo_state.is_none() && !demo {
             host.start_media();
+        }
+        if demo_state.is_none() && !demo {
+            host.send_remembered();
         }
         if let Some(step) = demo_state {
             host.demo = Some(Demo { step });
@@ -350,6 +434,7 @@ impl IslandHost {
     }
 
     pub fn shutdown(&mut self) {
+        self.release_calculator_focus();
         unsafe {
             let _ = KillTimer(Some(self.hwnd), TIMER_HOVER_EXPAND);
             let _ = KillTimer(Some(self.hwnd), TIMER_HOVER_COLLAPSE);
@@ -358,7 +443,12 @@ impl IslandHost {
             let _ = KillTimer(Some(self.hwnd), TIMER_DEMO);
             let _ = KillTimer(Some(self.hwnd), TIMER_MEDIA_PAUSED);
             let _ = KillTimer(Some(self.hwnd), TIMER_OCCLUSION);
+            let _ = KillTimer(Some(self.hwnd), TIMER_EMPTY_CHECK);
+            let _ = KillTimer(Some(self.hwnd), TIMER_MEDIA_CONDENSE);
+            let _ = KillTimer(Some(self.hwnd), TIMER_STATS);
+            let _ = KillTimer(Some(self.hwnd), TIMER_CLOCK);
         }
+        self.stats_sampler = None;
         self.window_events = None;
         self.dictation = None;
         self.loopback = None;
@@ -376,14 +466,30 @@ impl IslandHost {
 
     pub fn apply_config(&mut self) {
         let config = read_config(&self.shared);
+        self.appearance = [
+            config.general.top_margin_percent,
+            config.general.bottom_margin_percent,
+            config.general.top_expanded_scale,
+            config.general.bottom_expanded_scale,
+        ];
         if let Some(dictation) = &self.dictation {
             dictation.configure(&config.dictation);
         }
-        self.anchor_top = config.general.position == ScreenPosition::Top;
+        self.anchor_top = config.general.position.home_is_top();
         self.hide_in_fullscreen = config.general.hide_in_fullscreen;
         self.follow_cursor = config.general.monitor == MonitorChoice::FollowCursor;
         self.idle_style = config.general.idle_style;
+        self.dispatch(IslandEvent::SetCalculatorEnabled(config.widgets.calculator));
+        if needs_sampler(&config) != self.stats_sampler.is_some() {
+            self.stats_sampler = needs_sampler(&config).then(crate::sysstats::Sampler::new);
+        }
+        self.dispatch(IslandEvent::SetStatsEnabled(config.widgets.system_stats));
+        self.dispatch(IslandEvent::SetGlance(
+            config.general.always_on.then_some(config.general.glance),
+        ));
+        self.update_clock();
         self.dispatch(IslandEvent::SetIdleStyle(self.idle_style));
+        self.dispatch(IslandEvent::SetExpandTrigger(config.general.expand_on));
         self.dispatch(IslandEvent::SetMediaPauseDelay(
             config.media.pause_hide_seconds.saturating_mul(1_000),
         ));
@@ -392,11 +498,18 @@ impl IslandHost {
                 (true, false) => self.start_media(),
                 (false, true) => {
                     self.media = None;
-                    self.last_media = None;
-                    self.dispatch(IslandEvent::SetMedia(None));
+                    self.last_media.clear();
+                    self.media_focus = None;
+                    self.dispatch_all([
+                        IslandEvent::SetOtherMedia(None),
+                        IslandEvent::SetMedia(None),
+                    ]);
                 }
                 _ => {}
             }
+        }
+        if let Some(service) = &self.media {
+            service.set_pause_hold(media_pause_hold(&config));
         }
         let filter = music_filter(&config);
         if filter != self.music_filter {
@@ -405,7 +518,8 @@ impl IslandHost {
             }
             self.music_filter = filter;
         }
-        self.tuck_enabled = config.general.tuck_behind_windows;
+        self.tuck_enabled = config.general.position.docks_over_apps();
+        self.stay_over_empty = config.general.stay_over_empty_space;
         if !self.tuck_enabled {
             // Drop the hooks before the window starts moving so the last
             // occlusion check cannot re-tuck it mid-reposition.
@@ -460,7 +574,8 @@ impl IslandHost {
                 if unsafe { IsWindow(Some(anchor)) }.as_bool() {
                     if self.preview == Some(anchor) {
                         self.refresh_preview();
-                    } else if self.preview_pending.is_none() {
+                        self.send_snapshot();
+                    } else if self.preview_pending != Some(Some(anchor)) {
                         unsafe {
                             let _ = SetPropW(
                                 anchor,
@@ -538,24 +653,46 @@ impl IslandHost {
             }
             WM_MOUSEMOVE => {
                 self.track_mouse();
-                let inside = self.cursor_inside();
-                self.dispatch(if inside {
-                    IslandEvent::HoverEnter
-                } else {
-                    IslandEvent::HoverLeave
-                });
+                self.dispatch_hover(self.cursor_inside());
                 self.update_media_hover();
+                Some(LRESULT(0))
+            }
+            WM_MOUSEWHEEL => {
+                let mut point = point_from_lparam(lparam);
+                if self.state.widget_navigation_available()
+                    && self.shape_settled()
+                    && !self.scrubbing
+                    && !self.volume_dragging
+                    && unsafe { ScreenToClient(self.hwnd, &mut point) }.as_bool()
+                    && self.widget_point(point).is_some()
+                {
+                    let delta = ((wparam.0 >> 16) as u16 as i16) as i32;
+                    if self.widget_scroll.push(delta, clock_now()) {
+                        self.set_widget_hover(None);
+                        self.set_media_hover(None);
+                        self.dispatch(IslandEvent::CycleWidget);
+                        self.focus_calculator();
+                    }
+                }
                 Some(LRESULT(0))
             }
             WM_MOUSELEAVE => {
                 self.tracking_mouse = false;
                 if !self.scrubbing && !self.volume_dragging {
                     self.set_media_hover(None);
-                    self.dispatch(IslandEvent::HoverLeave);
+                    self.set_widget_hover(None);
+                    self.dispatch_hover(false);
                 }
                 Some(LRESULT(0))
             }
             WM_LBUTTONDOWN => {
+                // While the island is still growing or shrinking, what is under
+                // the pointer on screen is not the layout the controls use.
+                // Ignore the whole press rather than guess.
+                self.press_armed = self.shape_settled();
+                if !self.press_armed {
+                    return Some(LRESULT(0));
+                }
                 if let Some((x, y, width)) = self.media_point(lparam) {
                     let seekable = self.media_duration().is_some();
                     if let Some(fraction) = scrub_fraction(x, y, width, false).filter(|_| seekable)
@@ -584,10 +721,18 @@ impl IslandHost {
                 Some(LRESULT(0))
             }
             WM_LBUTTONUP => {
+                let armed = std::mem::take(&mut self.press_armed);
                 if self.scrubbing {
                     self.finish_scrub(true);
                 } else if self.volume_dragging {
                     self.finish_volume();
+                } else if !armed || !self.shape_settled() {
+                    // Pressed or released mid-animation: not a click.
+                } else if self.handle_widget_click(lparam) {
+                    // Widget controls never toggle or operate the music player.
+                } else if self.media_bubble_hit(lparam) {
+                    self.switch_player();
+
                 } else if let Some(action) = self
                     .media_point(lparam)
                     .and_then(|(x, y, width)| expanded_action_at(x, y, width))
@@ -596,7 +741,40 @@ impl IslandHost {
                 } else {
                     self.dispatch(IslandEvent::Click);
                 }
+                self.focus_calculator();
                 Some(LRESULT(0))
+            }
+            WM_CHAR if self.calculator_keyboard_active() => {
+                if !calculator_shortcut_held() {
+                    if let Some(key) = char::from_u32(wparam.0 as u32)
+                        .and_then(widgets::CalculatorKey::from_character)
+                    {
+                        // Coalesced Windows repeats become one render snapshot.
+                        let repeats = (lparam.0 as u16).clamp(1, 64) as usize;
+                        self.dispatch_all((0..repeats).map(|_| IslandEvent::CalculatorKey(key)));
+                    }
+                }
+                Some(LRESULT(0))
+            }
+            WM_KEYDOWN if self.calculator_keyboard_active() && !calculator_shortcut_held() => {
+                let key = match wparam.0 as u16 {
+                    value if value == VK_DELETE.0 || value == VK_ESCAPE.0 => {
+                        Some(widgets::CalculatorKey::Clear)
+                    }
+                    value if value == VK_F9.0 => Some(widgets::CalculatorKey::Negate),
+                    _ => None,
+                };
+                if let Some(key) = key {
+                    self.dispatch(IslandEvent::CalculatorKey(key));
+                    Some(LRESULT(0))
+                } else {
+                    None
+                }
+            }
+            WM_KILLFOCUS => {
+                // Another app was deliberately selected: never reclaim focus.
+                self.calculator_return_focus = None;
+                None
             }
             WM_CAPTURECHANGED => {
                 if self.scrubbing {
@@ -627,6 +805,7 @@ impl IslandHost {
             WM_APP_DICTATION => {
                 while let Ok(update) = self.dictation_rx.try_recv() {
                     match update {
+                        UiUpdate::PauseMedia => islet_media::pause_playing_media(),
                         UiUpdate::Card(card) => self.dispatch(IslandEvent::SetDictation(card)),
                         UiUpdate::Notice(notice) => {
                             self.dispatch(IslandEvent::SetDone(Some(notice)));
@@ -642,11 +821,29 @@ impl IslandHost {
                 }
                 if let Some(info) = latest {
                     self.last_media = info;
+                    self.finish_resume();
+                    // The opened player went away: the pill goes back to the
+                    // first-started one, and a later return starts fresh.
+                    if self.media_focus.as_ref().is_some_and(|focus| {
+                        !self.last_media.iter().any(|info| &info.app_id == focus)
+                    }) {
+                        self.media_focus = None;
+                    }
                     self.apply_media();
                 }
                 Some(LRESULT(0))
             }
-            WM_MOUSEACTIVATE => Some(LRESULT(MA_NOACTIVATE as isize)),
+            WM_MOUSEACTIVATE => {
+                if self.calculator_keyboard_available() {
+                    let previous = unsafe { GetForegroundWindow() };
+                    if previous != self.hwnd && unsafe { IsWindow(Some(previous)) }.as_bool() {
+                        self.calculator_return_focus = Some(previous);
+                    }
+                    Some(LRESULT(MA_ACTIVATE as isize))
+                } else {
+                    Some(LRESULT(MA_NOACTIVATE as isize))
+                }
+            }
             WM_TIMER => {
                 if wparam.0 == TIMER_PREVIEW_HANDOFF {
                     return self.handle_message(self.hwnd, PREVIEW_DEPARTED, WPARAM(0), LPARAM(0));
@@ -677,6 +874,7 @@ impl IslandHost {
                         self.traveling = false;
                         self.set_click_through(false);
                     }
+                    self.update_calculator_activation();
                     self.update_region();
                 }
                 Some(LRESULT(0))
@@ -698,20 +896,120 @@ impl IslandHost {
     }
 
     fn dispatch(&mut self, event: IslandEvent) {
-        let effects = reduce(&mut self.state, event, clock_now());
+        self.dispatch_all([event]);
+    }
+
+    /// Applies several events as one change, so the renderer gets a single
+    /// snapshot (two players swapping places is one move, not two).
+    fn dispatch_all(&mut self, events: impl IntoIterator<Item = IslandEvent>) {
         let mut changed = false;
-        for effect in effects {
-            match effect {
-                Effect::ArmTimer { kind, after_ms } => self.arm_timer(kind, after_ms),
-                Effect::CancelTimer(kind) => self.cancel_timer(kind),
-                Effect::LayoutChanged | Effect::ContentChanged => changed = true,
-            }
+        for event in events {
+            changed |= self.reduce_one(event);
         }
         if changed {
             self.send_snapshot();
         }
         self.update_poll_timer();
         self.update_loopback();
+        self.update_media_held();
+        self.update_stats_timer();
+    }
+
+    /// Readings run only while the stats widget is enabled: every second
+    /// while it is on screen, otherwise every two seconds and CPU only.
+    fn update_stats_timer(&mut self) {
+        let interval = self.stats_sampler.is_some().then(|| {
+            if self.state.stats_visible() {
+                STATS_VISIBLE_MS
+            } else {
+                STATS_BACKGROUND_MS
+            }
+        });
+        if interval == self.stats_interval {
+            return;
+        }
+        let became_visible = interval == Some(STATS_VISIBLE_MS);
+        self.stats_interval = interval;
+        unsafe {
+            match interval {
+                Some(ms) => {
+                    SetTimer(Some(self.hwnd), TIMER_STATS, ms, None);
+                }
+                None => {
+                    let _ = KillTimer(Some(self.hwnd), TIMER_STATS);
+                }
+            }
+        }
+        if became_visible {
+            // Fill the card now rather than a second after it opens.
+            self.sample_stats();
+        }
+    }
+
+    fn sample_stats(&mut self) {
+        let visible = self.state.stats_visible();
+        let Some(sampler) = &mut self.stats_sampler else {
+            return;
+        };
+        if visible {
+            let reading = sampler.full();
+            let hot = sampler.hot();
+            self.dispatch_all([IslandEvent::SetStats(reading), IslandEvent::SetCpuHot(hot)]);
+        } else if self.state.glance == Some(IdleGlance::Stats) {
+            let (cpu, memory) = sampler.light();
+            let hot = sampler.hot();
+            self.dispatch_all([
+                IslandEvent::SetGlanceStats { cpu, memory },
+                IslandEvent::SetCpuHot(hot),
+            ]);
+        } else {
+            sampler.cpu();
+            let hot = sampler.hot();
+            self.dispatch(IslandEvent::SetCpuHot(hot));
+        }
+    }
+
+    /// Keeps the always-on clock current: one wakeup a minute, on the
+    /// minute, and none when the clock is not in use.
+    fn update_clock(&mut self) {
+        let wanted = matches!(
+            self.state.glance,
+            Some(IdleGlance::Clock)
+        );
+        unsafe {
+            if wanted {
+                SetTimer(Some(self.hwnd), TIMER_CLOCK, crate::clock::until_next_minute(), None);
+            } else {
+                let _ = KillTimer(Some(self.hwnd), TIMER_CLOCK);
+                return;
+            }
+        }
+        let (time, long_date) = crate::clock::now();
+        self.dispatch(IslandEvent::SetGlanceTime { time, long_date });
+    }
+
+    /// Runs one event through the reducer; true if the island changed.
+    fn reduce_one(&mut self, event: IslandEvent) -> bool {
+        let mut changed = false;
+        for effect in reduce(&mut self.state, event, clock_now()) {
+            match effect {
+                Effect::ArmTimer { kind, after_ms } => self.arm_timer(kind, after_ms),
+                Effect::CancelTimer(kind) => self.cancel_timer(kind),
+                Effect::LayoutChanged | Effect::ContentChanged => changed = true,
+            }
+        }
+        changed
+    }
+
+    /// Paused players keep their place while the pointer is on the island.
+    fn update_media_held(&mut self) {
+        let held = self.state.pointer_inside;
+        if held != self.media_held {
+            self.media_held = held;
+            if let Some(service) = &self.media {
+                service.set_held(held);
+            }
+        }
     }
 
     /// Hooks window events only while slim mode is enabled.
@@ -741,11 +1039,93 @@ impl IslandHost {
         if self.demo.is_some() {
             return;
         }
-        let tucked = self.window_events.is_some() && self.window_behind_island();
+        let behind = self.window_events.is_some() && self.window_behind_island();
+        let tucked = behind && !self.home_space_is_empty();
+        // Content under the island can change without any window event (a
+        // new tab, a title), so look again now and then, but only while an
+        // app is actually behind it.
+        let recheck = behind && self.stay_over_empty;
+        unsafe {
+            if recheck {
+                SetTimer(Some(self.hwnd), TIMER_EMPTY_CHECK, EMPTY_CHECK_MS, None);
+            } else {
+                let _ = KillTimer(Some(self.hwnd), TIMER_EMPTY_CHECK);
+            }
+        }
+        if !behind {
+            self.empty_reading = None;
+        }
         if tucked == self.state.tucked {
             return;
         }
         self.dispatch(IslandEvent::SetTucked(tucked));
+    }
+
+    /// The app behind the island shows one flat colour where the island sits
+    /// (and a margin around it), so the island can stay there.
+    fn home_space_is_empty(&mut self) -> bool {
+        if !self.stay_over_empty {
+            return false;
+        }
+        // In use, or still moving (its own shape would be in the sample):
+        // keep the verdict.
+        if self.state.expanded
+            || self.state.pointer_inside
+            || self.traveling
+            || self.morph_box.is_some()
+        {
+            return !self.state.tucked;
+        }
+        let Some(home) = self.home_layout else {
+            return false;
+        };
+        let scale = home.dpi as f32 / 96.0;
+        let to_screen = |rect: Rect| {
+            Rect::new(
+                home.x as f32 + rect.x * scale,
+                home.y as f32 + rect.y * scale,
+                rect.width * scale,
+                rect.height * scale,
+            )
+        };
+        // The small pill where it rests, its own edge (or glow), and a 2px
+        // ring beyond that: only the ring is judged while the island sits
+        // there; from the other edge, the whole spot is.
+        let footprint = self.home_footprint(home);
+        let own = if self.state.cpu_hot {
+            OWN_GLOW_DP
+        } else {
+            OWN_EDGE_DP
+        };
+        let zone = to_screen(footprint.inflate(own + EMPTY_MARGIN_DP));
+        let exclude = (!self.state.tucked).then(|| to_screen(footprint.inflate(own)));
+        let empty = occlusion::zone_is_blank(zone, exclude).unwrap_or(false);
+        let previous = self.empty_reading.replace(empty);
+        match previous {
+            // A changed reading must repeat before the island moves.
+            Some(previous) if previous != empty => !self.state.tucked,
+            _ => empty,
+        }
+    }
+
+    /// Where the resting pill sits at the configured edge (logical pixels),
+    /// at the size it has now (shrunk while music has played a while).
+    fn home_footprint(&self, home: WindowLayout) -> Rect {
+        let margin = if home.anchor_top {
+            self.appearance[0]
+        } else {
+            self.appearance[1]
+        };
+        arrange(
+            self.state.resting_size(),
+            None,
+            0.0,
+            islet_core::island::EDGE_GAP_DP + home.logical_height * margin / 100.0,
+            WINDOW_LOGICAL_WIDTH,
+            home.logical_height,
+            home.anchor_top,
+        )
+        .main
     }
 
     fn window_behind_island(&self) -> bool {
@@ -756,16 +1136,7 @@ impl IslandHost {
         // pixels: exactly where the resting pill is drawn, nothing more. A
         // window may be anywhere else on the screen without disturbing it.
         let scale = home.dpi as f32 / 96.0;
-        let compact = arrange(
-            islet_core::island::COMPACT,
-            None,
-            0.0,
-            islet_core::island::EDGE_GAP_DP,
-            WINDOW_LOGICAL_WIDTH,
-            self.logical_height,
-            home.anchor_top,
-        )
-        .main;
+        let compact = self.home_footprint(home);
         let zone = Rect::new(
             home.x as f32 + compact.x * scale,
             home.y as f32 + compact.y * scale,
@@ -819,16 +1190,129 @@ impl IslandHost {
             }
         });
         match service {
-            Ok(service) => self.media = Some(service),
+            Ok(service) => {
+                service.set_pause_hold(media_pause_hold(&read_config(&self.shared)));
+                self.media_held = false;
+                self.media = Some(service);
+            }
             Err(error) => tracing::warn!(%error, "could not start the media thread"),
         }
     }
 
-    /// Converts the latest media report into the island's card.
+    /// Converts the latest media report into the island's cards.
     fn apply_media(&mut self) {
-        if self.demo.is_some() {
+        self.remember_playing();
+        let events = self.media_events();
+        self.dispatch_all(events);
+    }
+
+    /// Keeps the song now playing on disk, once per track and cover.
+    fn remember_playing(&mut self) {
+        let Some(info) = self
+            .focused_media()
+            .filter(|info| {
+                info.playing
+                    && !islet_core::music::is_chat_app(&format!("{} {}", info.app_id, info.source))
+            })
+        else {
+            return;
+        };
+        let card = MediaCard {
+            title: info.title.clone(),
+            artist: info.artist.clone(),
+            source: info.source.clone(),
+            playing: true,
+            timeline: None,
+            art: info.art.clone(),
+            accent: info.accent,
+            scrub: None,
+            volume: None,
+        };
+        let next = crate::last_music::Remembered::from_live(&info.app_id, &card);
+        if self.remembered.as_ref().is_some_and(|known| known.same_as(&next)) {
             return;
         }
+        crate::last_music::save(&crate::paths::Paths::discover().data_dir, &next);
+        self.remembered = Some(next);
+        self.send_remembered();
+    }
+
+    /// Hands the remembered song to the island for its opened view.
+    fn send_remembered(&mut self) {
+        let card = self.remembered.as_ref().map(|remembered| MediaCard {
+            accent: remembered.card.accent.filter(|_| self.color_tint),
+            ..remembered.card.clone()
+        });
+        self.dispatch(IslandEvent::SetRemembered(card));
+    }
+
+    /// Presses play on a player relaunched for the remembered song: on its
+    /// media session once that appears, or, if the app reports none (Spotify
+    /// until something plays), on its own window. Only that app is touched.
+    fn finish_resume(&mut self) {
+        let Some((app_id, asked)) = self.resume_pending.clone() else {
+            return;
+        };
+        let done = if asked.elapsed() > RESUME_WAIT {
+            true
+        } else if let Some(info) = self.last_media.iter().find(|info| info.app_id == app_id) {
+            if !info.playing {
+                if let Some(service) = &self.media {
+                    service.send(&app_id, MediaCommand::TogglePlayPause);
+                }
+            }
+            true
+        } else if asked.elapsed() >= RESUME_NUDGE_AFTER {
+            let source = self
+                .remembered
+                .as_ref()
+                .map(|remembered| remembered.card.source.clone())
+                .unwrap_or_default();
+            match find_app_window(&app_id, &source) {
+                Some(window) => {
+                    const APPCOMMAND_MEDIA_PLAY_PAUSE: isize = 14;
+                    unsafe {
+                        let _ = PostMessageW(
+                            Some(window),
+                            WM_APPCOMMAND,
+                            WPARAM(self.hwnd.0 as usize),
+                            LPARAM(APPCOMMAND_MEDIA_PLAY_PAUSE << 16),
+                        );
+                    }
+                    true
+                }
+                None => false,
+            }
+        } else {
+            false
+        };
+        if done {
+            self.resume_pending = None;
+            unsafe {
+                let _ = KillTimer(Some(self.hwnd), TIMER_RESUME);
+            }
+        }
+    }
+
+    /// The player in the main pill: the one the user switched to, else the
+    /// first-started one.
+    fn focused_media(&self) -> Option<&MediaInfo> {
+        self.media_focus
+            .as_ref()
+            .and_then(|focus| self.last_media.iter().find(|info| &info.app_id == focus))
+            .or_else(|| self.last_media.first())
+    }
+
+    /// Main-pill and bubble cards for the current players.
+    fn media_events(&self) -> Vec<IslandEvent> {
+        if self.demo.is_some() {
+            return Vec::new();
+        }
+        let main = self.focused_media();
+        let other = self
+            .last_media
+            .iter()
+            .find(|info| Some(info.app_id.as_str()) != main.map(|main| main.app_id.as_str()));
         let scrub = self
             .state
             .media
@@ -836,7 +1320,7 @@ impl IslandHost {
             .and_then(|media| media.scrub)
             .filter(|_| self.scrubbing);
         let volume = self.volume.as_ref().and_then(VolumeHandle::read);
-        let card = self.last_media.as_ref().map(|info| MediaCard {
+        let card = |info: &MediaInfo| MediaCard {
             title: info.title.clone(),
             artist: info.artist.clone(),
             source: info.source.clone(),
@@ -849,10 +1333,96 @@ impl IslandHost {
             }),
             art: info.art.clone(),
             accent: info.accent.filter(|_| self.color_tint),
-            scrub,
-            volume,
-        });
-        self.dispatch(IslandEvent::SetMedia(card));
+            scrub: None,
+            volume: None,
+        };
+        vec![
+            IslandEvent::SetOtherMedia(other.map(card)),
+            IslandEvent::SetMedia(main.map(|info| MediaCard {
+                scrub,
+                volume,
+                ..card(info)
+            })),
+        ]
+    }
+
+    /// The island has finished moving: the render thread confirmed the last
+    /// shape change settled, so what is on screen matches the hit zones.
+    fn shape_settled(&self) -> bool {
+        self.morph_box.is_none() && !self.traveling
+    }
+
+    /// True if a click at `lparam` landed on a second player's bubble.
+    fn media_bubble_hit(&self, lparam: LPARAM) -> bool {
+        let point = point_from_lparam(lparam);
+        self.media_bubble_at(point.x, point.y)
+    }
+
+    /// True if the client pixel is on a second player's bubble.
+    fn media_bubble_at(&self, x: i32, y: i32) -> bool {
+        if !matches!(
+            self.state.content().secondary,
+            Some(islet_core::ContentCard::Media(_))
+        ) {
+            return false;
+        }
+        let Some(bubble) = self
+            .target_frame(
+                self.customized_layout(self.state.layout(), self.effective_anchor_top()),
+                self.effective_anchor_top(),
+            )
+            .bubble
+        else {
+            return false;
+        };
+        let scale = self.dpi as f32 / 96.0;
+        bubble.contains(x as f32 / scale, y as f32 / scale)
+    }
+
+    fn cursor_on_media_bubble(&self) -> bool {
+        let mut point = POINT::default();
+        unsafe { GetCursorPos(&mut point) }.is_ok()
+            && unsafe { ScreenToClient(self.hwnd, &mut point) }.as_bool()
+            && self.media_bubble_at(point.x, point.y)
+    }
+
+    /// Hover in or out of the island. The second player's bubble is a
+    /// button: resting on it keeps the island as it is instead of expanding.
+    fn dispatch_hover(&mut self, inside: bool) {
+        if inside {
+            let on_switcher = self.cursor_on_media_bubble();
+            self.dispatch_all([
+                IslandEvent::HoverSwitcher(on_switcher),
+                IslandEvent::HoverEnter,
+            ]);
+        } else {
+            self.release_calculator_focus();
+            self.dispatch_all([IslandEvent::HoverLeave, IslandEvent::HoverSwitcher(false)]);
+        }
+    }
+
+    /// Opens the bubble's player in the expanded island; while expanded,
+    /// the bubble then holds the other one, so clicking it swaps back.
+    fn switch_player(&mut self) {
+        if self.demo.is_some() {
+            std::mem::swap(&mut self.state.media, &mut self.state.other_media);
+            self.state.expanded = true;
+            self.send_snapshot();
+            return;
+        }
+        let shown = self.focused_media().map(|info| info.app_id.clone());
+        let Some(next) = self
+            .last_media
+            .iter()
+            .find(|info| Some(&info.app_id) != shown.as_ref())
+            .map(|info| info.app_id.clone())
+        else {
+            return;
+        };
+        self.media_focus = Some(next);
+        let mut events = self.media_events();
+        events.push(IslandEvent::SetExpanded(true));
+        self.dispatch_all(events);
     }
 
     /// Runs the loopback visualizer only while playing media is on screen.
@@ -861,6 +1431,10 @@ impl IslandHost {
             && self.media.is_some()
             && !self.fullscreen_hidden
             && self.state.dictation.is_none()
+            && !matches!(
+                self.state.primary_card(),
+                Some(islet_core::ContentCard::Calculator(_))
+            )
             && self.state.media.as_ref().is_some_and(|media| media.playing);
         match (wanted, self.loopback.is_some()) {
             (true, false) => match Loopback::start(Arc::clone(&self.bars), clock_now_ms) {
@@ -891,12 +1465,139 @@ impl IslandHost {
         let scale = self.dpi as f32 / 96.0;
         // Client-area mouse messages carry client coordinates.
         let point = point_from_lparam(lparam);
+        let layout = self.customized_layout(layout, self.effective_anchor_top());
         let main = self.target_frame(layout, self.effective_anchor_top()).main;
         Some((
-            point.x as f32 / scale - main.x,
-            point.y as f32 / scale - main.y,
-            main.width,
+            (point.x as f32 / scale - main.x) / layout.content_scale,
+            (point.y as f32 / scale - main.y) / layout.content_scale,
+            main.width / layout.content_scale,
         ))
+    }
+
+    fn widget_point(&self, point: POINT) -> Option<(f32, f32)> {
+        if !self.state.expanded || self.traveling || self.fullscreen_hidden {
+            return None;
+        }
+        let layout = self.customized_layout(self.state.layout(), self.effective_anchor_top());
+        let main = self.target_frame(layout, self.effective_anchor_top()).main;
+        let dpi = self.dpi as f32 / 96.0;
+        let (x, y) = (point.x as f32 / dpi, point.y as f32 / dpi);
+        main.contains(x, y).then_some((
+            (x - main.x) / layout.content_scale,
+            (y - main.y) / layout.content_scale,
+        ))
+    }
+
+    fn widget_hover_at(&self, point: POINT) -> Option<WidgetHover> {
+        let (x, y) = self.widget_point(point)?;
+        let calculator = matches!(
+            self.state.primary_card(),
+            Some(islet_core::ContentCard::Calculator(_))
+        );
+        if calculator {
+            widgets::key_at(x, y).map(WidgetHover::Key)
+        } else {
+            None
+        }
+    }
+
+    fn calculator_keyboard_available(&self) -> bool {
+        self.state.expanded
+            && !self.traveling
+            && !self.fullscreen_hidden
+            && self.preview_pending.is_none()
+            && matches!(
+                self.state.primary_card(),
+                Some(islet_core::ContentCard::Calculator(_))
+            )
+    }
+
+    fn calculator_keyboard_active(&self) -> bool {
+        self.calculator_keyboard_available()
+            && unsafe { GetForegroundWindow() == self.hwnd && GetFocus() == self.hwnd }
+    }
+
+    fn update_calculator_activation(&mut self) {
+        let accepts_focus = self.calculator_keyboard_available();
+        if accepts_focus != self.calculator_accepts_focus {
+            unsafe {
+                let style = GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE);
+                let no_activate = WS_EX_NOACTIVATE.0 as isize;
+                SetWindowLongPtrW(
+                    self.hwnd,
+                    GWL_EXSTYLE,
+                    if accepts_focus {
+                        style & !no_activate
+                    } else {
+                        style | no_activate
+                    },
+                );
+            }
+            self.calculator_accepts_focus = accepts_focus;
+        }
+    }
+
+    fn focus_calculator(&mut self) {
+        if !self.calculator_keyboard_available() {
+            return;
+        }
+        unsafe {
+            let previous = GetForegroundWindow();
+            let activated = previous != self.hwnd && SetForegroundWindow(self.hwnd).as_bool();
+            tracing::debug!(activated, foreground = ?GetForegroundWindow(), "calculator keyboard focus requested");
+            if activated {
+                self.calculator_return_focus =
+                    IsWindow(Some(previous)).as_bool().then_some(previous);
+                let _ = SetFocus(Some(self.hwnd));
+            }
+        }
+    }
+
+    fn release_calculator_focus(&mut self) {
+        if let Some(previous) = self.calculator_return_focus.take() {
+            tracing::debug!("calculator keyboard focus released");
+            unsafe {
+                if GetForegroundWindow() == self.hwnd && IsWindow(Some(previous)).as_bool() {
+                    let _ = SetForegroundWindow(previous);
+                }
+            }
+        }
+    }
+
+    fn set_widget_hover(&mut self, hover: Option<WidgetHover>) {
+        if self.widget_hover != hover {
+            self.widget_hover = hover;
+            let _ = self.tx.send(RenderCommand::WidgetHover(hover));
+        }
+    }
+
+    fn update_widget_hover(&mut self) {
+        let mut point = POINT::default();
+        let hover = if unsafe { GetCursorPos(&mut point) }.is_ok()
+            && unsafe { ScreenToClient(self.hwnd, &mut point) }.as_bool()
+        {
+            self.widget_hover_at(point)
+        } else {
+            None
+        };
+        self.set_widget_hover(hover);
+    }
+
+    fn handle_widget_click(&mut self, lparam: LPARAM) -> bool {
+        let point = point_from_lparam(lparam);
+        match self.widget_hover_at(point) {
+            Some(WidgetHover::Key(key)) => {
+                self.dispatch(IslandEvent::CalculatorKey(key));
+                true
+            }
+            None => {
+                self.widget_point(point).is_some()
+                    && matches!(
+                        self.state.primary_card(),
+                        Some(islet_core::ContentCard::Calculator(_))
+                    )
+            }
+        }
     }
 
     fn media_duration(&self) -> Option<f64> {
@@ -918,6 +1619,7 @@ impl IslandHost {
     /// Reconcile on mouse movement, expansion, and the existing hover poll,
     /// including when the island moves under a stationary pointer.
     fn update_media_hover(&mut self) {
+        self.update_widget_hover();
         let mut point = POINT::default();
         let hover = if !self.state.expanded || self.fullscreen_hidden || self.traveling {
             None
@@ -931,12 +1633,13 @@ impl IslandHost {
             match self.state.primary_card() {
                 Some(islet_core::ContentCard::Media(media)) => {
                     let layout = self.state.layout();
+                    let layout = self.customized_layout(layout, self.effective_anchor_top());
                     let main = self.target_frame(layout, self.effective_anchor_top()).main;
                     let scale = self.dpi as f32 / 96.0;
                     expanded_hover_at(
-                        point.x as f32 / scale - main.x,
-                        point.y as f32 / scale - main.y,
-                        main.width,
+                        (point.x as f32 / scale - main.x) / layout.content_scale,
+                        (point.y as f32 / scale - main.y) / layout.content_scale,
+                        main.width / layout.content_scale,
                         media
                             .timeline
                             .is_some_and(|timeline| timeline.duration > 0.0),
@@ -1036,6 +1739,8 @@ impl IslandHost {
             return;
         }
         let Some(mut media) = self.state.media.clone() else {
+            // The opened island is showing the remembered song.
+            self.remembered_action(action);
             return;
         };
         let now = clock_now();
@@ -1061,15 +1766,68 @@ impl IslandHost {
             MediaAction::OpenApp => unreachable!(),
         };
         media.scrub = None;
-        if let Some(service) = &self.media {
-            service.send(command);
+        if let (Some(service), Some(info)) = (&self.media, self.focused_media()) {
+            service.send(&info.app_id, command);
         }
         self.dispatch(IslandEvent::SetMedia(Some(media)));
     }
 
+    /// A control on the remembered song. A player still open in the
+    /// background (paused, so no longer on the island) takes the command
+    /// directly; a closed app is opened and play is pressed once its session
+    /// appears; a closed browser has no tab to return to, so the song is
+    /// looked up on YouTube Music instead.
+    fn remembered_action(&mut self, action: MediaAction) {
+        let remembered_app = self.remembered.as_ref().map(|r| r.app_id.clone());
+        // Only the remembered song's own player: another app with a media
+        // session (WhatsApp voice notes, say) must never be started instead.
+        let live = remembered_app
+            .as_deref()
+            .and_then(|app| self.last_media.iter().find(|info| info.app_id == app))
+            .map(|info| info.app_id.clone());
+        let command = match action {
+            MediaAction::PlayPause => Some(MediaCommand::TogglePlayPause),
+            MediaAction::Next => Some(MediaCommand::Next),
+            MediaAction::Previous => Some(MediaCommand::Previous),
+            MediaAction::Seek(_) | MediaAction::OpenApp => None,
+        };
+        if let Some(app) = &live {
+            match (command, &self.media) {
+                (Some(command), Some(service)) => service.send(app, command),
+                _ if action == MediaAction::OpenApp => self.open_current_media_app(),
+                _ => {}
+            }
+            return;
+        }
+        if !matches!(action, MediaAction::PlayPause | MediaAction::OpenApp) {
+            return;
+        }
+        let Some(remembered) = &self.remembered else {
+            return;
+        };
+        let card = &remembered.card;
+        if action == MediaAction::PlayPause && is_browser(&remembered.app_id, &card.source) {
+            let query = format!("{} {}", card.title, card.artist);
+            shell_execute(&format!(
+                "https://music.youtube.com/search?q={}",
+                url_encode(query.trim())
+            ));
+            return;
+        }
+        open_media_source(&remembered.app_id, &card.source);
+        if action == MediaAction::PlayPause {
+            self.resume_pending = Some((remembered.app_id.clone(), Instant::now()));
+            unsafe {
+                SetTimer(Some(self.hwnd), TIMER_RESUME, 1_000, None);
+            }
+        }
+    }
+
     fn open_current_media_app(&self) {
-        if let Some(info) = &self.last_media {
+        if let Some(info) = self.focused_media() {
             open_media_source(&info.app_id, &info.source);
+        } else if let Some(remembered) = &self.remembered {
+            open_media_source(&remembered.app_id, &remembered.card.source);
         }
     }
 
@@ -1140,12 +1898,34 @@ impl IslandHost {
     }
 
     fn send_snapshot(&mut self) {
+        self.update_calculator_activation();
+        if !self.calculator_keyboard_available() {
+            self.release_calculator_focus();
+        }
+        let customizing = self.preview_property(w!("IsletCustomize")) != 0;
         let preview_state = self.preview.map(|_| {
             let mut state = self.state.clone();
             state.tucked = false;
+            if customizing {
+                state.dictation = None;
+                state.done = None;
+                state.needs_input = None;
+                state.running = None;
+                state.expanded = true;
+                if state.media.is_none() {
+                    let mut media = demo_media();
+                    media.title = "Your island".into();
+                    media.artist = "Expanded preview".into();
+                    media.source = String::new();
+                    media.playing = false;
+                    media.timeline = None;
+                    media.volume = None;
+                    state.media = Some(media);
+                }
+            }
             if state.content().primary.is_none() {
                 state.running = Some(AgentCard {
-                    project: "Islet".into(),
+                    project: "Onyx".into(),
                     activity: "Ready when you are".into(),
                     state: AgentState::Done,
                 });
@@ -1153,9 +1933,9 @@ impl IslandHost {
             state
         });
         let display_state = preview_state.as_ref().unwrap_or(&self.state);
-        let target = display_state.layout();
-        let content = display_state.content();
         let anchor_top = self.effective_anchor_top();
+        let target = self.customized_layout(display_state.layout(), anchor_top);
+        let content = display_state.content();
         if self
             .last_sent_anchor_top
             .is_some_and(|last| last != anchor_top)
@@ -1165,6 +1945,7 @@ impl IslandHost {
             // that a tall transparent window never swallows clicks.
             self.set_click_through(true);
             self.traveling = true;
+            self.release_calculator_focus();
         }
         self.last_sent_anchor_top = Some(anchor_top);
         self.generation = self.generation.wrapping_add(1);
@@ -1210,16 +1991,65 @@ impl IslandHost {
             target.bubble,
             target.gap,
             target.inset,
-            WINDOW_LOGICAL_WIDTH,
+            self.pixel_width as f32 * 96.0 / self.dpi as f32,
             self.logical_height,
             anchor_top,
         )
     }
 
+    fn preview_property(&self, key: windows::core::PCWSTR) -> usize {
+        self.preview.map_or(0, |anchor| unsafe {
+            windows::Win32::UI::WindowsAndMessaging::GetPropW(anchor, key).0 as usize
+        })
+    }
+
+    fn customized_layout(&self, target: LayoutTarget, anchor_top: bool) -> LayoutTarget {
+        let mode = self.preview_property(w!("IsletCustomize"));
+        let top = if self.preview.is_some() && mode == 0 {
+            self.anchor_top
+        } else {
+            anchor_top
+        };
+        let (margin, scale) = if mode != 0 {
+            (
+                self.preview_property(w!("IsletMargin")).saturating_sub(1) as f32 / 100.0,
+                self.preview_property(w!("IsletScale")) as f32 / 1000.0,
+            )
+        } else {
+            (
+                if top {
+                    self.appearance[0]
+                } else {
+                    self.appearance[1]
+                },
+                if top {
+                    self.appearance[2]
+                } else {
+                    self.appearance[3]
+                },
+            )
+        };
+        target.customized(
+            scale,
+            if self.preview.is_some() && mode == 0 {
+                0.0
+            } else {
+                margin
+            },
+            self.logical_height,
+        )
+    }
+
     /// The slim bar always docks at the bottom edge: at the top it would
-    /// cover browser tabs and title bars.
+    /// cover browser tabs and title bars. Dictation always shows at the
+    /// bottom too, near where you type; a top island travels down as a
+    /// droplet when it starts and back up when it ends.
     fn effective_anchor_top(&self) -> bool {
-        self.preview.is_some() || (self.anchor_top && !self.state.tucked)
+        if self.preview.is_some() {
+            self.preview_property(w!("IsletCustomize")) != 2
+        } else {
+            self.anchor_top && !self.state.tucked && self.state.dictation.is_none()
+        }
     }
 
     fn update_region(&mut self) {
@@ -1265,6 +2095,7 @@ impl IslandHost {
             TimerKind::HoverCollapse => TIMER_HOVER_COLLAPSE,
             TimerKind::DoneExpiry => TIMER_DONE_EXPIRY,
             TimerKind::MediaPaused => TIMER_MEDIA_PAUSED,
+            TimerKind::MediaCondense => TIMER_MEDIA_CONDENSE,
         };
         let result = unsafe { SetTimer(Some(self.hwnd), id, after_ms, None) };
         if result == 0 {
@@ -1278,6 +2109,7 @@ impl IslandHost {
             TimerKind::HoverCollapse => TIMER_HOVER_COLLAPSE,
             TimerKind::DoneExpiry => TIMER_DONE_EXPIRY,
             TimerKind::MediaPaused => TIMER_MEDIA_PAUSED,
+            TimerKind::MediaCondense => TIMER_MEDIA_CONDENSE,
         };
         unsafe {
             let _ = KillTimer(Some(self.hwnd), id);
@@ -1311,11 +2143,21 @@ impl IslandHost {
                 self.occlusion_pending = false;
                 self.update_tucked();
             }
+            TIMER_EMPTY_CHECK => self.update_tucked(),
+            TIMER_STATS => self.sample_stats(),
+            TIMER_CLOCK => self.update_clock(),
+            TIMER_RESUME => self.finish_resume(),
             TIMER_MEDIA_PAUSED => {
                 unsafe {
                     let _ = KillTimer(Some(self.hwnd), TIMER_MEDIA_PAUSED);
                 }
                 self.dispatch(IslandEvent::MediaPausedElapsed);
+            }
+            TIMER_MEDIA_CONDENSE => {
+                unsafe {
+                    let _ = KillTimer(Some(self.hwnd), TIMER_MEDIA_CONDENSE);
+                }
+                self.dispatch(IslandEvent::MediaCondenseElapsed);
             }
             TIMER_POLL => self.poll(),
             TIMER_DEMO => self.demo_advance(),
@@ -1331,12 +2173,10 @@ impl IslandHost {
         }
         if !self.fullscreen_hidden && !self.scrubbing {
             let inside = self.cursor_inside();
-            if inside != self.state.pointer_inside {
-                self.dispatch(if inside {
-                    IslandEvent::HoverEnter
-                } else {
-                    IslandEvent::HoverLeave
-                });
+            let on_switcher = inside && self.cursor_on_media_bubble();
+            if inside != self.state.pointer_inside || on_switcher != self.state.pointer_on_switcher
+            {
+                self.dispatch_hover(inside);
             }
         }
         self.sync_volume();
@@ -1397,6 +2237,7 @@ impl IslandHost {
     }
 
     fn begin_departure(&mut self) {
+        self.release_calculator_focus();
         self.set_click_through(true);
         if let Some(target) = self.last_target {
             self.morph_box = self
@@ -1471,7 +2312,7 @@ impl IslandHost {
             width: self.pixel_width,
             height: self.pixel_height,
             dpi: dpi as f32,
-            logical_width: WINDOW_LOGICAL_WIDTH,
+            logical_width: layout.width as f32 * 96.0 / dpi as f32,
             logical_height: self.logical_height,
         });
         self.region = None;
@@ -1560,6 +2401,7 @@ impl IslandHost {
         }
         self.fullscreen_hidden = hidden;
         if hidden {
+            self.release_calculator_focus();
             unsafe {
                 let _ = ShowWindow(self.hwnd, SW_HIDE);
             }
@@ -1623,7 +2465,11 @@ impl IslandHost {
             .filter(|looks| !looks.is_empty())
             .map_or(step, |looks| looks[step % looks.len()]);
         let mut state = IslandState {
+            calculator: self.state.calculator.clone(),
+            stats: self.state.stats.clone(),
+            widget: self.state.widget,
             idle_style: self.idle_style,
+            expand_on: self.state.expand_on,
             ..IslandState::default()
         };
         match look % DEMO_STATES {
@@ -1657,6 +2503,26 @@ impl IslandHost {
                 state.media = Some(demo_media());
                 state.last_music_accent = Some([224, 149, 94]);
                 state.dictation = Some(demo_dictation());
+            }
+            // Two players: the second waits in the bubble, and stays beside
+            // the expanded one.
+            13 => {
+                state.media = Some(demo_media());
+                state.other_media = Some(demo_browser_media());
+            }
+            14 => {
+                state.media = Some(demo_media());
+                state.other_media = Some(demo_browser_media());
+                state.expanded = true;
+            }
+            // Music that has played a while: just art and bars.
+            15 => {
+                state.media = Some(demo_media());
+                state.media_condensed = true;
+            }
+            16 => {
+                state.running = Some(demo_agent());
+                state.expanded = true;
             }
             _ => unreachable!(),
         }
@@ -1728,7 +2594,6 @@ fn render_thread(
 
     let mut dirty = true;
     let mut suspended = false;
-    let mut last_frame = f64::NEG_INFINITY;
     let mut generation = 0;
     let mut reported_settled = None;
     loop {
@@ -1772,23 +2637,21 @@ fn render_thread(
 
         let now = clock_now();
         if dirty || renderer.needs_frame(now) {
-            let morphing = dirty || renderer.is_morphing(now);
+            let morphing = renderer.is_morphing(now);
             if !dirty {
+                // Every visible animation follows the compositor's actual
+                // refresh cadence, including bars and the interpolated seekbar.
+                // The renderer still parks completely when nothing animates.
                 wait_for_compositor_clock();
-                // Content-only animation renders on the first vblank at or
-                // after the 30 Hz deadline. Counting vblanks instead of
-                // sleeping avoids the 15.6 ms system timer granularity.
-                if !morphing
-                    && clock_now() < last_frame + CONTENT_FRAME_INTERVAL - CONTENT_FRAME_SLACK
-                {
-                    continue;
+            }
+            let last_frame = clock_now();
+            let presented = match renderer.render(last_frame, dirty) {
+                Ok(presented) => presented,
+                Err(error) => {
+                    tracing::error!(%error, "island render failed");
+                    break;
                 }
-            }
-            last_frame = clock_now();
-            if let Err(error) = renderer.render(last_frame) {
-                tracing::error!(%error, "island render failed");
-                break;
-            }
+            };
             if renderer.take_departure_completed(last_frame) {
                 unsafe {
                     let _ = PostMessageW(Some(notify), PREVIEW_DEPARTED, WPARAM(0), LPARAM(0));
@@ -1798,7 +2661,7 @@ fn render_thread(
                 reported_settled = Some(generation);
                 report_settled(generation);
             }
-            if let Some((writer, last, count)) = &mut frame_log {
+            if let Some((writer, last, count)) = frame_log.as_mut().filter(|_| presented) {
                 use std::io::Write;
                 let now = Instant::now();
                 let elapsed = now.saturating_duration_since(*last).as_secs_f64() * 1000.0;
@@ -1890,6 +2753,11 @@ fn apply_command(
             *dirty = true;
             false
         }
+        RenderCommand::WidgetHover(hover) => {
+            renderer.set_widget_hover(hover);
+            *dirty = true;
+            false
+        }
         RenderCommand::Snapshot {
             target,
             content,
@@ -1899,8 +2767,7 @@ fn apply_command(
             *generation = snapshot_generation;
             let now = clock_now();
             renderer.set_anchor(anchor_top, now);
-            renderer.set_snapshot(target, *content, now);
-            *dirty = true;
+            *dirty |= renderer.set_snapshot(target, *content, now);
             false
         }
         RenderCommand::Resize {
@@ -1971,11 +2838,29 @@ fn music_filter(config: &Config) -> MusicFilter {
     MusicFilter::new(config.media.music_only, &config.media.music_sites)
 }
 
+/// A paused player keeps its place beside another for the same delay a
+/// lone paused player stays on the island.
+fn media_pause_hold(config: &Config) -> std::time::Duration {
+    std::time::Duration::from_secs(u64::from(config.media.pause_hide_seconds.max(1)))
+}
+
+/// The stats sampler runs for the stats widget or the stats glance.
+fn needs_sampler(config: &Config) -> bool {
+    config.widgets.system_stats
+        || (config.general.always_on && config.general.glance == IdleGlance::Stats)
+}
+
 fn read_config(shared: &Arc<RwLock<Config>>) -> Config {
     shared
         .read()
         .map(|config| config.clone())
         .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
+}
+
+fn calculator_shortcut_held() -> bool {
+    [VK_CONTROL, VK_MENU, VK_LWIN, VK_RWIN]
+        .into_iter()
+        .any(|key| unsafe { GetKeyState(i32::from(key.0)) < 0 })
 }
 
 fn point_from_lparam(lparam: LPARAM) -> POINT {
@@ -2009,8 +2894,13 @@ fn compute_window_layout(config: &Config, anchor_top: bool) -> WinResult<WindowL
         let height = (work.bottom - work.top).max(1);
         (height, work.top, height as f32 * 96.0 / dpi as f32)
     } else {
-        let height = (WINDOW_LOGICAL_HEIGHT * dpi as f32 / 96.0).round() as i32;
-        (height.max(1), work.bottom - height, WINDOW_LOGICAL_HEIGHT)
+        let logical_height = if config.widgets.calculator {
+            240.0
+        } else {
+            WINDOW_LOGICAL_HEIGHT
+        };
+        let height = (logical_height * dpi as f32 / 96.0).round() as i32;
+        (height.max(1), work.bottom - height, logical_height)
     };
     let x = work.left + ((work.right - work.left) - width) / 2;
 
@@ -2098,6 +2988,10 @@ fn monitor_info(monitor: HMONITOR) -> Option<MONITORINFO> {
 }
 
 fn demo_media() -> MediaCard {
+    let art = demo_art();
+    let accent = art
+        .as_ref()
+        .and_then(|art| islet_core::media::dominant_color(&art.pixels, art.width, art.height));
     MediaCard {
         title: "Midnight City".to_owned(),
         artist: "M83".to_owned(),
@@ -2109,10 +3003,39 @@ fn demo_media() -> MediaCard {
             sampled_at: clock_now(),
             rate: 1.0,
         }),
-        art: None,
-        accent: None,
+        art,
+        accent,
         scrub: None,
         volume: Some(0.66),
+    }
+}
+
+/// Debug: `ISLET_DEMO_ART=<file>` gives the demo song a cover (raw
+/// premultiplied BGRA, square), for Store screenshots.
+fn demo_art() -> Option<islet_core::media::ArtImage> {
+    let pixels = std::fs::read(std::env::var_os("ISLET_DEMO_ART")?).ok()?;
+    let side = ((pixels.len() / 4) as f64).sqrt() as u32;
+    (side > 0 && (side * side * 4) as usize == pixels.len()).then(|| islet_core::media::ArtImage {
+        id: 0xDE70_0000_0000_0001,
+        width: side,
+        height: side,
+        pixels: pixels.into(),
+    })
+}
+
+fn demo_browser_media() -> MediaCard {
+    MediaCard {
+        title: "Lo-fi beats to study to".to_owned(),
+        artist: "Lofi Girl".to_owned(),
+        source: "Chrome".to_owned(),
+        timeline: Some(Timeline {
+            position: 600.0,
+            duration: 1_800.0,
+            sampled_at: clock_now(),
+            rate: 1.0,
+        }),
+        accent: Some([236, 120, 140]),
+        ..demo_media()
     }
 }
 
@@ -2143,7 +3066,7 @@ fn demo_done() -> NotificationCard {
 }
 
 /// How many looks `--demo` cycles through.
-pub const DEMO_STATES: usize = 13;
+pub const DEMO_STATES: usize = 17;
 
 fn demo_dictation() -> DictationCard {
     demo_dictation_as(DictationPhase::Recording, false)
@@ -2206,6 +3129,31 @@ fn open_media_source(app_id: &str, source: &str) {
     }
 }
 
+/// Whether a media session belongs to a web browser.
+fn is_browser(app_id: &str, source: &str) -> bool {
+    // A music tab found inside a browser carries "browser#tab" as its id.
+    if app_id.contains('#') {
+        return true;
+    }
+    let name = format!("{app_id} {source}").to_ascii_lowercase();
+    ["chrome", "msedge", "edge", "firefox", "brave", "opera", "vivaldi", "arc"]
+        .iter()
+        .any(|browser| name.contains(browser))
+}
+
+/// Percent-encodes text for a URL query.
+fn url_encode(text: &str) -> String {
+    text.bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (byte as char).to_string()
+            }
+            b' ' => "+".to_owned(),
+            _ => format!("%{byte:02X}"),
+        })
+        .collect()
+}
+
 fn shell_execute(target: &str) -> bool {
     let wide: Vec<u16> = target.encode_utf16().chain(std::iter::once(0)).collect();
     let result = unsafe {
@@ -2227,6 +3175,14 @@ struct WindowFinder {
 }
 
 fn try_activate_window(app_id: &str, source: &str) -> bool {
+    let Some(hwnd) = find_app_window(app_id, source) else {
+        return false;
+    };
+    activate_window(hwnd)
+}
+
+/// The top-level window of the app behind a media session, if it is open.
+fn find_app_window(app_id: &str, source: &str) -> Option<HWND> {
     let mut needles = Vec::new();
     let lower_source = source.to_ascii_lowercase();
     let lower_app = app_id.to_ascii_lowercase();
@@ -2250,7 +3206,7 @@ fn try_activate_window(app_id: &str, source: &str) -> bool {
     }
 
     if needles.is_empty() {
-        return false;
+        return None;
     }
 
     let mut finder = WindowFinder {
@@ -2273,35 +3229,34 @@ fn try_activate_window(app_id: &str, source: &str) -> bool {
             LPARAM(std::ptr::addr_of_mut!(finder) as isize),
         );
     }
+    finder.found
+}
 
-    if let Some(hwnd) = finder.found {
-        unsafe {
-            if IsIconic(hwnd).as_bool() {
-                let _ = ShowWindow(hwnd, SW_RESTORE);
-            } else {
-                let _ = ShowWindow(hwnd, SW_SHOW);
-            }
-
-            let foreground = GetForegroundWindow();
-            let foreground_thread = GetWindowThreadProcessId(foreground, None);
-            let target_thread = GetWindowThreadProcessId(hwnd, None);
-            let current_thread = GetCurrentThreadId();
-
-            if foreground_thread != 0 && foreground_thread != target_thread {
-                let _ = AttachThreadInput(current_thread, foreground_thread, true);
-                let _ = AttachThreadInput(current_thread, target_thread, true);
-                let _ = SetForegroundWindow(hwnd);
-                let _ = BringWindowToTop(hwnd);
-                let _ = AttachThreadInput(current_thread, target_thread, false);
-                let _ = AttachThreadInput(current_thread, foreground_thread, false);
-            } else {
-                let _ = SetForegroundWindow(hwnd);
-            }
+fn activate_window(hwnd: HWND) -> bool {
+    unsafe {
+        if IsIconic(hwnd).as_bool() {
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+        } else {
+            let _ = ShowWindow(hwnd, SW_SHOW);
         }
-        return true;
-    }
 
-    false
+        let foreground = GetForegroundWindow();
+        let foreground_thread = GetWindowThreadProcessId(foreground, None);
+        let target_thread = GetWindowThreadProcessId(hwnd, None);
+        let current_thread = GetCurrentThreadId();
+
+        if foreground_thread != 0 && foreground_thread != target_thread {
+            let _ = AttachThreadInput(current_thread, foreground_thread, true);
+            let _ = AttachThreadInput(current_thread, target_thread, true);
+            let _ = SetForegroundWindow(hwnd);
+            let _ = BringWindowToTop(hwnd);
+            let _ = AttachThreadInput(current_thread, target_thread, false);
+            let _ = AttachThreadInput(current_thread, foreground_thread, false);
+        } else {
+            let _ = SetForegroundWindow(hwnd);
+        }
+    }
+    true
 }
 
 unsafe fn is_candidate_window(hwnd: HWND, needles: &[String]) -> bool {
@@ -2377,4 +3332,17 @@ fn surface_animations_enabled() -> bool {
         );
     }
     enabled.as_bool()
+}
+
+#[cfg(test)]
+mod resume_tests {
+    use super::*;
+
+    #[test]
+    fn browsers_are_recognised_and_queries_are_encoded() {
+        assert!(is_browser("Chrome", ""));
+        assert!(is_browser("MSEdge", "Microsoft Edge"));
+        assert!(!is_browser("Spotify.exe", "Spotify"));
+        assert_eq!(url_encode("Hey Jude & co"), "Hey+Jude+%26+co");
+    }
 }

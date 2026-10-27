@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Privacy — Onyx</title>
+  <meta name="description" content="What Onyx does with your data: it runs on your PC, has no account and sends nothing about you anywhere.">
+  <meta name="theme-color" content="#09090a">
+  <link rel="icon" href="/favicon.ico" sizes="any">
+  <link rel="apple-touch-icon" href="/assets/apple-touch-icon.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Geist:wght@300..700&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/styles.css?v=5">
+</head>
+<body>
+
+<div class="grain" aria-hidden="true"></div>
+
+<header class="nav">
+  <a class="nav__brand" href="/" aria-label="Onyx home"><img src="/assets/onyx-512.png" alt="" width="28" height="28"><span>Onyx</span></a>
+  <nav class="nav__links" aria-label="Sections">
+    <a href="/#features">Features</a>
+    <a href="/#captures">Captures</a>
+    <a href="/#details">Details</a>
+    <a href="/privacy" aria-current="page">Privacy</a>
+  </nav>
+  <a class="nav__cta" href="/#get">Get Onyx</a>
+</header>
+
+<main class="legal">
+  <div class="legal__head">
+    <p class="label">Privacy</p>
+    <h1>Yours stays <span class="muted">yours.</span></h1>
+    <p>Last updated 28 October 2026</p>
+  </div>
+
+  <div>
+    <p class="legal__summary">Onyx runs entirely on your PC. There’s no account, no analytics and no telemetry. Nothing you say, play or type is sent to us or anyone else.</p>
+
+    <section>
+      <h2>What Onyx collects</h2>
+      <div>
+        <p>Nothing. Onyx has no servers, so it has nowhere to send your data. It doesn’t track how you use it and doesn’t phone home.</p>
+      </div>
+    </section>
+
+    <section>
+      <h2>Voice typing</h2>
+      <div>
+        <p>The microphone is used only while you hold your dictation hotkey, or between presses in hands-free mode.</p>
+        <p>Speech is turned into text on your PC by a speech model stored on your PC. The audio stays in memory and is never saved. The text is typed into the app you’re using and isn’t kept by Onyx.</p>
+        <p>If you turn on AI cleanup, the rewrite is done by a small language model running on your PC. Onyx talks to it over a connection that never leaves your computer.</p>
+      </div>
+    </section>
+
+    <section>
+      <h2>Music</h2>
+      <div>
+        <p>To show what’s playing, Onyx reads the song, artist and cover that Windows shares from media apps.</p>
+        <p>To tell music from videos, it also reads the titles of your browser tabs, and for YouTube Music, the song shown in the player bar. These are read on your PC and aren’t stored or logged.</p>
+        <p>The last song you played (title, artist, cover and which app played it) is saved on your PC, so the player can show it after a restart.</p>
+      </div>
+    </section>
+
+    <section>
+      <h2>Your screen</h2>
+      <div>
+        <p>In Dynamic mode, Onyx checks a thin ring of pixels around the island to see whether an app is using the top of the screen. Those pixels are checked in memory and discarded straight away. Onyx never takes or keeps screenshots.</p>
+      </div>
+    </section>
+
+    <section>
+      <h2>System stats</h2>
+      <div>
+        <p>The stats widget reads Windows’ own performance counters for CPU, GPU, memory, network and temperature. It reads them only while the widget is on, and keeps only the last few readings, in memory.</p>
+      </div>
+    </section>
+
+    <section>
+      <h2>What’s stored on your PC</h2>
+      <div>
+        <ul>
+          <li>Your settings, in <code>%APPDATA%\Islet</code></li>
+          <li>Downloaded models, the last song you played, and diagnostic logs, in <code>%LOCALAPPDATA%\Islet</code></li>
+        </ul>
+        <p>The logs record app events and errors so problems can be fixed. They don’t contain what you dictate or the songs you play. Delete these folders to remove everything Onyx has stored.</p>
+      </div>
+    </section>
+
+    <section>
+      <h2>When Onyx goes online</h2>
+      <div>
+        <p>Onyx connects to the internet only when you ask it to:</p>
+        <ul>
+          <li>Downloading a speech model, from Hugging Face and GitHub</li>
+          <li>Downloading AI cleanup, from GitHub and Hugging Face</li>
+          <li>Pressing play on a song you last played in a browser that’s now closed, which opens a YouTube Music search for it in your browser</li>
+        </ul>
+        <p>These services see an ordinary download or page request from your computer, including your IP address, under their own privacy policies. Onyx sends them nothing else.</p>
+      </div>
+    </section>
+
+    <section>
+      <h2>This website</h2>
+      <div>
+        <p>This site sets no cookies and uses no analytics. If you hover or play the island, Spotify’s player loads from Spotify so the music can play, and Spotify may set its own cookies under its privacy policy. It’s hosted on Firebase Hosting by Google, which keeps standard server logs, such as IP addresses, to run and protect the service. Fonts load from Google Fonts, animation scripts from cdnjs and unpkg, and the album covers in the demo island from Spotify, so those services see your request too.</p>
+      </div>
+    </section>
+
+    <section>
+      <h2>Changes</h2>
+      <div>
+        <p>If Onyx ever starts handling data differently, this page will be updated before the change ships, and the date at the top will change.</p>
+      </div>
+    </section>
+  </div>
+</main>
+
+<footer class="footer">
+  <div class="footer__row">
+    <span>© 2026 Onyx</span>
+    <a href="/">Home</a>
+    <a href="/privacy" aria-current="page">Privacy</a>
+  </div>
+</footer>
+
+</body>
+</html>

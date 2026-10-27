@@ -8,12 +8,15 @@
 
 pub mod client;
 pub mod manager;
+pub mod polish;
 pub mod protocol;
 pub mod registry;
 
 pub use client::{default_worker_path, AsrClient, AsrEvent};
 pub use manager::{ManagerError, ModelManager, ModelStatus, Progress};
+pub use polish::{PolishError, Polisher};
 pub use protocol::{LoadRequest, SAMPLE_RATE};
 pub use registry::{
-    find, find_or_default, EngineKind, ModelFile, ModelSpec, DEFAULT_MODEL_ID, MODELS,
+    find, find_or_default, AddOn, EngineKind, ModelFile, ModelSpec, AI_CLEANUP, DEFAULT_MODEL_ID,
+    MODELS,
 };

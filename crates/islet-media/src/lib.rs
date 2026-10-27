@@ -50,6 +50,9 @@ pub const ART_SIZE: u32 = 128;
 const COALESCE: Duration = Duration::from_millis(40);
 /// Tab titles can lag a track change; re-check a rejected browser track once.
 const RECHECK_AFTER: Duration = Duration::from_millis(1_500);
+/// The island shows the first player that started, plus the next one in a
+/// bubble beside it.
+const MAX_PLAYERS: usize = 2;
 
 /// The current track as reported by the source app.
 #[derive(Clone, Debug, PartialEq)]
@@ -78,10 +81,74 @@ pub enum MediaCommand {
     Seek(f64),
 }
 
+/// One-shot pause independent of the island's music filter and visibility.
+/// WinRT work stays off the recording/UI threads; nothing runs while disabled.
+pub fn pause_playing_media() {
+    static RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if RUNNING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("islet-pause-media".to_owned())
+        .spawn(|| {
+            struct Reset;
+            impl Drop for Reset {
+                fn drop(&mut self) {
+                    RUNNING.store(false, Ordering::Release);
+                }
+            }
+            let _reset = Reset;
+            // SAFETY: initialization and cleanup occur on this worker thread.
+            if let Err(error) = unsafe { RoInitialize(RO_INIT_MULTITHREADED) } {
+                tracing::debug!(%error, "media pause initialization failed");
+                return;
+            }
+            let result = (|| -> WinResult<()> {
+                let manager = Manager::RequestAsync()?.join()?;
+                let sessions = manager.GetSessions()?;
+                // Issue every request before waiting for any individual player.
+                let mut pending = Vec::new();
+                for index in 0..sessions.Size()? {
+                    let Ok(session) = sessions.GetAt(index) else {
+                        continue;
+                    };
+                    let status = session
+                        .GetPlaybackInfo()
+                        .and_then(|info| info.PlaybackStatus());
+                    if matches!(status, Ok(PlaybackStatus::Playing)) {
+                        match session.TryPauseAsync() {
+                            Ok(operation) => pending.push(operation),
+                            Err(error) => tracing::debug!(%error, "media pause request failed"),
+                        }
+                    }
+                }
+                for operation in pending {
+                    match operation.join() {
+                        Ok(true) => {}
+                        Ok(false) => tracing::debug!("media app declined pause"),
+                        Err(error) => tracing::debug!(%error, "media pause failed"),
+                    }
+                }
+                Ok(())
+            })();
+            if let Err(error) = result {
+                tracing::debug!(%error, "could not enumerate media for dictation");
+            }
+            unsafe { RoUninitialize() };
+        });
+    if let Err(error) = spawned {
+        RUNNING.store(false, Ordering::Release);
+        tracing::warn!(%error, "could not start media pause worker");
+    }
+}
+
 enum Message {
     Refresh(Refresh),
-    Command(MediaCommand),
+    /// A transport command for the player with this app id.
+    Command(String, MediaCommand),
     Filter(MusicFilter),
+    PauseHold(Duration),
+    Held(bool),
     Stop,
 }
 
@@ -120,11 +187,12 @@ pub struct MediaService {
 }
 
 impl MediaService {
-    /// Starts the media thread. `on_update` runs on that thread whenever the
-    /// shown track changes; `None` means nothing is playing.
+    /// Starts the media thread. `on_update` runs on that thread whenever a
+    /// shown track changes. Players come in the order they started playing
+    /// (at most two); empty means nothing is playing.
     pub fn start(
         filter: MusicFilter,
-        on_update: impl FnMut(Option<MediaInfo>) + Send + 'static,
+        on_update: impl FnMut(Vec<MediaInfo>) + Send + 'static,
     ) -> std::io::Result<Self> {
         let (tx, rx) = unbounded();
         let thread_tx = tx.clone();
@@ -137,13 +205,25 @@ impl MediaService {
         })
     }
 
-    pub fn send(&self, command: MediaCommand) {
-        let _ = self.tx.send(Message::Command(command));
+    /// Sends `command` to the player whose [`MediaInfo::app_id`] is `app_id`.
+    pub fn send(&self, app_id: &str, command: MediaCommand) {
+        let _ = self.tx.send(Message::Command(app_id.to_owned(), command));
     }
 
     /// Replaces the music filter (config reload) and re-picks the session.
     pub fn set_filter(&self, filter: MusicFilter) {
         let _ = self.tx.send(Message::Filter(filter));
+    }
+
+    /// How long a paused player keeps its place while another one plays.
+    pub fn set_pause_hold(&self, hold: Duration) {
+        let _ = self.tx.send(Message::PauseHold(hold));
+    }
+
+    /// While held (the pointer is on the island), paused players keep their
+    /// place, so nothing swaps out from under the cursor.
+    pub fn set_held(&self, held: bool) {
+        let _ = self.tx.send(Message::Held(held));
     }
 }
 
@@ -298,7 +378,7 @@ fn media_thread(
     tx: Sender<Message>,
     rx: Receiver<Message>,
     filter: MusicFilter,
-    mut on_update: impl FnMut(Option<MediaInfo>),
+    mut on_update: impl FnMut(Vec<MediaInfo>),
 ) {
     // SAFETY: balanced with RoUninitialize below on this same thread.
     if let Err(error) = unsafe { RoInitialize(RO_INIT_MULTITHREADED) } {
@@ -316,7 +396,7 @@ fn run(
     tx: &Sender<Message>,
     rx: &Receiver<Message>,
     filter: MusicFilter,
-    on_update: &mut impl FnMut(Option<MediaInfo>),
+    on_update: &mut impl FnMut(Vec<MediaInfo>),
 ) -> WinResult<()> {
     let manager = Manager::RequestAsync()?.join()?;
     let sessions_tx = tx.clone();
@@ -344,17 +424,19 @@ fn run(
         .ok();
     let mut state = State {
         filter,
+        hidden: None,
+        hidden_poll_at: None,
         last_played: None,
         tabs,
         recheck_at: None,
         rechecked: std::collections::HashSet::new(),
-        subscription: None,
-        source_name: String::new(),
+        artist_badges: ArtistBadges::default(),
+        players: Vec::new(),
+        order: Vec::new(),
+        pause_hold: Duration::from_millis(u64::from(islet_core::island::MEDIA_PAUSED_MS)),
+        held: false,
         watchers: Vec::new(),
-        cache: TrackCache::default(),
-        playback: None,
-        timeline: None,
-        last_sent: None,
+        last_sent: Vec::new(),
     };
     let mut pending = Refresh::ALL;
 
@@ -365,28 +447,23 @@ fn run(
             loop {
                 let remaining = deadline.saturating_duration_since(std::time::Instant::now());
                 match rx.recv_timeout(remaining) {
-                    Ok(Message::Refresh(flags)) => pending.merge(flags),
-                    Ok(Message::Command(command)) => state.command(command),
-                    Ok(Message::Filter(filter)) => {
-                        state.filter = filter;
-                        pending.merge(Refresh::ALL);
-                    }
                     Ok(Message::Stop) | Err(RecvTimeoutError::Disconnected) => {
                         return cleanup(&manager, sessions_token, current_token);
                     }
+                    Ok(message) => state.handle(message, &mut pending),
                     Err(RecvTimeoutError::Timeout) => break,
                 }
             }
             let flags = std::mem::take(&mut pending);
             if let Err(error) = state.refresh(&manager, flags, tx, wic.as_ref()) {
                 tracing::debug!(%error, "media refresh failed");
-                // The session probably went away; re-resolve next time.
-                state.subscription = None;
+                // A session probably went away; re-resolve next time.
+                state.players.clear();
             }
             let info = state.info();
-            if let Some(info) = info.as_ref().filter(|info| info.playing) {
-                if state.last_played.as_deref() != Some(info.app_id.as_str()) {
-                    state.last_played = Some(info.app_id.clone());
+            if let Some(playing) = info.iter().find(|info| info.playing) {
+                if state.last_played.as_deref() != Some(playing.app_id.as_str()) {
+                    state.last_played = Some(playing.app_id.clone());
                 }
             }
             if info != state.last_sent {
@@ -396,13 +473,29 @@ fn run(
             continue;
         }
 
-        // Idle: block, except for a pending one-shot tab re-check.
-        let message = match state.recheck_at {
+        // Idle: block, except for a pending tab re-check or a paused player
+        // whose hold runs out.
+        let wake = [state.recheck_at, state.next_expiry(), state.hidden_poll_at]
+            .into_iter()
+            .flatten()
+            .min();
+        let message = match wake {
             Some(at) => {
                 match rx.recv_timeout(at.saturating_duration_since(std::time::Instant::now())) {
                     Ok(message) => Ok(message),
                     Err(RecvTimeoutError::Timeout) => {
-                        state.recheck_at = None;
+                        if state
+                            .recheck_at
+                            .is_some_and(|at| at <= std::time::Instant::now())
+                        {
+                            state.recheck_at = None;
+                        }
+                        if state
+                            .hidden_poll_at
+                            .is_some_and(|at| at <= std::time::Instant::now())
+                        {
+                            state.hidden_poll_at = None;
+                        }
                         pending.merge(Refresh {
                             sessions: true,
                             ..Refresh::default()
@@ -415,13 +508,8 @@ fn run(
             None => rx.recv().map_err(|_| ()),
         };
         match message {
-            Ok(Message::Refresh(flags)) => pending.merge(flags),
-            Ok(Message::Command(command)) => state.command(command),
-            Ok(Message::Filter(filter)) => {
-                state.filter = filter;
-                pending.merge(Refresh::ALL);
-            }
             Ok(Message::Stop) | Err(()) => return cleanup(&manager, sessions_token, current_token),
+            Ok(message) => state.handle(message, &mut pending),
         }
     }
 }
@@ -432,90 +520,43 @@ fn cleanup(manager: &Manager, sessions: i64, current: i64) -> WinResult<()> {
     Ok(())
 }
 
-struct State {
-    filter: MusicFilter,
-    /// App id of the music session most recently seen playing.
-    last_played: Option<String>,
-    tabs: Option<tabs::TabReader>,
-    /// One-shot re-check for a browser track rejected before its tab title
-    /// caught up.
-    recheck_at: Option<std::time::Instant>,
-    /// Rejected tracks already re-checked, so a non-music video playing for
-    /// an hour costs one re-check, not a timer.
-    rechecked: std::collections::HashSet<String>,
-    subscription: Option<Subscription>,
-    /// Display name of the subscribed session's app, resolved once.
+/// A player in line for the island, in the order it started playing.
+struct Queued {
+    app_id: String,
+    /// When it paused. It keeps its place for the pause hold, so pausing
+    /// the first player never swaps the second one in under your cursor.
+    paused_since: Option<std::time::Instant>,
+}
+
+/// A session the island shows, with its own event subscription and cache.
+struct Player {
+    app_id: String,
+    subscription: Subscription,
+    /// Display name of the session's app, resolved once.
     source_name: String,
-    watchers: Vec<Watcher>,
     cache: TrackCache,
     playback: Option<Playback>,
     timeline: Option<TimelineSample>,
-    last_sent: Option<MediaInfo>,
 }
 
-impl State {
-    fn session(&self) -> Option<&Session> {
-        self.subscription
-            .as_ref()
-            .map(|subscription| &subscription.session)
+impl Player {
+    fn new(app_id: String, session: Session, tx: &Sender<Message>) -> WinResult<Self> {
+        Ok(Self {
+            source_name: app_display_name(&app_id),
+            app_id,
+            subscription: Subscription::new(session, tx)?,
+            cache: TrackCache::default(),
+            playback: None,
+            timeline: None,
+        })
     }
 
-    fn refresh(
-        &mut self,
-        manager: &Manager,
-        mut flags: Refresh,
-        tx: &Sender<Message>,
-        wic: Option<&IWICImagingFactory>,
-    ) -> WinResult<()> {
-        if flags.sessions || self.subscription.is_none() {
-            let pick = pick_session(
-                manager,
-                &self.filter,
-                self.last_played.as_deref(),
-                self.tabs.as_mut(),
-            )?;
-            for key in pick.rejected_browser_tracks {
-                if self.rechecked.len() > 256 {
-                    self.rechecked.clear();
-                }
-                if self.rechecked.insert(key) {
-                    self.recheck_at = Some(std::time::Instant::now() + RECHECK_AFTER);
-                }
-            }
-            let (chosen, all) = (pick.chosen, pick.all);
-            self.watchers.clear();
-            for session in all {
-                match Watcher::new(session, tx) {
-                    Ok(watcher) => self.watchers.push(watcher),
-                    Err(error) => tracing::debug!(%error, "could not watch a media session"),
-                }
-            }
-            let current_id = self
-                .session()
-                .and_then(|session| session.SourceAppUserModelId().ok());
-            let chosen_id = chosen
-                .as_ref()
-                .and_then(|session| session.SourceAppUserModelId().ok());
-            if chosen_id != current_id || self.subscription.is_none() {
-                self.subscription = None;
-                self.cache = TrackCache::default();
-                self.playback = None;
-                self.timeline = None;
-                if let Some(session) = chosen {
-                    let app_id = session
-                        .SourceAppUserModelId()
-                        .map(|id| id.to_string_lossy())
-                        .unwrap_or_default();
-                    self.source_name = app_display_name(&app_id);
-                    self.subscription = Some(Subscription::new(session, tx)?);
-                    flags = Refresh::ALL;
-                }
-            }
-        }
-        let Some(session) = self.session().cloned() else {
-            return Ok(());
-        };
+    fn session(&self) -> &Session {
+        &self.subscription.session
+    }
 
+    fn refresh(&mut self, flags: Refresh, wic: Option<&IWICImagingFactory>) -> WinResult<()> {
+        let session = self.session().clone();
         if flags.properties {
             let properties = session.TryGetMediaPropertiesAsync()?.join()?;
             let title = properties.Title()?.to_string_lossy();
@@ -582,14 +623,9 @@ impl State {
     }
 
     fn info(&self) -> Option<MediaInfo> {
-        let session = self.session()?;
         if self.cache.title.is_empty() && self.cache.artist.is_empty() {
             return None;
         }
-        let app_id = session
-            .SourceAppUserModelId()
-            .map(|id| id.to_string_lossy())
-            .unwrap_or_default();
         let (playing, rate) = self
             .playback
             .as_ref()
@@ -607,7 +643,7 @@ impl State {
         });
         Some(MediaInfo {
             source: self.source_name.clone(),
-            app_id,
+            app_id: self.app_id.clone(),
             title: self.cache.title.clone(),
             artist: self.cache.artist.clone(),
             playing,
@@ -619,10 +655,8 @@ impl State {
         })
     }
 
-    fn command(&mut self, command: MediaCommand) {
-        let Some(session) = self.session() else {
-            return;
-        };
+    fn command(&self, command: MediaCommand) {
+        let session = self.session();
         let result = match command {
             MediaCommand::TogglePlayPause => session
                 .TryTogglePlayPauseAsync()
@@ -652,11 +686,446 @@ impl State {
     }
 }
 
+/// Music playing in a browser tab that the browser does not report: Firefox
+/// gives Windows one session, for whichever tab played last, so a YouTube
+/// Music tab playing behind a newer video tab is otherwise invisible. Read
+/// from the tab itself (its speaker icon and, for YouTube Music, its player
+/// bar), and controlled through that player bar.
+#[derive(Clone, Debug, PartialEq)]
+struct HiddenTab {
+    browser: String,
+    tab: String,
+    title: String,
+    artist: String,
+    playing: bool,
+    heard_at: std::time::Instant,
+}
+
+impl HiddenTab {
+    fn app_id(&self) -> String {
+        format!("{}#{}", self.browser, self.tab)
+    }
+
+    fn info(&self) -> MediaInfo {
+        MediaInfo {
+            app_id: self.app_id(),
+            source: self.tab.clone(),
+            title: self.title.clone(),
+            artist: self.artist.clone(),
+            playing: self.playing,
+            position: 0.0,
+            duration: 0.0,
+            rate: 1.0,
+            art: None,
+            accent: None,
+        }
+    }
+}
+
+/// While a hidden tab plays, how often its player bar is read again (the
+/// tab sends Windows nothing when its song changes).
+const HIDDEN_TAB_POLL: Duration = Duration::from_secs(2);
+
+struct State {
+    filter: MusicFilter,
+    hidden: Option<HiddenTab>,
+    hidden_poll_at: Option<std::time::Instant>,
+    /// App id of the music session most recently seen playing.
+    last_played: Option<String>,
+    tabs: Option<tabs::TabReader>,
+    /// One-shot re-check for a browser track rejected before its tab title
+    /// caught up.
+    recheck_at: Option<std::time::Instant>,
+    /// Rejected tracks already re-checked, so a non-music video playing for
+    /// an hour costs one re-check, not a timer.
+    rechecked: std::collections::HashSet<String>,
+    artist_badges: ArtistBadges,
+    /// The shown players, first-started first.
+    players: Vec<Player>,
+    /// Music sessions that started playing, in that order.
+    order: Vec<Queued>,
+    pause_hold: Duration,
+    held: bool,
+    watchers: Vec<Watcher>,
+    last_sent: Vec<MediaInfo>,
+}
+
+impl State {
+    fn handle(&mut self, message: Message, pending: &mut Refresh) {
+        let sessions = Refresh {
+            sessions: true,
+            ..Refresh::default()
+        };
+        match message {
+            Message::Refresh(flags) => pending.merge(flags),
+            Message::Command(app_id, command) => {
+                if let Some(player) = self.players.iter().find(|player| player.app_id == app_id) {
+                    player.command(command);
+                } else if let (Some(hidden), Some(reader)) = (&self.hidden, self.tabs.as_mut()) {
+                    if hidden.app_id() == app_id {
+                        let names: &[&str] = match command {
+                            MediaCommand::TogglePlayPause => &["Pause", "Play"],
+                            MediaCommand::Next => &["Next"],
+                            MediaCommand::Previous => &["Previous"],
+                            MediaCommand::Seek(_) => &[],
+                        };
+                        if !names.is_empty() && reader.press_player_button(&hidden.tab, names) {
+                            pending.merge(sessions);
+                        }
+                    }
+                }
+            }
+            Message::Filter(filter) => {
+                self.filter = filter;
+                pending.merge(Refresh::ALL);
+            }
+            Message::PauseHold(hold) => {
+                self.pause_hold = hold;
+                pending.merge(sessions);
+            }
+            Message::Held(held) => {
+                self.held = held;
+                if !held {
+                    pending.merge(sessions);
+                }
+            }
+            // Handled by the caller, which owns the manager.
+            Message::Stop => {}
+        }
+    }
+
+    /// When the longest-paused queued player's hold runs out.
+    fn next_expiry(&self) -> Option<std::time::Instant> {
+        if self.held {
+            return None;
+        }
+        self.order
+            .iter()
+            .filter_map(|queued| queued.paused_since)
+            .min()
+            .map(|since| since + self.pause_hold)
+    }
+
+    /// Keeps `order` in step with the sessions: new players join the end,
+    /// closed ones leave, and paused ones leave once their hold runs out.
+    fn update_order(&mut self, music: &[MusicSession]) {
+        let now = std::time::Instant::now();
+        self.order
+            .retain(|queued| music.iter().any(|session| session.app_id == queued.app_id));
+        for session in music {
+            match self
+                .order
+                .iter_mut()
+                .find(|queued| queued.app_id == session.app_id)
+            {
+                Some(queued) if session.playing => queued.paused_since = None,
+                Some(queued) => {
+                    queued.paused_since.get_or_insert(now);
+                }
+                None if session.playing => self.order.push(Queued {
+                    app_id: session.app_id.clone(),
+                    paused_since: None,
+                }),
+                None => {}
+            }
+        }
+        if !self.held {
+            let hold = self.pause_hold;
+            self.order.retain(|queued| {
+                queued
+                    .paused_since
+                    .is_none_or(|since| now.saturating_duration_since(since) < hold)
+            });
+        }
+    }
+
+    fn refresh(
+        &mut self,
+        manager: &Manager,
+        mut flags: Refresh,
+        tx: &Sender<Message>,
+        wic: Option<&IWICImagingFactory>,
+    ) -> WinResult<()> {
+        if flags.sessions || self.players.is_empty() {
+            let pick = pick_session(
+                manager,
+                &self.filter,
+                self.last_played.as_deref(),
+                self.tabs.as_mut(),
+                &mut self.artist_badges,
+            )?;
+            self.find_hidden_tab(&pick.rejected_browser_tracks);
+            for key in pick.rejected_browser_tracks {
+                if self.rechecked.len() > 256 {
+                    self.rechecked.clear();
+                }
+                if self.rechecked.insert(key) {
+                    self.recheck_at = Some(std::time::Instant::now() + RECHECK_AFTER);
+                }
+            }
+            self.watchers.clear();
+            for session in pick.all {
+                match Watcher::new(session, tx) {
+                    Ok(watcher) => self.watchers.push(watcher),
+                    Err(error) => tracing::debug!(%error, "could not watch a media session"),
+                }
+            }
+            self.update_order(&pick.music);
+            // Players in line, first-started first. A player that is playing
+            // always gets a slot before a paused one, so a paused player held
+            // on the island never pushes out music that is playing now. With
+            // none in line (all paused a while), fall back to the single best
+            // session so a paused song stays until the island closes it.
+            let mut in_line: Vec<&MusicSession> = self
+                .order
+                .iter()
+                .filter_map(|queued| {
+                    pick.music
+                        .iter()
+                        .find(|session| session.app_id == queued.app_id)
+                })
+                .collect();
+            if in_line.len() > MAX_PLAYERS {
+                in_line.sort_by_key(|session| !session.playing);
+            }
+            let mut wanted: Vec<(String, Session)> = in_line
+                .into_iter()
+                .take(MAX_PLAYERS)
+                .map(|session| (session.app_id.clone(), session.session.clone()))
+                .collect();
+            if wanted.is_empty() {
+                if let Some(session) = pick.chosen {
+                    let app_id = session
+                        .SourceAppUserModelId()
+                        .map(|id| id.to_string_lossy())
+                        .unwrap_or_default();
+                    wanted.push((app_id, session));
+                }
+            }
+            let mut previous = std::mem::take(&mut self.players);
+            for (app_id, session) in wanted {
+                if let Some(index) = previous.iter().position(|player| player.app_id == app_id) {
+                    self.players.push(previous.remove(index));
+                } else {
+                    self.players.push(Player::new(app_id, session, tx)?);
+                    flags = Refresh::ALL;
+                }
+            }
+        }
+        for player in &mut self.players {
+            player.refresh(flags, wic)?;
+        }
+        Ok(())
+    }
+
+    fn info(&self) -> Vec<MediaInfo> {
+        let mut info: Vec<MediaInfo> = self.players.iter().filter_map(Player::info).collect();
+        if let Some(hidden) = &self.hidden {
+            // Playing now: it takes the main pill ahead of paused players.
+            let place = if hidden.playing {
+                info.iter().position(|player| !player.playing).unwrap_or(info.len())
+            } else {
+                info.len()
+            };
+            info.insert(place, hidden.info());
+            info.truncate(MAX_PLAYERS);
+        }
+        info
+    }
+
+    /// Looks for music playing in a browser tab the browser is not
+    /// reporting (its session shows another, non-music tab).
+    fn find_hidden_tab(&mut self, rejected: &[String]) {
+        let now = std::time::Instant::now();
+        let Some(reader) = self.tabs.as_mut().filter(|_| self.filter.music_only) else {
+            self.hidden = None;
+            return;
+        };
+        if rejected.is_empty() && self.hidden.is_none() {
+            return;
+        }
+        // "browser app id|title" of the browser tracks the filter turned down.
+        let reported: Vec<(&str, &str)> = rejected
+            .iter()
+            .filter_map(|key| key.split_once('|'))
+            .collect();
+        let audible = reader.audible_titles();
+        let found = audible.iter().find(|tab| {
+            self.filter.is_music_site_tab(tab)
+                && !reported
+                    .iter()
+                    .any(|(_, track)| MusicFilter::tab_names_track(tab, track))
+        });
+        match found {
+            Some(tab) => {
+                let browser = reported
+                    .first()
+                    .map(|(browser, _)| (*browser).to_owned())
+                    .or_else(|| self.hidden.as_ref().map(|hidden| hidden.browser.clone()))
+                    .unwrap_or_default();
+                let (title, artist) = reader
+                    .youtube_music_now_playing(tab)
+                    .map(|(title, byline)| {
+                        let artist = byline.split(" \u{2022} ").next().unwrap_or("").to_owned();
+                        (title, artist)
+                    })
+                    .unwrap_or_else(|| (site_trimmed(tab), String::new()));
+                self.hidden = Some(HiddenTab {
+                    browser,
+                    tab: tab.clone(),
+                    title,
+                    artist,
+                    playing: true,
+                    heard_at: now,
+                });
+            }
+            None => {
+                // Paused (no speaker icon): it stays for the pause hold, as
+                // any paused player does, then goes.
+                let keep = self
+                    .hidden
+                    .as_ref()
+                    .is_some_and(|hidden| now.duration_since(hidden.heard_at) < self.pause_hold);
+                if keep {
+                    if let Some(hidden) = &mut self.hidden {
+                        hidden.playing = false;
+                    }
+                } else {
+                    self.hidden = None;
+                }
+            }
+        }
+        self.hidden_poll_at = self.hidden.as_ref().map(|_| now + HIDDEN_TAB_POLL);
+    }
+}
+
+/// A music session the filter accepts. One per app: of several sessions an
+/// app exposes (browser tabs), a playing one is kept.
+struct MusicSession {
+    app_id: String,
+    playing: bool,
+    session: Session,
+}
+
 struct Pick {
+    /// The single best session, for when no player is in line.
     chosen: Option<Session>,
+    music: Vec<MusicSession>,
     all: Vec<Session>,
     /// "app|title" of browser tracks the music filter rejected.
     rejected_browser_tracks: Vec<String>,
+}
+
+/// Answers to "does this YouTube page show the Official Artist Channel
+/// badge?", by tab title, so each video's page is searched at most twice.
+#[derive(Default)]
+struct ArtistBadges {
+    /// Tab title -> (badge found, times checked).
+    seen: std::collections::HashMap<String, (bool, u8)>,
+}
+
+impl ArtistBadges {
+    /// A "no" is checked once more (the page may still have been loading;
+    /// the rejected track's re-check comes back shortly), then kept.
+    const CHECKS: u8 = 2;
+
+    fn check(&mut self, reader: &mut tabs::TabReader, tab: &str) -> bool {
+        let checks = match self.seen.get(tab) {
+            Some(&(found, checks)) if found || checks >= Self::CHECKS => return found,
+            Some(&(_, checks)) => checks,
+            None => 0,
+        };
+        // Not readable (e.g. a background tab): answer no without caching.
+        let Some(found) = reader.official_artist(tab) else {
+            return false;
+        };
+        if self.seen.len() >= 256 {
+            self.seen.clear();
+        }
+        self.seen.insert(tab.to_owned(), (found, checks + 1));
+        found
+    }
+}
+
+/// For the `media_why` example: one line per media session saying how the
+/// music filter judged it. Never called by the app; prints titles, so only
+/// for the user's own console.
+pub fn explain_sessions(filter: &MusicFilter) -> Vec<String> {
+    // SAFETY: balanced with RoUninitialize below on success.
+    let initialised = unsafe { RoInitialize(RO_INIT_MULTITHREADED) }.is_ok();
+    let lines = (|| -> WinResult<Vec<String>> {
+        let manager = Manager::RequestAsync()?.join()?;
+        let mut reader = tabs::TabReader::new().ok();
+        let titles = reader.as_mut().map(tabs::TabReader::titles).unwrap_or_default();
+        let sessions = manager.GetSessions()?;
+        let mut lines: Vec<String> = titles
+            .iter()
+            .filter(|tab| tab.to_lowercase().contains("music"))
+            .map(|tab| format!("music tab: {tab}"))
+            .collect();
+        if let Some(reader) = reader.as_mut() {
+            for tab in reader.audible_titles() {
+                lines.push(format!("audible tab: {tab}"));
+            }
+            lines.push(format!(
+                "youtube music bar: {:?}",
+                reader.youtube_music_now_playing("YouTube Music")
+            ));
+        }
+        for index in 0..sessions.Size()? {
+            let session = sessions.GetAt(index)?;
+            let app_id = session.SourceAppUserModelId()?.to_string_lossy();
+            let properties = session.TryGetMediaPropertiesAsync()?.join()?;
+            let title = properties.Title()?.to_string_lossy();
+            let artist = properties.Artist()?.to_string_lossy();
+            let is_browser = is_browser_name(&app_display_name(&app_id));
+            let status = session
+                .GetPlaybackInfo()
+                .and_then(|info| info.PlaybackStatus())
+                .map_or_else(|_| "unknown".to_owned(), |status| format!("{status:?}"));
+            let facts = SessionFacts {
+                app: &app_id,
+                is_browser,
+                flagged_video: false,
+                title: &title,
+                artist: &artist,
+            };
+            let accepted = filter.is_music(facts, &titles);
+            let doubtful = filter.doubtful_youtube_tab(facts, &titles);
+            let found = match (doubtful, reader.as_mut()) {
+                (Some(tab), Some(reader)) => Some(reader.official_artist(tab)),
+                _ => None,
+            };
+            let accepted = accepted || found.flatten() == Some(true);
+            let badge = found.map_or_else(|| "not checked".to_owned(), |found| format!("{found:?}"));
+            let tab = titles
+                .iter()
+                .find(|tab| tab.to_lowercase().contains(&title.to_lowercase()))
+                .cloned()
+                .unwrap_or_else(|| "(no tab names this title)".to_owned());
+            lines.push(format!(
+                "{app_id}  [{status}]\n  title:  {title}\n  artist: {artist}\n  browser: {is_browser}  tab: {tab}\n  \
+                 title heuristic: {}  badge: {badge}  => accepted: {accepted}",
+                islet_core::music::looks_like_music(&title, &artist)
+            ));
+        }
+        Ok(lines)
+    })()
+    .unwrap_or_else(|error| vec![format!("error: {error}")]);
+    if initialised {
+        // SAFETY: matches the successful RoInitialize above.
+        unsafe { RoUninitialize() };
+    }
+    lines
+}
+
+/// A tab title without its site name: "Song - SoundCloud" -> "Song".
+fn site_trimmed(tab: &str) -> String {
+    tab.rsplit_once(" - ")
+        .or_else(|| tab.rsplit_once(" | "))
+        .map_or(tab, |(page, _)| page)
+        .trim()
+        .to_owned()
 }
 
 /// Chooses the session to show among those the music filter accepts.
@@ -665,6 +1134,7 @@ fn pick_session(
     filter: &MusicFilter,
     last_played: Option<&str>,
     mut tabs: Option<&mut tabs::TabReader>,
+    artist_badges: &mut ArtistBadges,
 ) -> WinResult<Pick> {
     let sessions = manager.GetSessions()?;
     let count = sessions.Size()?;
@@ -716,15 +1186,24 @@ fn pick_session(
         } else {
             &[]
         };
-        let is_music = filter.is_music(
-            SessionFacts {
-                is_browser,
-                flagged_video,
-                title: &title,
-                artist: &artist,
-            },
-            titles,
-        );
+        let facts = SessionFacts {
+            app: &app_id,
+            is_browser,
+            flagged_video,
+            title: &title,
+            artist: &artist,
+        };
+        let mut is_music = filter.is_music(facts, titles);
+        // The title did not look like a song: an artist's own channel still
+        // makes it music.
+        if !is_music {
+            if let (Some(tab), Some(reader)) = (
+                filter.doubtful_youtube_tab(facts, titles),
+                tabs.as_deref_mut(),
+            ) {
+                is_music = artist_badges.check(reader, tab);
+            }
+        }
         if is_browser && !is_music && !title.is_empty() {
             rejected_browser_tracks.push(format!("{app_id}|{title}"));
         }
@@ -753,8 +1232,27 @@ fn pick_session(
         .collect();
     let current = current.and_then(|current| eligible.iter().position(|&index| index == current));
     let chosen = choose_session(&candidates, current).map(|slot| all[eligible[slot]].clone());
+    let mut unique: Vec<MusicSession> = Vec::with_capacity(eligible.len());
+    for &index in &eligible {
+        match unique
+            .iter_mut()
+            .find(|session| session.app_id == ids[index])
+        {
+            Some(existing) if playing[index] && !existing.playing => {
+                existing.playing = true;
+                existing.session = all[index].clone();
+            }
+            Some(_) => {}
+            None => unique.push(MusicSession {
+                app_id: ids[index].clone(),
+                playing: playing[index],
+                session: all[index].clone(),
+            }),
+        }
+    }
     Ok(Pick {
         chosen,
+        music: unique,
         all,
         rejected_browser_tracks,
     })
@@ -877,6 +1375,25 @@ fn now_filetime() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_hidden_music_tab_reads_as_a_player() {
+        assert_eq!(site_trimmed("Lofi beat - SoundCloud"), "Lofi beat");
+        assert_eq!(site_trimmed("Song | Bandcamp"), "Song");
+        assert_eq!(site_trimmed("YouTube Music"), "YouTube Music");
+        let hidden = HiddenTab {
+            browser: "308046B0AF4A39CB".to_owned(),
+            tab: "YouTube Music".to_owned(),
+            title: "The Hills".to_owned(),
+            artist: "Hozie".to_owned(),
+            playing: true,
+            heard_at: std::time::Instant::now(),
+        };
+        let info = hidden.info();
+        assert_eq!(info.app_id, "308046B0AF4A39CB#YouTube Music");
+        assert_eq!(info.source, "YouTube Music");
+        assert!(info.playing && info.art.is_none() && info.duration == 0.0);
+    }
 
     #[test]
     fn tick_conversion_round_trips() {

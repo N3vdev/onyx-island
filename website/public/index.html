@@ -1,0 +1,264 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Onyx — A Dynamic Island for Windows</title>
+  <meta name="description" content="Onyx puts a small black island at the top of your Windows screen. Music, voice typing, your coding agents and your machine's vitals, out of the way until you need them.">
+  <meta name="theme-color" content="#09090a">
+  <meta property="og:title" content="Onyx — A Dynamic Island for Windows">
+  <meta property="og:description" content="Music, voice typing, agents and system stats in one small black pill at the top of your screen.">
+  <meta property="og:image" content="/assets/onyx-512.png">
+  <link rel="icon" href="/favicon.ico" sizes="any">
+  <link rel="apple-touch-icon" href="/assets/apple-touch-icon.png">
+  <link rel="preconnect" href="https://i.scdn.co" crossorigin>
+  <link rel="preconnect" href="https://open.spotify.com">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Geist:wght@300..700&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/styles.css?v=5">
+</head>
+<body>
+
+<div class="grain" aria-hidden="true"></div>
+
+<!-- Intro: the pill appears in the middle, then takes its place at the top. -->
+<div class="intro" aria-hidden="true"><div class="intro__pill"></div></div>
+
+<!-- The island. It lives at the top of the page the way Onyx lives at the top of
+     your screen, at its real size: hover it to open the player, press play. -->
+<div class="island" data-state="music">
+  <div class="island__body" role="group" aria-label="Now playing">
+
+    <div class="panel panel--music is-on">
+      <span class="art art--sm" data-art></span>
+      <span class="music__text" data-song><b data-title>Pink + White</b><small data-artist>Frank Ocean</small></span>
+      <span class="bars" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span>
+    </div>
+
+    <div class="panel panel--player">
+      <span class="art art--lg" data-art></span>
+      <div class="player__main">
+        <div class="player__song" data-song><b data-title>Pink + White</b><small data-artist>Frank Ocean</small></div>
+        <div class="player__controls">
+          <button type="button" class="ctl" data-prev aria-label="Previous song"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 6v12M18 6l-8 6 8 6z"/></svg></button>
+          <button type="button" class="ctl ctl--main" data-toggle aria-label="Play">
+            <svg class="i-play" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5l11 7-11 7z"/></svg>
+            <svg class="i-pause" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14M16 5v14"/></svg>
+          </button>
+          <button type="button" class="ctl" data-next aria-label="Next song"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M17 6v12M6 6l8 6-8 6z"/></svg></button>
+        </div>
+        <div class="player__track" data-seek role="slider" aria-label="Seek" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" tabindex="0"><span class="player__fill"></span></div>
+        <div class="player__times"><span data-elapsed>0:00</span><span data-remaining>-0:30</span></div>
+      </div>
+      <div class="player__side">
+        <a class="chip chip--link" data-track-link href="https://open.spotify.com/track/3xKsf9qdS1CyvXSMEid6g8" target="_blank" rel="noopener">Spotify <em aria-hidden="true">↗</em></a>
+        <span class="chip chip--vol" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 9h4l5-4v14l-5-4H4zM16 9a4 4 0 0 1 0 6"/></svg><span class="vol"><span></span></span></span>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<!-- Spotify's own player, out of sight. It loads the first time the island is
+     hovered, focused or tapped, and plays what the island shows. -->
+<div class="spotify-host" aria-hidden="true"><div id="spotify-embed"></div></div>
+
+<header class="nav">
+  <a class="nav__brand" href="#top" aria-label="Onyx home"><img src="/assets/onyx-512.png" alt="" width="28" height="28"><span>Onyx</span></a>
+  <nav class="nav__links" aria-label="Sections">
+    <a href="#features">Features</a>
+    <a href="#captures">Captures</a>
+    <a href="#details">Details</a>
+    <a href="/privacy">Privacy</a>
+  </nav>
+  <a class="nav__cta" href="#get">Get Onyx</a>
+</header>
+
+<main id="top">
+
+  <!-- Hero -->
+  <section class="hero">
+    <p class="hero__kicker label"><span class="label__dot"></span>A Dynamic Island for Windows</p>
+    <h1 class="hero__title">
+      <span class="line"><span class="word">Everything</span></span>
+      <span class="line"><span class="word">happening,</span> <span class="word muted">in one</span></span>
+      <span class="line"><span class="word">black pill.</span></span>
+    </h1>
+    <div class="hero__foot">
+      <p class="hero__lede">Onyx sits quietly at the top of your screen. Your music, your voice, your coding agents and your machine’s vitals, out of the way until the moment you need them.</p>
+      <div class="hero__actions">
+        <a class="btn btn--primary magnetic" href="#get"><span>Get Onyx for Windows</span></a>
+        <a class="btn btn--ghost" href="#features"><span>See what it does</span></a>
+      </div>
+    </div>
+    <div class="hero__wordmark" aria-hidden="true"><span data-sheen>ONYX</span></div>
+    <p class="hero__hint label" aria-hidden="true">Hover the island — press play</p>
+  </section>
+
+  <!-- Manifesto -->
+  <section class="manifesto">
+    <p class="label">( 00 ) Idea</p>
+    <p class="manifesto__text" data-words>Windows tells you things with toasts that stack in a corner and vanish before you read them. Onyx gives every live thing one place, at the top of the screen, where your eyes already go. It grows when something matters and shrinks back to a sliver when nothing does.</p>
+  </section>
+
+  <!-- Chapters. The island up top stays a music player; the other features
+       are shown at their real size beside their text. -->
+  <section class="chapters" id="features">
+    <article class="chapter">
+      <p class="label">( 01 ) Now playing</p>
+      <h2>Whatever’s playing, <span class="muted">right there.</span></h2>
+      <p>Spotify, Apple Music, YouTube Music in a background Firefox tab. Onyx finds the song, pulls its colours from the cover and keeps the bars moving to the beat. Videos and voice notes stay out of it.</p>
+      <ul class="facts"><li>Two players at once</li><li>Remembers your last song</li><li>Music only, by design</li></ul>
+    </article>
+
+    <article class="chapter">
+      <p class="label">( 02 ) Hover</p>
+      <h2>Hover, and it <span class="muted">opens up.</span></h2>
+      <p>Point at the island and it opens into a full player: cover, seek bar, skip, volume and a jump to the app. Move away and it folds back. You never leave the window you were working in.</p>
+      <p class="try">Try it: hover the island at the top of this page and press play.</p>
+      <ul class="facts"><li>Play, pause, skip, seek</li><li>Per-app volume</li><li>Scroll for widgets</li></ul>
+    </article>
+
+    <article class="chapter chapter--specimen">
+      <p class="label">( 03 ) Voice typing</p>
+      <h2>Hold a key. <span class="muted">Speak.</span> Let go.</h2>
+      <p>Hold Right Ctrl and talk. Your words land in whatever you’re typing in, cleaned up: stutters, “um”s and second thoughts are gone, and spoken lists come out as bullet points. The speech model runs on your PC. Nothing is sent anywhere.</p>
+      <ul class="facts"><li>Works in any app</li><li>On-device, works offline</li><li>Optional local AI rewrite</li></ul>
+          <div class="specimen" aria-hidden="true">
+        <div class="pill pill--dictation">
+          <span class="rec"></span>
+          <span class="wave"><i></i><i></i><i></i><i></i><i></i><i></i></span>
+          <span class="dict__label">Listening</span>
+        </div>
+        <span class="specimen__note">Actual size</span>
+      </div>
+    </article>
+
+    <article class="chapter chapter--specimen">
+      <p class="label">( 04 ) Agents <span class="soon">Coming soon</span></p>
+      <h2>Your agents <span class="muted">tap you</span> on the shoulder.</h2>
+      <p>Coming next: when Claude Code needs permission, the question will appear in the island, so you can answer without hunting for the terminal. When it finishes, you’ll know, even with your editor buried under three other windows.</p>
+      <ul class="facts"><li>Allow or deny in place</li><li>Done, at a glance</li><li>Stays until you look</li></ul>
+          <div class="specimen" aria-hidden="true">
+        <img src="/assets/shots/island-permission.png" alt="" width="430" height="109" loading="lazy">
+        <span class="specimen__note">Captured from the app</span>
+      </div>
+    </article>
+
+    <article class="chapter chapter--specimen">
+      <p class="label">( 05 ) Widgets</p>
+      <h2>Your machine’s <span class="muted">pulse.</span></h2>
+      <p>Scroll inside the open island to find live CPU, GPU, memory, network and temperature, plus a calculator that respects operator precedence. When the CPU pegs, the pill’s edge starts to glow, so you can see it from across the room.</p>
+      <ul class="facts"><li>Read once a second</li><li>Only while open</li><li>Hot-CPU glow</li></ul>
+          <div class="specimen" aria-hidden="true">
+        <div class="pill pill--stats">
+          <div class="tile"><small>CPU</small><b data-cpu>34%</b><svg class="spark" viewBox="0 0 100 28" preserveAspectRatio="none"><path data-spark="cpu"/></svg></div>
+          <div class="tile"><small>GPU</small><b data-gpu>12%</b><svg class="spark" viewBox="0 0 100 28" preserveAspectRatio="none"><path data-spark="gpu"/></svg></div>
+          <div class="tile"><small>Memory</small><b>9.8<em> GB</em></b><span class="meter"><span style="width:61%"></span></span></div>
+          <div class="tile"><small>Network</small><b data-net>2.4<em> MB/s</em></b><span class="meter meter--dim"><span style="width:28%"></span></span></div>
+        </div>
+        <span class="specimen__note">Actual size</span>
+      </div>
+    </article>
+
+    <article class="chapter" data-dock>
+      <p class="label">( 06 ) Dynamic</p>
+      <h2>It knows <span class="muted">when to move.</span></h2>
+      <p>When an app needs the top of the screen for its tabs or toolbar, the island glides down to the bottom edge. When the space clears, it comes back. It checks a two-pixel ring around itself, so it never jumps for nothing.</p>
+      <ul class="facts"><li>Top, bottom or dynamic</li><li>Follows your cursor across monitors</li><li>Never covers your tabs</li></ul>
+      <div class="dock-window" aria-hidden="true"><span></span><span></span><span></span><i>a window with tabs</i></div>
+    </article>
+  </section>
+
+  <!-- Real captures -->
+  <section class="captures" id="captures">
+    <div class="captures__head">
+      <p class="label">( 07 ) Real pixels</p>
+      <h2>No mockups. <span class="muted">These are captures</span> of the app.</h2>
+    </div>
+
+    <div class="reel" aria-label="Captures of the Onyx island">
+      <div class="reel__track">
+        <figure><img src="/assets/shots/island-player.png" alt="Expanded player showing Midnight City by M83 with controls, seek bar, Spotify link and volume" loading="lazy" width="546" height="153"><figcaption>Expanded player</figcaption></figure>
+        <figure><img src="/assets/shots/island-music.png" alt="Compact island with the song title and moving bars" loading="lazy" width="270" height="69"><figcaption>Playing</figcaption></figure>
+        <figure><img src="/assets/shots/island-permission.png" alt="Claude Code permission request inside the island" loading="lazy" width="430" height="109"><figcaption>Agent needs you · soon</figcaption></figure>
+        <figure><img src="/assets/shots/island-two-players.png" alt="Expanded player with a second player waiting in a bubble beside it" loading="lazy" width="596" height="153"><figcaption>Two players</figcaption></figure>
+        <figure><img src="/assets/shots/island-done.png" alt="Island saying Claude finished" loading="lazy" width="270" height="69"><figcaption>Agent done · soon</figcaption></figure>
+        <figure><img src="/assets/shots/island-music-agent.png" alt="Music island with an agent bubble beside it" loading="lazy" width="312" height="69"><figcaption>Music + agent · soon</figcaption></figure>
+        <figure><img src="/assets/shots/island-condensed.png" alt="Condensed island showing just the cover and bars" loading="lazy" width="158" height="65"><figcaption>Condensed</figcaption></figure>
+      </div>
+    </div>
+
+    <div class="settings">
+      <div class="settings__copy">
+        <p class="label">Settings</p>
+        <h3>One calm window for every choice.</h3>
+        <p>Every change saves itself and the live island updates as you go. There’s no Save button and nothing to restart.</p>
+        <div class="tabs" role="tablist" aria-label="Settings pages">
+          <button role="tab" aria-selected="true" data-shot="general">General</button>
+          <button role="tab" aria-selected="false" data-shot="media">Now Playing</button>
+          <button role="tab" aria-selected="false" data-shot="dictation">Dictation</button>
+          <button role="tab" aria-selected="false" data-shot="widgets">Widgets</button>
+        </div>
+      </div>
+      <div class="settings__frame">
+        <img data-settings src="/assets/shots/settings-general.webp" alt="Onyx Settings, General page" width="1042" height="852" loading="lazy">
+      </div>
+    </div>
+  </section>
+
+  <!-- Details -->
+  <section class="details" id="details">
+    <p class="label">( 08 ) Under the glass</p>
+    <div class="bento">
+      <div class="cell cell--big">
+        <h3>Native, <span class="muted">not a web page.</span></h3>
+        <p>Written in Rust, drawn with Direct2D and DirectComposition. No Electron, no browser engine idling in the background.</p>
+        <span class="cell__kicker">Rust · Direct2D · DirectComposition</span>
+        <img class="cell__icon" src="/assets/onyx-512.png" alt="The Onyx app icon: a polished black pill with a small light" width="512" height="512" loading="lazy">
+      </div>
+      <div class="cell">
+        <h3>Private by default</h3>
+        <p>No account, no cloud. Speech recognition and the optional AI cleanup both run on your PC.</p>
+      </div>
+      <div class="cell">
+        <h3>Lives with Windows</h3>
+        <p>Starts with Windows, sits in the tray and moves to whichever monitor your cursor is on.</p>
+      </div>
+      <div class="cell cell--wide">
+        <h3>Quiet when idle</h3>
+        <p>Nothing playing? The island shows the time, or your system stats if you’d rather. It never goes blank and never nags.</p>
+        <div class="mini-pill"><span data-clock-mini>1:36</span></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- CTA -->
+  <section class="get" id="get">
+    <p class="label">( 09 ) Get it</p>
+    <h2 class="get__title"><span class="line"><span class="word">Give your screen</span></span><span class="line"><span class="word muted">an island.</span></span></h2>
+    <div class="get__row">
+      <span class="btn btn--primary btn--xl" aria-disabled="true"><span>Coming soon to the Microsoft Store</span></span>
+      <p class="get__meta">Free · Windows 10 &amp; 11 · Search for “Onyx Island”</p>
+    </div>
+  </section>
+
+</main>
+
+<footer class="footer">
+  <div class="footer__mark" aria-hidden="true">ONYX</div>
+  <div class="footer__row">
+    <span>© <span data-year>2026</span> Onyx</span>
+    <span>Made for Windows, by someone who missed the island.</span>
+    <a href="/privacy">Privacy</a>
+    <a href="#top">Back to top ↑</a>
+  </div>
+</footer>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.5/gsap.min.js" integrity="sha384-g4NTh/Iv5PPU4xPyhEWqPcwtNXOvdaDI8LLnyYfyNZOjKJeYQyjzQ9X5275eBjpt" crossorigin="anonymous"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.5/ScrollTrigger.min.js" integrity="sha384-Z3REaz79l2IaAZqJsSABtTbhjgOUYyV3p90XNnAPCSHg3EMTz1fouunq9WZRtj3d" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/lenis@1.1.13/dist/lenis.min.js" integrity="sha384-B2WBjDzEjJpYvhmi2UyEn7rektqkf5suS6sNoyyrf0EBAwBHdkiXxIlU0V5Ru2ed" crossorigin="anonymous"></script>
+<script src="/main.js?v=7"></script>
+</body>
+</html>

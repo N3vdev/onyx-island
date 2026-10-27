@@ -15,7 +15,10 @@ islet-asr = { path = "../islet-asr" }
 islet-audio = { path = "../islet-audio" }
 eframe = { version = "0.32", default-features = false, features = ["default_fonts", "glow"] }
 windows = { version = "0.62", features = [
+    "ApplicationModel",
+    "Foundation",
     "Win32_Foundation",
+    "Win32_Storage_Packaging_Appx",
     "Win32_Graphics_Dwm",
     "Win32_Security",
     "Win32_System_Registry",
@@ -23,3 +26,6 @@ windows = { version = "0.62", features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[build-dependencies]
+embed-resource = "3"

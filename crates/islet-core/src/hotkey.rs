@@ -287,7 +287,7 @@ impl fmt::Display for HotkeyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Empty => write!(f, "press at least one key"),
-            Self::UnknownKey(name) => write!(f, "`{name}` is not a key Islet knows"),
+            Self::UnknownKey(name) => write!(f, "`{name}` is not a key Onyx knows"),
             Self::TooManyKeys => write!(f, "use one key plus modifiers (Ctrl, Alt, Shift, Win)"),
             Self::NeedsModifier => write!(
                 f,

@@ -226,6 +226,108 @@ unsafe fn overlaps(hwnd: HWND, zone: Rect) -> bool {
     intersects(window, zone)
 }
 
+/// Whether the screen in `zone` (physical pixels) shows only one flat colour,
+/// such as an empty stretch of a title bar or tab strip. Pixels inside
+/// `exclude` are skipped: that is where the island itself is drawn. `None`
+/// if the screen could not be read.
+///
+/// One small BitBlt of the composed screen and a sparse sample of it: well
+/// under a millisecond. The pixels are only compared and never kept.
+pub fn zone_is_blank(zone: Rect, exclude: Option<Rect>) -> Option<bool> {
+    use windows::Win32::Graphics::Gdi::{
+        BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC,
+        SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, SRCCOPY,
+    };
+    let (x, y) = (zone.x.round() as i32, zone.y.round() as i32);
+    let (width, height) = (zone.width.round() as i32, zone.height.round() as i32);
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+    // SAFETY: every GDI object created here is released before returning, and
+    // the DIB's pixel pointer is only read while the bitmap is alive.
+    unsafe {
+        let screen = GetDC(None);
+        if screen.is_invalid() {
+            return None;
+        }
+        let memory = CreateCompatibleDC(Some(screen));
+        let info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width,
+                // Negative: top-down rows.
+                biHeight: -height,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+        let result = CreateDIBSection(Some(memory), &info, DIB_RGB_COLORS, &mut bits, None, 0)
+            .ok()
+            .filter(|_| !bits.is_null())
+            .and_then(|bitmap| {
+                let previous = SelectObject(memory, bitmap.into());
+                let copied =
+                    BitBlt(memory, 0, 0, width, height, Some(screen), x, y, SRCCOPY).is_ok();
+                let pixels = std::slice::from_raw_parts(
+                    bits.cast::<u32>(),
+                    (width as usize) * (height as usize),
+                );
+                let exclude = exclude.map(|rect| {
+                    Rect::new(rect.x - zone.x, rect.y - zone.y, rect.width, rect.height)
+                });
+                let blank = copied.then(|| is_flat(pixels, width as usize, exclude));
+                SelectObject(memory, previous);
+                let _ = DeleteObject(bitmap.into());
+                blank
+            });
+        let _ = DeleteDC(memory);
+        ReleaseDC(None, screen);
+        result
+    }
+}
+
+/// Every pixel outside `exclude` is within a small tolerance of the first:
+/// anti-aliasing and Mica's faint grain pass, text, icons, tabs and search
+/// boxes do not. Every pixel is read: the zone is a thin ring round a small
+/// pill, a few thousand pixels at most.
+fn is_flat(pixels: &[u32], width: usize, exclude: Option<Rect>) -> bool {
+    const STEP: usize = 1;
+    const TOLERANCE: i32 = 14;
+    let height = pixels.len() / width.max(1);
+    let channels = |pixel: u32| {
+        [
+            ((pixel >> 16) & 0xff) as i32,
+            ((pixel >> 8) & 0xff) as i32,
+            (pixel & 0xff) as i32,
+        ]
+    };
+    let mut reference = None;
+    let mut sampled = 0usize;
+    for row in (0..height).step_by(STEP) {
+        for column in (0..width).step_by(STEP) {
+            if exclude.is_some_and(|rect| rect.contains(column as f32, row as f32)) {
+                continue;
+            }
+            let color = channels(pixels[row * width + column]);
+            let reference = *reference.get_or_insert(color);
+            if color
+                .iter()
+                .zip(reference)
+                .any(|(a, b)| (a - b).abs() > TOLERANCE)
+            {
+                return false;
+            }
+            sampled += 1;
+        }
+    }
+    // Too little left to judge (the island covers nearly everything).
+    sampled >= 24
+}
+
 fn intersects(a: Rect, b: Rect) -> bool {
     !a.is_empty()
         && !b.is_empty()
@@ -247,6 +349,35 @@ mod tests {
         assert!(!intersects(Rect::new(0.0, 0.0, 1920.0, 1000.0), zone));
         assert!(!intersects(Rect::new(400.0, 900.0, 100.0, 200.0), zone));
         assert!(!intersects(Rect::new(0.0, 0.0, 0.0, 0.0), zone));
+    }
+
+    #[test]
+    fn flat_title_bars_are_blank_and_content_is_not() {
+        let (width, height) = (60, 20);
+        let bar = 0x00_20_20_22u32;
+        let mut pixels = vec![bar; width * height];
+        assert!(is_flat(&pixels, width, None));
+        // Faint grain (Mica) still counts as empty.
+        pixels[3 * width + 9] = 0x00_26_25_28;
+        assert!(is_flat(&pixels, width, None));
+        // A light glyph, like a tab title or search box, does not.
+        pixels[6 * width + 30] = 0x00_e0_e0_e0;
+        assert!(!is_flat(&pixels, width, None));
+        // ...unless it is under the island itself, which is skipped.
+        let island = Rect::new(25.0, 3.0, 12.0, 8.0);
+        assert!(is_flat(&pixels, width, Some(island)));
+        // If the island covers almost everything there is nothing to judge.
+        assert!(!is_flat(
+            &pixels,
+            width,
+            Some(Rect::new(0.0, 0.0, 60.0, 19.9))
+        ));
+        // A thin ring round the island is still judged, pixel by pixel.
+        let mut ring = vec![bar; width * height];
+        let island = Rect::new(3.0, 3.0, 54.0, 14.0);
+        assert!(is_flat(&ring, width, Some(island)));
+        ring[width + 40] = 0x00_e0_e0_e0;
+        assert!(!is_flat(&ring, width, Some(island)));
     }
 
     #[test]

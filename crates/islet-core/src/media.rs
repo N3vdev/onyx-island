@@ -348,27 +348,38 @@ pub mod expanded {
     use super::Rect;
 
     /// The music pane stays fixed as features are added on its right.
-    pub const PLAYER_WIDTH: f32 = 280.0;
-    pub const ART: Rect = Rect::new(14.0, 14.0, 84.0, 84.0);
-    pub const ART_RADIUS: f32 = 24.0;
-    pub const TEXT_X: f32 = 112.0;
-    pub const TEXT_WIDTH: f32 = 152.0;
-    pub const TITLE_Y: f32 = 18.0;
+    /// Gap between album art and the edge of whatever holds it, the same in
+    /// every pill size: the art is inset this much and its corners follow
+    /// the pill's, so the gap is even all round.
+    pub const ART_INSET: f32 = 4.0;
+    pub const PLAYER_WIDTH: f32 = 312.0;
+    pub const ART: Rect = Rect::new(
+        ART_INSET,
+        ART_INSET,
+        crate::island::MEDIA.height - ART_INSET * 2.0,
+        crate::island::MEDIA.height - ART_INSET * 2.0,
+    );
+    pub const ART_RADIUS: f32 = crate::island::MEDIA.corner - ART_INSET;
+    pub const TEXT_X: f32 = ART.x + ART.width + 16.0;
+    pub const TEXT_WIDTH: f32 = 164.0;
+    pub const TITLE_Y: f32 = 20.0;
     pub const TITLE_HEIGHT: f32 = 19.0;
-    pub const ARTIST_Y: f32 = 38.0;
+    pub const ARTIST_Y: f32 = 41.0;
     pub const ARTIST_HEIGHT: f32 = 16.0;
-    pub const CHIP_Y: f32 = 16.0;
-    pub const CHIP_HEIGHT: f32 = 36.0;
-    pub const SCRUBBER_Y: f32 = 90.0;
+    pub const CHIP_Y: f32 = 18.0;
+    pub const CHIP_HEIGHT: f32 = 38.0;
+    pub const SCRUBBER_Y: f32 = 96.0;
     pub const SCRUBBER_HEIGHT: f32 = 2.0;
     /// Vertical slack around the thin scrubber for comfortable clicking.
     pub const SCRUBBER_HIT_SLOP: f32 = 6.0;
-    pub const TIMES_Y: f32 = 96.0;
+    pub const TIMES_Y: f32 = 102.0;
     pub const TIMES_HEIGHT: f32 = 12.0;
-    pub const CONTROLS_Y: f32 = 68.0;
-    pub const CONTROL_SPACING: f32 = 42.0;
+    /// Placed so the play button's hit circle ends where the seekbar's
+    /// slop begins.
+    pub const CONTROLS_Y: f32 = 74.0;
+    pub const CONTROL_SPACING: f32 = 44.0;
     pub const CONTROL_HIT_RADIUS: f32 = 16.0;
-    pub const VOLUME_TRACK_WIDTH: f32 = 78.0;
+    pub const VOLUME_TRACK_WIDTH: f32 = 86.0;
     pub const VOLUME_TRACK_HEIGHT: f32 = 3.0;
     /// Gap between the speaker glyph and the start of the track.
     pub const VOLUME_ICON_GAP: f32 = 20.0;
@@ -382,7 +393,7 @@ pub mod expanded {
     /// Centres of previous, play/pause, next.
     #[must_use]
     pub fn controls(_pill_width: f32) -> [(f32, f32); 3] {
-        let center = TEXT_X + 56.0;
+        let center = TEXT_X + 60.0;
         [
             (center - CONTROL_SPACING, CONTROLS_Y),
             (center, CONTROLS_Y),
@@ -396,9 +407,9 @@ pub mod expanded {
     pub fn feature_area(pill_width: f32) -> Rect {
         Rect::new(
             PLAYER_WIDTH + 14.0,
-            16.0,
-            (pill_width - PLAYER_WIDTH - 28.0).clamp(64.0, 140.0),
-            80.0,
+            18.0,
+            (pill_width - PLAYER_WIDTH - 28.0).clamp(64.0, 156.0),
+            84.0,
         )
     }
 
@@ -412,7 +423,7 @@ pub mod expanded {
     #[must_use]
     pub fn volume_area(pill_width: f32) -> Rect {
         let area = feature_area(pill_width);
-        Rect::new(area.x, 60.0, area.width, 36.0)
+        Rect::new(area.x, 64.0, area.width, 38.0)
     }
 
     /// The volume slider track, right-aligned with the card's margin.
@@ -509,6 +520,42 @@ pub fn volume_fraction(x: f32, y: f32, pill_width: f32, dragging: bool) -> Optio
 }
 
 pub const BAR_COUNT: usize = 5;
+
+/// Bridges the audio meter's updates to each display refresh without tying
+/// smoothing speed to the monitor's frame rate. No allocation or extra timer.
+#[derive(Default)]
+pub struct BarSmoother {
+    state: Option<([f32; BAR_COUNT], f64)>,
+}
+
+impl BarSmoother {
+    pub fn sample(
+        &mut self,
+        target: Option<[f32; BAR_COUNT]>,
+        now: f64,
+    ) -> Option<[f32; BAR_COUNT]> {
+        let Some(target) = target else {
+            self.state = None;
+            return None;
+        };
+        let target = target.map(|value| value.clamp(0.0, 1.0));
+        let values = match self.state {
+            Some((mut values, previous)) => {
+                let elapsed = (now - previous).max(0.0);
+                let attack = (1.0 - (-elapsed / 0.016).exp()) as f32;
+                let release = (1.0 - (-elapsed / 0.045).exp()) as f32;
+                for (value, target) in values.iter_mut().zip(target) {
+                    let amount = if target > *value { attack } else { release };
+                    *value += (target - *value) * amount;
+                }
+                values
+            }
+            None => target,
+        };
+        self.state = Some((values, now));
+        Some(values)
+    }
+}
 
 /// Visualizer levels shared between the audio thread (writer) and the render
 /// thread (reader) without locks.
@@ -657,6 +704,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn audio_bars_move_between_meter_updates_at_180_hz() {
+        let mut smoother = BarSmoother::default();
+        smoother.sample(Some([0.0; BAR_COUNT]), 0.0);
+        let first = smoother
+            .sample(Some([1.0; BAR_COUNT]), 1.0 / 180.0)
+            .unwrap();
+        let second = smoother
+            .sample(Some([1.0; BAR_COUNT]), 2.0 / 180.0)
+            .unwrap();
+        assert!(first[0] > 0.0 && first[0] < second[0] && second[0] < 1.0);
+    }
+
+    #[test]
+    fn audio_bar_timing_matches_at_60_and_180_hz() {
+        fn run(hz: u32, start: f32, target: f32) -> f32 {
+            let mut smoother = BarSmoother::default();
+            smoother.sample(Some([start; BAR_COUNT]), 0.0);
+            let mut result = start;
+            for frame in 1..=hz / 10 {
+                result = smoother
+                    .sample(Some([target; BAR_COUNT]), f64::from(frame) / f64::from(hz))
+                    .unwrap()[0];
+            }
+            result
+        }
+        for (start, target) in [(0.0, 1.0), (1.0, 0.0)] {
+            assert!((run(60, start, target) - run(180, start, target)).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn stale_audio_resets_display_smoothing() {
+        let mut smoother = BarSmoother::default();
+        smoother.sample(Some([1.0; BAR_COUNT]), 0.0);
+        assert!(smoother.sample(None, 0.1).is_none());
+        assert_eq!(
+            smoother.sample(Some([0.2; BAR_COUNT]), 1.0),
+            Some([0.2; BAR_COUNT])
+        );
+    }
+
+    #[test]
     fn timeline_extrapolates_only_while_playing() {
         let timeline = Timeline {
             position: 30.0,
@@ -793,6 +882,25 @@ mod tests {
     }
 
     #[test]
+    fn the_play_button_zone_meets_the_seekbar_zone_exactly() {
+        const {
+            assert!(
+                expanded::CONTROLS_Y + expanded::CONTROL_HIT_RADIUS
+                    == expanded::SCRUBBER_Y - expanded::SCRUBBER_HIT_SLOP
+            );
+            // Everything fits inside the card with a margin.
+            assert!(
+                expanded::ART.y + expanded::ART.height
+                    == crate::island::MEDIA.height - expanded::ART_INSET
+            );
+            assert!(expanded::PLAYER_WIDTH == expanded::TEXT_X + expanded::TEXT_WIDTH + 16.0);
+            assert!(
+                expanded::TIMES_Y + expanded::TIMES_HEIGHT <= crate::island::MEDIA.height - 4.0
+            );
+        };
+    }
+
+    #[test]
     fn expanded_controls_and_scrubber_hit_testing() {
         let width = crate::island::MEDIA.width;
         let [previous, play, next] = expanded::controls(width);
@@ -920,7 +1028,12 @@ mod tests {
                 None
             );
         }
-        for (x, y) in [(280.0, 56.0), (-20.0, 40.0), (460.0, 40.0), (250.0, 70.0)] {
+        for (x, y) in [
+            (expanded::PLAYER_WIDTH, 56.0),
+            (-20.0, 40.0),
+            (width + 20.0, 40.0),
+            (255.0, 70.0),
+        ] {
             assert_eq!(expanded_hover_at(x, y, width, true, true, true), None);
         }
     }

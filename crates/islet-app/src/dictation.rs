@@ -11,6 +11,10 @@
 //!    detection and recognises each as it closes.
 //! 3. `Stop` (hotkey up): finish the last utterance, clean the text, insert
 //!    it, show a check mark.
+//! 4. With AI cleanup on, the cleaned text is first rewritten by the
+//!    on-device language model (`islet_asr::Polisher`, started while the user
+//!    speaks). A slow, failed, or suspicious rewrite falls back to the
+//!    rule-cleaned text, so dictation never gets worse than without it.
 
 use std::io;
 use std::path::PathBuf;
@@ -19,7 +23,9 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{unbounded, Receiver, Select, Sender};
-use islet_asr::{AsrClient, AsrEvent, LoadRequest, ModelManager, ModelStatus};
+use islet_asr::{
+    AsrClient, AsrEvent, LoadRequest, ModelManager, ModelStatus, PolishError, Polisher, AI_CLEANUP,
+};
 use islet_audio::{tone, MicError, Microphone, Tone};
 use islet_core::config::{DictationConfig, InjectionMethod};
 use islet_core::hotkey::Action;
@@ -34,6 +40,8 @@ use crate::settings;
 /// What the controller tells the island.
 #[derive(Clone, Debug)]
 pub enum UiUpdate {
+    /// One-shot request after a real recording has been confirmed.
+    PauseMedia,
     /// Show (or update) the dictation pill; `None` hides it.
     Card(Option<DictationCard>),
     /// A transient message ("model not installed", an error).
@@ -122,6 +130,10 @@ const MAX_PENDING_SAMPLES: usize = 16_000 * 120;
 /// A recording whose loudest sample is below this (about -54 dBFS) is
 /// silence, not a quiet room: the device is muted, virtual, or wrong.
 const SILENCE_PEAK: f32 = 0.002;
+/// Time allowed for the AI rewrite: a base plus a little per word.
+const POLISH_BASE: Duration = Duration::from_millis(2500);
+const POLISH_PER_WORD: Duration = Duration::from_millis(60);
+const POLISH_MAX: Duration = Duration::from_secs(15);
 /// Notices about a missing model are not repeated more often than this.
 const NOTICE_COOLDOWN: Duration = Duration::from_secs(8);
 
@@ -163,6 +175,23 @@ struct Session {
     end_sent_at: Option<Instant>,
 }
 
+/// Timings of one dictation, logged when its text is inserted.
+#[derive(Clone, Copy)]
+struct Timing {
+    stopped_at: Option<Instant>,
+    worker_ms: Option<u64>,
+    tail_audio_ms: u64,
+    tail_decode_ms: u64,
+}
+
+/// A rewrite in flight: the rule-cleaned text is typed if it fails.
+struct Polishing {
+    events: Receiver<Result<String, PolishError>>,
+    fallback: String,
+    timing: Timing,
+    started: Instant,
+}
+
 struct Controller {
     config: DictationConfig,
     text_options: TextOptions,
@@ -177,6 +206,8 @@ struct Controller {
     manager: ModelManager,
     model: ModelState,
     loaded_model: String,
+    polisher: Arc<Polisher>,
+    polishing: Option<Polishing>,
 
     phase: Phase,
     session: Option<Session>,
@@ -215,6 +246,11 @@ impl Controller {
             mic: None,
             mic_device: String::new(),
             asr: AsrClient::new(islet_asr::default_worker_path()),
+            polisher: Arc::new(Polisher::new(
+                ModelManager::new(&models_dir).addon_program(&AI_CLEANUP),
+                ModelManager::new(&models_dir).addon_model(&AI_CLEANUP),
+            )),
+            polishing: None,
             manager: ModelManager::new(models_dir),
             model: ModelState::NotLoaded,
             loaded_model: String::new(),
@@ -235,15 +271,29 @@ impl Controller {
 
     fn run(&mut self, commands: &Receiver<Command>) {
         let hook_events = self.hook.as_ref().map(|hook| hook.events().clone());
+        self.run_with_hook_events(commands, hook_events);
+    }
+
+    fn run_with_hook_events(
+        &mut self,
+        commands: &Receiver<Command>,
+        hook_events: Option<Receiver<HookEvent>>,
+    ) {
         let asr_events = self.asr.events().clone();
+        let mut hook_connected = true;
         loop {
             let mic_audio = self.mic.as_ref().map(|mic| mic.audio().clone());
 
             let mut select = Select::new();
             let commands_index = select.recv(commands);
             let asr_index = select.recv(&asr_events);
-            let hook_index = hook_events.as_ref().map(|events| select.recv(events));
+            let hook_index = hook_events
+                .as_ref()
+                .filter(|_| hook_connected)
+                .map(|events| select.recv(events));
             let mic_index = mic_audio.as_ref().map(|audio| select.recv(audio));
+            let polish_events = self.polishing.as_ref().map(|job| job.events.clone());
+            let polish_index = polish_events.as_ref().map(|events| select.recv(events));
 
             let operation = match self.next_deadline() {
                 Some(deadline) => select
@@ -275,15 +325,37 @@ impl Controller {
                 }
             } else if Some(index) == hook_index {
                 if let Some(events) = &hook_events {
-                    if let Ok(HookEvent::Action(action)) = operation.recv(events) {
-                        self.on_action(action);
+                    match operation.recv(events) {
+                        Ok(HookEvent::Action(action)) => self.on_action(action),
+                        Err(_) => {
+                            // A disconnected channel is always ready. Stop
+                            // selecting it so a dead hook cannot spin a core.
+                            hook_connected = false;
+                            self.hook = None;
+                            if self.phase == Phase::Recording {
+                                self.discard();
+                            }
+                            self.notice(
+                                "Hotkeys unavailable",
+                                "Restart Onyx to enable dictation again.",
+                                AlertLevel::Error,
+                            );
+                        }
                     }
                 }
             } else if Some(index) == mic_index {
                 if let Some(audio) = &mic_audio {
-                    if let Ok(chunk) = operation.recv(audio) {
-                        self.on_audio(&chunk);
+                    match operation.recv(audio) {
+                        Ok(chunk) => self.on_audio(&chunk),
+                        Err(_) => self.microphone_disconnected(),
                     }
+                }
+            } else if Some(index) == polish_index {
+                if let Some(events) = &polish_events {
+                    let result = operation
+                        .recv(events)
+                        .unwrap_or_else(|_| Err(PolishError::Request("stopped".to_owned())));
+                    self.polished(result);
                 }
             }
             if self.next_tick <= Instant::now() {
@@ -296,18 +368,41 @@ impl Controller {
             mic.stop();
         }
         self.asr.shutdown();
+        self.polisher.shutdown();
     }
 
     /// When the loop must wake even if nothing arrives.
     fn next_deadline(&self) -> Option<Instant> {
-        let mut deadlines = Vec::with_capacity(3);
-        if self.phase == Phase::Recording || self.phase == Phase::Transcribing {
-            deadlines.push(self.next_tick);
+        match self.phase {
+            Phase::Recording | Phase::Transcribing => Some(self.next_tick),
+            Phase::Idle if self.models_running() && !self.config.keep_warm => {
+                Some(self.last_used + self.unload_after())
+            }
+            Phase::Idle => None,
         }
-        if self.phase == Phase::Idle && self.asr.is_running() && !self.config.keep_warm {
-            deadlines.push(self.last_used + self.unload_after());
+    }
+
+    fn models_running(&self) -> bool {
+        self.asr.is_running() || self.polisher.is_running()
+    }
+
+    /// AI cleanup is on and its files are on disk.
+    fn ai_ready(&self) -> bool {
+        self.config.ai_cleanup && self.manager.addon_status(&AI_CLEANUP) == ModelStatus::Installed
+    }
+
+    /// Starts the language model in the background while the user speaks,
+    /// so the rewrite does not wait for it to load.
+    fn warm_polisher(&self) {
+        if !self.ai_ready() || self.polisher.is_running() {
+            return;
         }
-        deadlines.into_iter().min()
+        let polisher = Arc::clone(&self.polisher);
+        std::thread::spawn(move || {
+            if let Err(error) = polisher.warm() {
+                tracing::warn!(%error, "AI cleanup could not start");
+            }
+        });
     }
 
     fn unload_after(&self) -> Duration {
@@ -319,6 +414,9 @@ impl Controller {
             hook.set_combos(&config.push_to_talk, hands_free_hotkey(&config));
         }
         self.text_options = TextOptions::from_config(&config);
+        if !config.ai_cleanup {
+            self.polisher.shutdown();
+        }
 
         let model_changed = config.model != self.config.model;
         let mic_changed = config.microphone != self.config.microphone;
@@ -429,7 +527,7 @@ impl Controller {
         if islet_input::foreground_is_blocked_by_elevation() {
             self.notice(
                 "Admin window",
-                "That window runs as administrator. Run Islet as administrator to dictate into it.",
+                "That window runs as administrator. Run Onyx as administrator to dictate into it.",
                 AlertLevel::Error,
             );
             self.recording_ended();
@@ -478,6 +576,16 @@ impl Controller {
     /// model if needed, play the start tone, and show the pill. Returns
     /// false if the model could not be started (the dictation is dropped).
     fn reveal(&mut self) -> bool {
+        if self.session.is_none() {
+            return false;
+        }
+        if self
+            .session
+            .as_ref()
+            .is_some_and(|session| session.revealed)
+        {
+            return true;
+        }
         let spec = islet_asr::find_or_default(&self.config.model);
         if let Some(session) = &mut self.session {
             session.revealed = true;
@@ -490,6 +598,10 @@ impl Controller {
                 return false;
             }
         }
+        if self.config.pause_media {
+            self.send(UiUpdate::PauseMedia);
+        }
+        self.warm_polisher();
         if self.config.tones {
             tone::play(Tone::Start);
         }
@@ -561,6 +673,7 @@ impl Controller {
             let _ = self.asr.cancel();
         }
         self.session = None;
+        self.polishing = None;
         self.phase = Phase::Idle;
         self.last_used = Instant::now();
         self.recording_ended();
@@ -568,7 +681,12 @@ impl Controller {
     }
 
     fn fail(&mut self, title: &str, body: &str) {
+        // Errors end capture too; otherwise the hidden mic keeps delivering
+        // packets and waking this thread after the UI has returned to idle.
+        self.mic = None;
+        self.mic_device.clear();
         self.session = None;
+        self.polishing = None;
         self.phase = Phase::Idle;
         self.model = ModelState::NotLoaded;
         self.asr.shutdown();
@@ -585,6 +703,19 @@ impl Controller {
     }
 
     // ----- audio and meter -----------------------------------------------
+
+    fn microphone_disconnected(&mut self) {
+        self.mic = None;
+        self.mic_device.clear();
+        if self.phase == Phase::Recording {
+            self.discard();
+            self.notice(
+                "Microphone disconnected",
+                "Choose a microphone in Settings and try again.",
+                AlertLevel::Error,
+            );
+        }
+    }
 
     fn ensure_mic(&mut self) -> Result<(), MicError> {
         let wanted = self.config.microphone.clone();
@@ -636,8 +767,9 @@ impl Controller {
         if session.outgoing.is_empty() {
             return;
         }
-        let samples = std::mem::take(&mut session.outgoing);
-        if self.asr.audio(&samples).is_err() {
+        let result = self.asr.audio(&session.outgoing);
+        session.outgoing.clear();
+        if result.is_err() {
             self.fail("Voice error", "Try again.");
         }
     }
@@ -693,12 +825,13 @@ impl Controller {
             }
             Phase::Transcribing => self.send_card(),
             Phase::Idle => {
-                if self.asr.is_running()
+                if self.models_running()
                     && !self.config.keep_warm
                     && now.duration_since(self.last_used) >= self.unload_after()
                 {
                     tracing::info!("unloading the speech model after idle");
                     self.asr.shutdown();
+                    self.polisher.shutdown();
                     self.model = ModelState::NotLoaded;
                     self.loaded_model.clear();
                     self.mic = None;
@@ -783,7 +916,7 @@ impl Controller {
             .as_ref()
             .is_some_and(|session| session.peak < SILENCE_PEAK);
         self.session = None;
-        let mut text = transcript::clean(raw, &self.text_options);
+        let text = transcript::clean(raw, &self.text_options);
         if text.is_empty() {
             self.phase = Phase::Idle;
             self.recording_ended();
@@ -792,12 +925,81 @@ impl Controller {
                 // Most often the wrong input device (a virtual or muted one).
                 self.notice(
                     "No sound",
-                    "Islet heard silence. Choose your microphone in Settings > Dictation.",
+                    "Onyx heard silence. Choose your microphone in Settings > Dictation.",
                     AlertLevel::NeedsInput,
                 );
             }
             return;
         }
+        let timing = Timing {
+            stopped_at,
+            worker_ms,
+            tail_audio_ms,
+            tail_decode_ms,
+        };
+        if self.ai_ready() {
+            self.start_polish(text, timing);
+        } else {
+            self.insert(text, timing);
+        }
+    }
+
+    /// Hands the text to the language model on a helper thread; the pill
+    /// keeps showing "transcribing" until `polished` types the result.
+    fn start_polish(&mut self, text: String, timing: Timing) {
+        let words = text.split_whitespace().count() as u32;
+        let budget = (POLISH_BASE + POLISH_PER_WORD * words).min(POLISH_MAX);
+        let (sender, events) = crossbeam_channel::bounded(1);
+        let polisher = Arc::clone(&self.polisher);
+        let input = text.clone();
+        std::thread::spawn(move || {
+            let _ = sender.send(polisher.rewrite(&input, budget));
+        });
+        self.polishing = Some(Polishing {
+            events,
+            fallback: text,
+            timing,
+            started: Instant::now(),
+        });
+    }
+
+    fn polished(&mut self, result: Result<String, PolishError>) {
+        let Some(job) = self.polishing.take() else {
+            return;
+        };
+        if self.phase != Phase::Transcribing {
+            return; // Cancelled meanwhile.
+        }
+        let polish_ms = job.started.elapsed().as_millis() as u64;
+        let text = match result {
+            Ok(rewrite) => {
+                let rewrite = transcript::unwrap_rewrite(&rewrite);
+                if transcript::accept_rewrite(&job.fallback, &rewrite) {
+                    tracing::info!(polish_ms, "AI cleanup applied");
+                    rewrite
+                } else {
+                    tracing::info!(polish_ms, "AI cleanup rewrite refused; typing the cleaned text");
+                    job.fallback
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, polish_ms, "AI cleanup unavailable");
+                if matches!(error, PolishError::MissingRuntime | PolishError::Start(_)) {
+                    self.notice("AI cleanup off", &error.to_string(), AlertLevel::Error);
+                }
+                job.fallback
+            }
+        };
+        self.insert(text, job.timing);
+    }
+
+    fn insert(&mut self, mut text: String, timing: Timing) {
+        let Timing {
+            stopped_at,
+            worker_ms,
+            tail_audio_ms,
+            tail_decode_ms,
+        } = timing;
         if self.config.trailing_space {
             text.push(' ');
         }
@@ -882,7 +1084,7 @@ impl Controller {
 
     fn notice(&mut self, title: &str, body: &str, level: AlertLevel) {
         self.send(UiUpdate::Notice(NotificationCard {
-            source: "Islet".to_owned(),
+            source: "Onyx".to_owned(),
             title: title.to_owned(),
             body: body.to_owned(),
             level,
@@ -910,5 +1112,154 @@ impl Controller {
         if self.ui.send(update).is_ok() {
             (self.notify)();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossbeam_channel::RecvTimeoutError;
+
+    fn controller(ui: Sender<UiUpdate>) -> Controller {
+        let config = DictationConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        Controller {
+            text_options: TextOptions::from_config(&config),
+            config,
+            paused: false,
+            ui,
+            notify: Arc::new(|| {}),
+            hook: None,
+            mic: None,
+            mic_device: String::new(),
+            asr: AsrClient::new("unused-test-worker.exe"),
+            polisher: Arc::new(Polisher::new(
+                PathBuf::from("unused-llama-server.exe"),
+                PathBuf::from("unused.gguf"),
+            )),
+            polishing: None,
+            manager: ModelManager::new(std::env::temp_dir().join("islet-controller-test")),
+            model: ModelState::NotLoaded,
+            loaded_model: String::new(),
+            phase: Phase::Idle,
+            session: None,
+            last_used: Instant::now(),
+            last_notice: None,
+            sum_squares: 0.0,
+            sample_count: 0,
+            level: 0.0,
+            bars: [0; DICTATION_BARS],
+            next_tick: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn media_pause_is_opt_in_and_sent_once_per_confirmed_recording() {
+        for enabled in [false, true] {
+            let (tx, rx) = unbounded();
+            let mut controller = controller(tx);
+            controller.config.pause_media = enabled;
+            controller.config.tones = false;
+            controller.model = ModelState::Ready;
+            controller.loaded_model = controller.config.model.clone();
+            controller.phase = Phase::Recording;
+            controller.session = Some(Session {
+                started: Instant::now(),
+                reveal_at: Instant::now(),
+                revealed: false,
+                hands_free: false,
+                began: true,
+                stop_requested: false,
+                pending: Vec::new(),
+                outgoing: Vec::new(),
+                samples: 0,
+                peak: 0.0,
+                stopped_at: None,
+                end_sent_at: None,
+            });
+            assert!(rx.is_empty());
+            assert!(controller.reveal());
+            assert!(controller.reveal());
+            let pauses = rx
+                .try_iter()
+                .filter(|update| matches!(update, UiUpdate::PauseMedia))
+                .count();
+            assert_eq!(pauses, usize::from(enabled));
+        }
+    }
+
+    #[test]
+    fn closed_hook_is_removed_from_selection_and_reported_once() {
+        let (ui_tx, ui_rx) = unbounded();
+        let (commands, commands_rx) = unbounded();
+        let (hook_tx, hook_rx) = unbounded();
+        drop(hook_tx);
+        let worker = std::thread::spawn(move || {
+            controller(ui_tx).run_with_hook_events(&commands_rx, Some(hook_rx))
+        });
+        let first = ui_rx.recv_timeout(Duration::from_secs(1));
+        let duplicate = ui_rx.recv_timeout(Duration::from_millis(50));
+        commands.send(Command::Shutdown).unwrap();
+        worker.join().unwrap();
+        assert!(
+            matches!(first, Ok(UiUpdate::Notice(notice)) if notice.title == "Hotkeys unavailable")
+        );
+        assert!(matches!(duplicate, Err(RecvTimeoutError::Timeout)));
+    }
+
+    #[test]
+    fn disconnected_mic_cancels_recording_and_returns_to_blocking_idle() {
+        let (tx, rx) = unbounded();
+        let mut controller = controller(tx);
+        controller.phase = Phase::Recording;
+        controller.microphone_disconnected();
+        assert_eq!(controller.phase, Phase::Idle);
+        assert!(controller.mic.is_none());
+        assert!(controller.next_deadline().is_none());
+        let updates: Vec<_> = rx.try_iter().collect();
+        assert!(matches!(&updates[0], UiUpdate::Card(None)));
+        assert!(
+            matches!(&updates[1], UiUpdate::Notice(notice) if notice.title == "Microphone disconnected")
+        );
+    }
+
+    #[test]
+    fn speech_failure_stops_audio_delivery_instead_of_leaving_capture_running() {
+        // A synthetic one-sample WAV; no real microphone, hook, or model is used.
+        let path = std::env::temp_dir().join(format!("islet-error-mic-{}.wav", std::process::id()));
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&38_u32.to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16_u32.to_le_bytes());
+        wav.extend_from_slice(&1_u16.to_le_bytes());
+        wav.extend_from_slice(&1_u16.to_le_bytes());
+        wav.extend_from_slice(&16_000_u32.to_le_bytes());
+        wav.extend_from_slice(&32_000_u32.to_le_bytes());
+        wav.extend_from_slice(&2_u16.to_le_bytes());
+        wav.extend_from_slice(&16_u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&2_u32.to_le_bytes());
+        wav.extend_from_slice(&0_i16.to_le_bytes());
+        std::fs::write(&path, wav).unwrap();
+        let mic = Microphone::from_wav(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        let audio = mic.audio().clone();
+        mic.start();
+        assert!(audio.recv_timeout(Duration::from_secs(1)).is_ok());
+        let (ui, _) = unbounded();
+        let mut controller = controller(ui);
+        controller.mic = Some(mic);
+        controller.phase = Phase::Recording;
+        controller.fail("Voice error", "Try again.");
+        while audio.try_recv().is_ok() {}
+        assert_eq!(
+            audio.recv_timeout(Duration::from_millis(100)),
+            Err(RecvTimeoutError::Disconnected)
+        );
+        assert_eq!(controller.phase, Phase::Idle);
+        assert!(controller.next_deadline().is_none());
     }
 }

@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 
-use crate::registry::{ModelFile, ModelSpec, SILERO_VAD, SUPPORT_DIR};
+use crate::registry::{AddOn, ModelFile, ModelSpec, SILERO_VAD, SUPPORT_DIR};
 
 const CHUNK: usize = 256 * 1024;
 const ATTEMPTS: u32 = 4;
@@ -125,6 +125,95 @@ impl ModelManager {
     }
 
     #[must_use]
+    pub fn addon_dir(&self, addon: &AddOn) -> PathBuf {
+        self.root.join(addon.dir)
+    }
+
+    /// The program to run for `addon`, inside its unpacked runtime.
+    #[must_use]
+    pub fn addon_program(&self, addon: &AddOn) -> PathBuf {
+        self.addon_dir(addon)
+            .join(AddOn::RUNTIME_DIR)
+            .join(addon.program)
+    }
+
+    #[must_use]
+    pub fn addon_model(&self, addon: &AddOn) -> PathBuf {
+        self.addon_dir(addon).join(addon.model)
+    }
+
+    fn runtime_unpacked(&self, addon: &AddOn) -> bool {
+        addon.archive.is_none() || self.addon_program(addon).is_file()
+    }
+
+    /// Like [`Self::status`], for an add-on. An archive counts as present
+    /// once it has been unpacked (the zip itself is removed).
+    #[must_use]
+    pub fn addon_status(&self, addon: &AddOn) -> ModelStatus {
+        let dir = self.addon_dir(addon);
+        let mut present = 0u64;
+        let mut complete = true;
+        for file in addon.files {
+            if Some(file.name) == addon.archive && self.runtime_unpacked(addon) {
+                present += file.size;
+                continue;
+            }
+            match file_size(&dir.join(file.name)) {
+                Some(size) if size == file.size && Some(file.name) != addon.archive => {
+                    present += size;
+                }
+                size => {
+                    complete = false;
+                    let part = file_size(&dir.join(part_name(file))).unwrap_or(0);
+                    present += size.unwrap_or(part).min(file.size);
+                }
+            }
+        }
+        match (complete, present) {
+            (true, _) => ModelStatus::Installed,
+            (false, 0) => ModelStatus::Missing,
+            (false, bytes) => ModelStatus::Partial { bytes },
+        }
+    }
+
+    /// Downloads an add-on and unpacks its runtime. Resumes like
+    /// [`Self::download`].
+    pub fn download_addon(
+        &self,
+        addon: &AddOn,
+        progress: &mut dyn FnMut(Progress),
+        cancel: &AtomicBool,
+    ) -> Result<(), ManagerError> {
+        let dir = self.addon_dir(addon);
+        fs::create_dir_all(&dir)?;
+        let total = addon.total_size();
+        let mut done = 0u64;
+        progress(Progress { done, total });
+        for file in addon.files {
+            let is_archive = Some(file.name) == addon.archive;
+            if !(is_archive && self.runtime_unpacked(addon)) {
+                download_file(file, &dir, done, total, progress, cancel)?;
+                if is_archive {
+                    unpack(&dir.join(file.name), &dir.join(AddOn::RUNTIME_DIR))?;
+                    let _ = fs::remove_file(dir.join(file.name));
+                }
+            }
+            done += file.size;
+            progress(Progress { done, total });
+        }
+        Ok(())
+    }
+
+    /// Removes an add-on's files.
+    pub fn delete_addon(&self, addon: &AddOn) -> io::Result<()> {
+        match fs::remove_dir_all(self.addon_dir(addon)) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    #[must_use]
     pub fn vad_ready(&self) -> bool {
         file_size(&self.vad_path()) == Some(SILERO_VAD.size)
     }
@@ -179,6 +268,40 @@ impl ModelManager {
         }
         Ok(())
     }
+}
+
+/// Unpacks the program and libraries of a runtime zip into `target`
+/// (flattened; tools and docs the app never runs are skipped). Unpacks into a
+/// temporary folder first so a half-written runtime is never used.
+fn unpack(archive: &Path, target: &Path) -> Result<(), ManagerError> {
+    let staging = target.with_extension("unpacking");
+    let _ = fs::remove_dir_all(&staging);
+    fs::create_dir_all(&staging)?;
+    let mut zip = zip::ZipArchive::new(File::open(archive)?)
+        .map_err(|error| ManagerError::Io(io::Error::other(error)))?;
+    for index in 0..zip.len() {
+        let mut entry = zip
+            .by_index(index)
+            .map_err(|error| ManagerError::Io(io::Error::other(error)))?;
+        let Some(name) = entry
+            .enclosed_name()
+            .and_then(|path| path.file_name().map(|name| name.to_owned()))
+        else {
+            continue;
+        };
+        let lower = name.to_string_lossy().to_lowercase();
+        let wanted = lower.ends_with(".dll")
+            || lower == "llama-server.exe"
+            || lower.starts_with("license");
+        if !entry.is_file() || !wanted {
+            continue;
+        }
+        let mut out = File::create(staging.join(&name))?;
+        io::copy(&mut entry, &mut out)?;
+    }
+    let _ = fs::remove_dir_all(target);
+    fs::rename(&staging, target)?;
+    Ok(())
 }
 
 fn file_size(path: &Path) -> Option<u64> {

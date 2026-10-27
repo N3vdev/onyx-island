@@ -153,6 +153,65 @@ pub const SILERO_VAD: ModelFile = ModelFile {
     sha256: "9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6",
 };
 
+/// An optional download that is not a speech model: files to fetch, and
+/// optionally one archive among them to unpack into [`AddOn::RUNTIME_DIR`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AddOn {
+    pub id: &'static str,
+    pub name: &'static str,
+    pub summary: &'static str,
+    pub maker: &'static str,
+    pub license: &'static str,
+    /// Directory under the models folder.
+    pub dir: &'static str,
+    pub files: &'static [ModelFile],
+    /// Name of the file in `files` that is a zip to unpack.
+    pub archive: Option<&'static str>,
+    /// The model file the runtime loads.
+    pub model: &'static str,
+    /// Program to run, inside the unpacked runtime.
+    pub program: &'static str,
+}
+
+impl AddOn {
+    /// Where the archive is unpacked, under the add-on's directory.
+    pub const RUNTIME_DIR: &'static str = "runtime";
+
+    #[must_use]
+    pub fn total_size(&self) -> u64 {
+        self.files.iter().map(|file| file.size).sum()
+    }
+}
+
+/// On-device AI cleanup: Qwen2.5 1.5B Instruct (4-bit) run by llama.cpp's CPU
+/// server. Both pinned by SHA-256: the runtime is the official llama.cpp
+/// release asset, the model the official Qwen GGUF.
+pub const AI_CLEANUP: AddOn = AddOn {
+    id: "ai-cleanup",
+    name: "Qwen2.5 1.5B Instruct",
+    summary: "Rewrites each dictation: drops what you corrected, fixes grammar, makes lists.",
+    maker: "Qwen \u{b7} llama.cpp",
+    license: "Apache-2.0 \u{b7} MIT",
+    dir: "ai-cleanup",
+    files: &[
+        ModelFile {
+            name: "llama-b11927-bin-win-cpu-x64.zip",
+            url: "https://github.com/ggml-org/llama.cpp/releases/download/b11927/llama-b11927-bin-win-cpu-x64.zip",
+            size: 24_227_896,
+            sha256: "f70b7fe800e683f58fed3199fcf9c961932307f30916498a7758dce5f1d76ce9",
+        },
+        ModelFile {
+            name: "qwen2.5-1.5b-instruct-q4_k_m.gguf",
+            url: "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q4_k_m.gguf",
+            size: 1_117_320_736,
+            sha256: "6a1a2eb6d15622bf3c96857206351ba97e1af16c30d7a74ee38970e434e9407e",
+        },
+    ],
+    archive: Some("llama-b11927-bin-win-cpu-x64.zip"),
+    model: "qwen2.5-1.5b-instruct-q4_k_m.gguf",
+    program: "llama-server.exe",
+};
+
 /// Directory (under the models folder) holding files shared by all models.
 pub const SUPPORT_DIR: &str = "support";
 
@@ -198,6 +257,15 @@ mod tests {
             }
         }
         assert_eq!(PARAKEET_V3.total_size(), 670_478_772);
+        for file in AI_CLEANUP.files {
+            assert!(file.url.ends_with(file.name) && file.url.starts_with("https://"));
+            assert_eq!(file.sha256.len(), 64);
+        }
+        assert!(AI_CLEANUP
+            .files
+            .iter()
+            .any(|file| Some(file.name) == AI_CLEANUP.archive));
+        assert!(AI_CLEANUP.files.iter().any(|file| file.name == AI_CLEANUP.model));
     }
 
     #[test]

@@ -1,6 +1,8 @@
 //! Prints now-playing updates until Enter is pressed. Used to verify GSMTC
 //! against real apps (Spotify, browsers, Media Player).
 
+use std::sync::{Arc, Mutex};
+
 use islet_core::music::MusicFilter;
 use islet_media::{MediaCommand, MediaService};
 
@@ -8,23 +10,36 @@ fn main() {
     // Same defaults as the app's config.
     let config = islet_core::Config::default();
     let filter = MusicFilter::new(config.media.music_only, &config.media.music_sites);
-    let service = MediaService::start(filter, |info| match info {
-        Some(info) => println!(
-            "[{}] {} - {} | playing={} {:.1}/{:.1}s rate={} art={} accent={:?}",
-            info.source,
-            info.title,
-            info.artist,
-            info.playing,
-            info.position,
-            info.duration,
-            info.rate,
-            info.art.as_ref().map_or("none".to_owned(), |art| format!(
-                "{}x{} #{}",
-                art.width, art.height, art.id
-            )),
-            info.accent,
-        ),
-        None => println!("(nothing playing)"),
+    // Commands go to the first-started player.
+    let first = Arc::new(Mutex::new(String::new()));
+    let shown = Arc::clone(&first);
+    let service = MediaService::start(filter, move |players| {
+        if let Ok(mut first) = shown.lock() {
+            *first = players
+                .first()
+                .map(|info| info.app_id.clone())
+                .unwrap_or_default();
+        }
+        if players.is_empty() {
+            println!("(nothing playing)");
+        }
+        for (slot, info) in players.iter().enumerate() {
+            println!(
+                "#{slot} [{}] {} - {} | playing={} {:.1}/{:.1}s rate={} art={} accent={:?}",
+                info.source,
+                info.title,
+                info.artist,
+                info.playing,
+                info.position,
+                info.duration,
+                info.rate,
+                info.art.as_ref().map_or("none".to_owned(), |art| format!(
+                    "{}x{} #{}",
+                    art.width, art.height, art.id
+                )),
+                info.accent,
+            );
+        }
     })
     .expect("start media thread");
 
@@ -56,6 +71,7 @@ fn main() {
                 None => continue,
             },
         };
-        service.send(command);
+        let app_id = first.lock().map(|id| id.clone()).unwrap_or_default();
+        service.send(&app_id, command);
     }
 }

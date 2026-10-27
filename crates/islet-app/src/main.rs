@@ -1,15 +1,18 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod clock;
 mod config_watch;
 mod context_menu;
 mod dictation;
 mod icon;
+mod last_music;
 mod island_window;
 mod logging;
 mod occlusion;
 mod paths;
 mod restart;
 mod settings;
+mod sysstats;
 mod tray;
 
 use std::process::ExitCode;

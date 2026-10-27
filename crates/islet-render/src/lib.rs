@@ -16,10 +16,13 @@ use islet_core::geometry::{point_in_rounded_rect, Rect};
 use islet_core::handoff::Handoff;
 use islet_core::island::{
     arrange_at, AgentCard, AgentState, AlertLevel, ContentCard, ContentSnapshot, DictationCard,
-    DictationPhase, LayoutTarget, MediaCard, NotificationCard, PillSize, DICTATION_BARS,
+    DictationPhase, LayoutTarget, MediaCard, NotificationCard, PillSize, COMPACT,
+    DEFAULT_MEDIA_ACCENT, DICTATION_BARS,
 };
-use islet_core::media::{expanded, format_clock, ArtImage, BarLevels, MediaHover, BAR_COUNT};
-use islet_core::{Spring, SpringParams};
+use islet_core::media::{
+    expanded, format_clock, ArtImage, BarLevels, BarSmoother, MediaHover, BAR_COUNT,
+};
+use islet_core::{Ease, Spring, SpringParams, Tween};
 use windows::core::{w, Interface, PCWSTR};
 use windows::Win32::Foundation::{HMODULE, HWND};
 use windows::Win32::Graphics::Direct2D::Common::{
@@ -60,9 +63,9 @@ use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
-    IDXGIAdapter, IDXGIDevice, IDXGIFactory2, IDXGIOutput, IDXGISurface, IDXGISwapChain1,
-    DXGI_PRESENT, DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG,
-    DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL, DXGI_USAGE_RENDER_TARGET_OUTPUT,
+    IDXGIAdapter, IDXGIDevice, IDXGIDevice1, IDXGIFactory2, IDXGIOutput, IDXGISurface,
+    IDXGISwapChain1, DXGI_PRESENT, DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1,
+    DXGI_SWAP_CHAIN_FLAG, DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL, DXGI_USAGE_RENDER_TARGET_OUTPUT,
 };
 use windows_numerics::{Matrix3x2, Vector2};
 
@@ -80,12 +83,36 @@ const HAIRLINE_COLOR: D2D1_COLOR_F = D2D1_COLOR_F {
     b: 1.0,
     a: 0.17,
 };
+/// One line for a glance on the slim docked island.
+fn glance_line(glance: &islet_core::island::GlanceCard) -> String {
+    match glance.kind {
+        islet_core::config::IdleGlance::Stats => format!(
+            "CPU {}  \u{b7}  Memory {}",
+            islet_core::widgets::format_percent(glance.cpu),
+            islet_core::widgets::format_percent(glance.memory)
+        ),
+        _ => glance.time.clone(),
+    }
+}
+
+/// The hot-CPU halo.
+const HEAT_COLOR: [u8; 3] = [255, 118, 58];
 /// Outline thickness in dips (one physical pixel at 100% scaling).
 const HAIRLINE_WIDTH: f32 = 1.0;
 /// Real visualizer levels older than this fall back to procedural bars.
 const BAR_LEVELS_MAX_AGE_MS: u64 = 250;
-/// Album-art brushes kept around (current track plus a transition partner).
-const ART_CACHE_SIZE: usize = 3;
+/// Album-art brushes kept around: both players' tracks plus a transition
+/// partner.
+const ART_CACHE_SIZE: usize = 4;
+/// Margin between the shrunk music pill's bars and its right end.
+const SHRUNK_BARS_RIGHT: f32 = 14.0;
+/// How far a bar grows above its resting height in the shrunk pill (15 in
+/// the full one).
+const SHRUNK_BAR_REACH: f32 = 12.0;
+/// Black margin between the second player's round art and its bubble's edge,
+/// the same at every size. It matches the compact pill's art margin, so the
+/// two discs sit side by side at the same size.
+const BUBBLE_ART_INSET: f32 = expanded::ART_INSET;
 
 /// How long a hidden island keeps its D3D/D2D device before releasing it.
 const GRAPHICS_RELEASE_DELAY: f64 = 15.0;
@@ -182,7 +209,12 @@ impl From<windows::core::Error> for RenderError {
 
 pub type RenderResult<T> = Result<T, RenderError>;
 
+#[cfg(test)]
+mod widget_tests;
+mod widgets;
+
 pub struct Renderer {
+    widget_hover: Option<islet_core::widgets::WidgetHover>,
     handoff: Option<(Handoff, Sample)>,
     departure_reported: bool,
     hwnd: HWND,
@@ -195,6 +227,16 @@ pub struct Renderer {
     hidden_since: Option<f64>,
     hit_region: Arc<Mutex<HitRegion>>,
     bars: Arc<BarLevels>,
+    bar_smoother: BarSmoother,
+    /// A layout received while the island was leaving its edge (see
+    /// `set_snapshot`).
+    deferred: Option<(LayoutTarget, ContentSnapshot)>,
+    /// The last small size of the main pill: the music card's expansion grows
+    /// from it and collapses back to it.
+    media_rest: PillSize,
+    /// What the last content-only frame showed, quantized to device pixels.
+    /// A vblank whose picture would be identical is skipped entirely.
+    presented: Option<u64>,
     media_hover: Option<MediaHover>,
     anchor_top: bool,
     logical_width: f32,
@@ -218,6 +260,7 @@ impl Renderer {
         let animator = Animator::new(LayoutTarget::HIDDEN, anchor, now);
         Ok(Self {
             handoff: None,
+            widget_hover: None,
             departure_reported: false,
             hwnd: config.hwnd,
             gfx: None,
@@ -229,6 +272,10 @@ impl Renderer {
             hidden_since: Some(now),
             hit_region,
             bars,
+            bar_smoother: BarSmoother::default(),
+            deferred: None,
+            media_rest: COMPACT,
+            presented: None,
             media_hover: None,
             anchor_top: config.anchor_top,
             logical_width: config.logical_width,
@@ -240,7 +287,69 @@ impl Renderer {
     }
 
     /// Applies a UI-thread snapshot. Safe to call with the same snapshot.
-    pub fn set_snapshot(&mut self, target: LayoutTarget, content: ContentSnapshot, now: f64) {
+    ///
+    /// While the island is still being drawn into the edge it is leaving, a
+    /// new layout waits: the departing droplet keeps its old look, and the new
+    /// one wells out of the other edge (applied at the hidden midpoint).
+    pub fn set_snapshot(
+        &mut self,
+        target: LayoutTarget,
+        content: ContentSnapshot,
+        now: f64,
+    ) -> bool {
+        // Background media can update while a static widget is in front.
+        // Identical visible snapshots need neither another draw nor a wakeup.
+        if self.deferred.is_none() && target == self.target && content == self.content {
+            return false;
+        }
+        if target.visible && self.animator.leaving(self.anchor_top, now) {
+            self.deferred = Some((target, content));
+            return true;
+        }
+        self.deferred = None;
+        self.apply_snapshot(target, content, now, false);
+        true
+    }
+
+    /// Applies the layout held back during a trip between edges. Inside the
+    /// edge nobody sees the switch, so it is instant; if the trip turned back
+    /// before getting there, it is the usual morph instead.
+    fn apply_deferred(&mut self, now: f64) {
+        if self.deferred.is_none() || self.animator.leaving(self.anchor_top, now) {
+            return;
+        }
+        if let Some((target, content)) = self.deferred.take() {
+            let hidden = self.animator.edge_fullness(now) < PRESENCE_UNSEEN;
+            self.apply_snapshot(target, content, now, hidden);
+        }
+    }
+
+    fn apply_snapshot(
+        &mut self,
+        target: LayoutTarget,
+        content: ContentSnapshot,
+        now: f64,
+        instant: bool,
+    ) {
+        if instant {
+            self.animator.jump_to(target, now);
+            self.target = target;
+            self.content = content;
+            self.previous_content = None;
+            self.transition_start = None;
+        } else {
+            self.morph_to(target, content, now);
+        }
+        if self.target.visible || !self.content.is_empty() {
+            self.hidden_since = None;
+        } else if self.hidden_since.is_none() {
+            self.hidden_since = Some(now);
+        }
+    }
+
+    /// The usual change while visible: springs to the new size, and a short
+    /// cross-fade when the content itself changes.
+    fn morph_to(&mut self, target: LayoutTarget, content: ContentSnapshot, now: f64) {
         if target != self.target {
             self.animator.set_target(target, now);
             self.target = target;
@@ -257,11 +366,6 @@ impl Renderer {
                 }
                 self.content = content;
             }
-        }
-        if self.target.visible || !self.content.is_empty() {
-            self.hidden_since = None;
-        } else if self.hidden_since.is_none() {
-            self.hidden_since = Some(now);
         }
     }
 
@@ -302,6 +406,11 @@ impl Renderer {
     /// Hover is a single repaint, including while playback is paused.
     pub fn set_media_hover(&mut self, hover: Option<MediaHover>) {
         self.media_hover = hover;
+    }
+
+    pub fn set_widget_hover(&mut self, hover: Option<islet_core::widgets::WidgetHover>) {
+        self.widget_hover = hover;
+        self.presented = None;
     }
 
     pub fn depart_surface(&mut self, now: f64, animate: bool) {
@@ -365,7 +474,10 @@ impl Renderer {
         !self.needs_frame(now)
     }
 
-    pub fn render(&mut self, now: f64) -> RenderResult<()> {
+    /// Draws and presents a frame. `force` is set when state changed since the
+    /// last call; otherwise a content-only frame that would look identical to
+    /// the one on screen is skipped. Returns whether a frame was presented.
+    pub fn render(&mut self, now: f64, force: bool) -> RenderResult<bool> {
         if self.gfx.is_none()
             && !self.target.visible
             && self.content.is_empty()
@@ -373,7 +485,10 @@ impl Renderer {
             && self.animator.is_settled(now)
         {
             self.clear_hit_region();
-            return Ok(());
+            return Ok(false);
+        }
+        if force || self.gfx.is_none() || self.is_morphing(now) {
+            self.presented = None;
         }
         let mut now = now;
         if self.gfx.is_none() {
@@ -403,6 +518,10 @@ impl Renderer {
             }
         }
 
+        self.apply_deferred(now);
+        if self.target.visible && self.target.main.height < 60.0 {
+            self.media_rest = self.target.main;
+        }
         let mut sample = self.animator.sample(now);
         if let Some((transfer, frozen)) = self.handoff {
             if !transfer.arriving {
@@ -427,14 +546,33 @@ impl Renderer {
         };
 
         let geometry = self.frame_geometry(&sample);
+        let levels = self.bar_smoother.sample(
+            self.bars
+                .load_fresh((now * 1000.0) as u64, BAR_LEVELS_MAX_AGE_MS),
+            now,
+        );
+        // Settled shape, no transition: only bars, seekbar and clock can move.
+        // Most vblanks change none of them by a visible step (the expanded
+        // seekbar crawls about a pixel a second), so those frames are skipped.
+        let key = if self.handoff.is_none() && previous.is_none() && !self.is_morphing(now) {
+            self.content_key(now, &geometry, levels)
+        } else {
+            None
+        };
+        if key.is_some() && key == self.presented {
+            return Ok(false);
+        }
+        self.presented = key;
         // SAFETY: the renderer owns all graphics state and is only used from
         // the render thread that created it.
         unsafe {
             let gfx = self.gfx.as_mut().ok_or(RenderError::InvalidSize)?;
             gfx.media_hover = self.media_hover;
-            gfx.bar_levels = self
-                .bars
-                .load_fresh((now * 1000.0) as u64, BAR_LEVELS_MAX_AGE_MS);
+            gfx.media_rest = self.media_rest;
+            gfx.main_spring_height = sample.main_height;
+            gfx.bar_levels = levels;
+            gfx.content_scale = sample.content_scale;
+            gfx.widget_hover = self.widget_hover;
             gfx.draw(
                 now,
                 &geometry,
@@ -451,7 +589,77 @@ impl Renderer {
             self.previous_content = None;
             self.transition_start = None;
         }
-        Ok(())
+        Ok(true)
+    }
+
+    /// Hash of everything time-dependent in a settled frame, at half-device-
+    /// pixel resolution. `None` when the content has motion this does not
+    /// model (agent spinners, dictation waves); those frames always draw.
+    fn content_key(
+        &self,
+        now: f64,
+        geometry: &FrameGeometry,
+        levels: Option<[f32; BAR_COUNT]>,
+    ) -> Option<u64> {
+        use std::hash::{Hash, Hasher};
+        let steps_per_px = f64::from(self.dpi / 96.0) * 2.0;
+        let quantize = |value: f64, span: f64| (value * span * steps_per_px).round() as i64;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for value in [
+            geometry.main.x,
+            geometry.main.y,
+            geometry.main.width,
+            geometry.main.height,
+            geometry.content_alpha,
+            geometry.shell_alpha,
+        ] {
+            value.to_bits().hash(&mut hasher);
+        }
+        self.media_hover.map(|hover| hover as u8).hash(&mut hasher);
+        self.content.cpu_hot.hash(&mut hasher);
+        let slots = [
+            (Some(geometry.main), self.content.primary.as_ref()),
+            (geometry.bubble, self.content.secondary.as_ref()),
+        ];
+        for (rect, card) in slots {
+            let (Some(rect), Some(card)) = (rect, card) else {
+                continue;
+            };
+            match card {
+                ContentCard::Notification(_) | ContentCard::Calculator(_) => {}
+                ContentCard::Stats(stats) => format!("{stats:?}").hash(&mut hasher),
+                ContentCard::Glance(glance) => format!("{glance:?}").hash(&mut hasher),
+                ContentCard::Agent(_) | ContentCard::Dictation(_) => return None,
+                ContentCard::Media(media) => {
+                    // Mirrors `Gfx::draw_card`'s layout choice.
+                    if rect.width < 60.0 && rect.height < 60.0 {
+                        continue;
+                    }
+                    if rect.height > 60.0 {
+                        if let Some(timeline) = media.timeline.filter(|t| t.duration > 0.0) {
+                            let progress = f64::from(
+                                media
+                                    .scrub
+                                    .unwrap_or_else(|| timeline.progress_at(now, media.playing))
+                                    .clamp(0.0, 1.0),
+                            );
+                            let bar = expanded::scrubber(rect.width);
+                            quantize(progress, f64::from(bar.width)).hash(&mut hasher);
+                            let position = progress * timeline.duration;
+                            (position.max(0.0) as u64).hash(&mut hasher);
+                            ((timeline.duration - position).max(0.0) as u64).hash(&mut hasher);
+                        }
+                    } else {
+                        // The tallest bars span 15 logical pixels.
+                        for index in 0..BAR_COUNT {
+                            let level = bar_level(levels, now, index, media.playing);
+                            quantize(f64::from(level), 15.0).hash(&mut hasher);
+                        }
+                    }
+                }
+            }
+        }
+        Some(hasher.finish())
     }
 
     /// Seconds until the device should be released, if the island is hidden
@@ -469,6 +677,7 @@ impl Renderer {
 
     pub fn release_graphics(&mut self) {
         self.gfx = None;
+        self.presented = None;
         self.clear_hit_region();
     }
 
@@ -518,6 +727,7 @@ impl Renderer {
 
 #[derive(Clone, Copy, Debug, Default)]
 struct Sample {
+    content_scale: f32,
     main_width: f32,
     main_height: f32,
     main_corner: f32,
@@ -541,6 +751,7 @@ enum TransportIcon {
 }
 
 struct Animator {
+    content_scale: Spring,
     main_width: Spring,
     main_height: Spring,
     main_corner: Spring,
@@ -549,20 +760,33 @@ struct Animator {
     bubble_corner: Spring,
     gap: Spring,
     inset: Spring,
-    anchor: Spring,
-    presence: Spring,
+    /// Edge phase: 0 at the top, 1 at the bottom (see `droplet_geometry`).
+    anchor: Tween,
+    /// 0 drawn into the edge (hidden), 1 the resting pill.
+    presence: Tween,
 }
 
 /// Below this the droplet is invisible, so the pill's size can jump to a new
 /// one without anyone seeing it.
 const PRESENCE_UNSEEN: f64 = 0.04;
-/// A hide aims a little past "gone", so the droplet slips through the edge at
-/// speed instead of creeping the last few pixels.
-const PRESENCE_GONE: f64 = -0.12;
+/// Top edge to bottom edge: drawn into one edge and welling out of the other.
+/// Each half is as long as a show, so the trip reads as hide-then-show.
+const TRAVEL_SECONDS: f64 = 0.84;
+/// Welling out of the edge into the resting pill.
+const EMERGE_SECONDS: f64 = 0.56;
+/// Drawn back into the edge.
+const RECEDE_SECONDS: f64 = 0.36;
+
+/// A partial move (an interrupted show, a reversed trip) takes less time, but
+/// not proportionally less, so short corrections stay smooth.
+fn tween_duration(full: f64, distance: f64) -> f64 {
+    full * distance.abs().clamp(0.0, 1.0).sqrt().max(0.35)
+}
 
 impl Animator {
     fn new(target: LayoutTarget, anchor: f64, now: f64) -> Self {
         let mut animator = Self {
+            content_scale: Spring::new(1.0, 1.0, SpringParams::EXPAND, now),
             main_width: Spring::new(0.0, 0.0, SpringParams::EXPAND, now),
             main_height: Spring::new(0.0, 0.0, SpringParams::EXPAND, now),
             main_corner: Spring::new(0.0, 0.0, SpringParams::EXPAND, now),
@@ -579,8 +803,8 @@ impl Animator {
             ),
             // Also starts at rest: a fresh window should already be at the
             // configured edge, not fly there from the other one.
-            anchor: Spring::new(anchor, anchor, SpringParams::DOCK, now),
-            presence: Spring::new(PRESENCE_GONE, PRESENCE_GONE, SpringParams::RECEDE, now),
+            anchor: Tween::new(anchor, now),
+            presence: Tween::new(0.0, now),
         };
         animator.set_target(target, now);
         animator
@@ -591,16 +815,42 @@ impl Animator {
         if (self.anchor.target() - target).abs() < f64::EPSILON {
             return;
         }
-        retarget(&mut self.anchor, target, SpringParams::DOCK, now);
+        let distance = target - self.anchor.position(now);
+        self.anchor.retarget(
+            target,
+            tween_duration(TRAVEL_SECONDS, distance),
+            Ease::TRAVEL,
+            now,
+        );
+    }
+
+    fn set_presence(&mut self, target: f64, now: f64) {
+        if (self.presence.target() - target).abs() < f64::EPSILON {
+            return;
+        }
+        let (full, ease) = if target > 0.5 {
+            (EMERGE_SECONDS, Ease::EMERGE)
+        } else {
+            (RECEDE_SECONDS, Ease::RECEDE)
+        };
+        let distance = target - self.presence.position(now);
+        self.presence
+            .retarget(target, tween_duration(full, distance), ease, now);
     }
 
     /// Showing and hiding are one motion on `presence`: the pill keeps its
     /// shape and is drawn into (or wells out of) the screen edge as a
     /// droplet. Size changes while visible are the usual spring morph.
     fn set_target(&mut self, target: LayoutTarget, now: f64) {
+        retarget(
+            &mut self.content_scale,
+            f64::from(target.content_scale),
+            SpringParams::EXPAND,
+            now,
+        );
         if !target.visible {
             // Keep the last shape so the hide is the show played backwards.
-            retarget(&mut self.presence, PRESENCE_GONE, SpringParams::RECEDE, now);
+            self.set_presence(0.0, now);
             return;
         }
         if self.presence.position(now) < PRESENCE_UNSEEN {
@@ -608,7 +858,7 @@ impl Animator {
             // motion is the droplet growing out of the edge.
             self.jump_to(target, now);
         }
-        retarget(&mut self.presence, 1.0, SpringParams::EMERGE, now);
+        self.set_presence(1.0, now);
 
         let old_area = self.main_width.target() * self.main_height.target();
         let new_area = f64::from(target.main.width) * f64::from(target.main.height);
@@ -666,9 +916,35 @@ impl Animator {
         );
     }
 
+    /// Still on the way into the edge it is leaving, toward the edge
+    /// `anchor_top` names.
+    fn leaving(&self, anchor_top: bool, now: f64) -> bool {
+        if self.anchor.is_settled(now) {
+            return false;
+        }
+        let phase = self.anchor.position(now);
+        if anchor_top {
+            phase > 0.5
+        } else {
+            phase < 0.5
+        }
+    }
+
+    /// How far out of its current edge the travelling island is: 1 resting,
+    /// 0 fully inside the edge (the trip's midpoint).
+    fn edge_fullness(&self, now: f64) -> f64 {
+        let phase = self.anchor.position(now).clamp(0.0, 1.0);
+        if phase <= 0.5 {
+            1.0 - phase / 0.5
+        } else {
+            (phase - 0.5) / 0.5
+        }
+    }
+
     fn jump_to(&mut self, target: LayoutTarget, now: f64) {
         let bubble = target.bubble.unwrap_or(PillSize::new(0.0, 0.0, 0.0));
         for (spring, value) in [
+            (&mut self.content_scale, target.content_scale),
             (&mut self.main_width, target.main.width),
             (&mut self.main_height, target.main.height),
             (&mut self.main_corner, target.main.corner),
@@ -684,6 +960,7 @@ impl Animator {
 
     fn sample(&self, now: f64) -> Sample {
         Sample {
+            content_scale: self.content_scale.position(now).clamp(0.7, 1.4) as f32,
             main_width: self.main_width.position(now).max(0.0) as f32,
             main_height: self.main_height.position(now).max(0.0) as f32,
             main_corner: self.main_corner.position(now).max(0.0) as f32,
@@ -693,15 +970,13 @@ impl Animator {
             gap: self.gap.position(now).max(0.0) as f32,
             inset: self.inset.position(now).max(0.0) as f32,
             anchor: self.anchor.position(now).clamp(0.0, 1.0) as f32,
-            presence: self.presence.position(now).clamp(0.0, 1.2) as f32,
+            presence: self.presence.position(now).clamp(0.0, 1.0) as f32,
         }
     }
 
-    /// The anchor is the droplet phase, so it settles on the *visual* scale:
-    /// a hundredth of the phase is only a few tenths of a pixel of shape once
-    /// the pill is back at an edge.
     fn is_settled(&self, now: f64) -> bool {
-        self.main_width.is_settled(now)
+        self.content_scale.is_settled_with(now, 0.001, 0.01)
+            && self.main_width.is_settled(now)
             && self.main_height.is_settled(now)
             && self.main_corner.is_settled(now)
             && self.bubble_width.is_settled(now)
@@ -709,20 +984,10 @@ impl Animator {
             && self.bubble_corner.is_settled(now)
             && self.gap.is_settled(now)
             && self.inset.is_settled(now)
-            && self
-                .presence
-                .is_settled_with(now, TRAVEL_SETTLE_PHASE, TRAVEL_SETTLE_VELOCITY)
-            && self
-                .anchor
-                .is_settled_with(now, TRAVEL_SETTLE_PHASE, TRAVEL_SETTLE_VELOCITY)
+            && self.presence.is_settled(now)
+            && self.anchor.is_settled(now)
     }
 }
-
-/// Within a hundredth of an edge, the pill is less than half a pixel short of
-/// its resting shape.
-const TRAVEL_SETTLE_PHASE: f64 = 0.012;
-/// ...and moving slowly enough that another frame would not change a pixel.
-const TRAVEL_SETTLE_VELOCITY: f64 = 0.012;
 
 fn retarget(spring: &mut Spring, target: f64, params: SpringParams, now: f64) {
     spring.set_params(params, now);
@@ -737,6 +1002,87 @@ unsafe fn set_blur_deviation(effect: &ID2D1Effect, deviation: f32) -> RenderResu
         &value,
     )?;
     Ok(())
+}
+
+/// Bar height 0..1: real loopback levels when fresh, otherwise a gentle
+/// procedural wave while playing, and a low rest when paused.
+fn bar_level(levels: Option<[f32; BAR_COUNT]>, now: f64, index: usize, playing: bool) -> f32 {
+    if !playing {
+        return 0.12;
+    }
+    if let Some(levels) = levels {
+        return levels[index % BAR_COUNT].clamp(0.0, 1.0);
+    }
+    let phase = now * 7.2 + index as f64 * 0.85;
+    (phase.sin() * 0.5 + 0.5) as f32 * 0.65 + 0.35
+}
+
+/// One part of a card opening into its big look (or closing back), drawn in
+/// separate passes so each can fade and blur on its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MorphPart {
+    /// The small look, fading and blurring out as the pill grows.
+    Small,
+    /// The big look, fading and sharpening in once there is room for it.
+    Big,
+    /// The album art, drawn sharp throughout and moving between the two.
+    Art,
+}
+
+/// A card between its small and big looks.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Morph {
+    /// 0 at the small look's height, 1 at the big look's.
+    open: f32,
+    small: PillSize,
+    big: PillSize,
+}
+
+/// The small and big looks of a card, and how far open it is at `height`
+/// (from the size spring). `None` at either end, where the card is simply
+/// drawn in that look, and for cards with only one look.
+fn morph_of(
+    card: &ContentCard,
+    height: f32,
+    media_rest: PillSize,
+    content_scale: f32,
+) -> Option<Morph> {
+    // The slot draws in unscaled content coordinates. Compare its spring
+    // height in that same space so a smaller expanded card can fully open.
+    let height = height / content_scale;
+    let (small, big) = match card {
+        ContentCard::Calculator(_) => (COMPACT, islet_core::island::CALCULATOR),
+        ContentCard::Stats(_) => (COMPACT, islet_core::island::STATS),
+        ContentCard::Media(_) => (media_rest, islet_core::island::MEDIA),
+        ContentCard::Notification(_) | ContentCard::Agent(_) => {
+            (COMPACT, islet_core::island::NOTIFICATION)
+        }
+        ContentCard::Dictation(_) | ContentCard::Glance(_) => return None,
+    };
+    if big.height <= small.height + 1.0 {
+        return None;
+    }
+    let open = ((height - small.height) / (big.height - small.height)).clamp(0.0, 1.0);
+    (open > 0.002 && open < 0.998).then_some(Morph { open, small, big })
+}
+
+/// Opacity of the small and big looks: the small one is gone a third of the
+/// way open, the big one arrives over the last half. In between only the
+/// shape (and a music card's art) moves, so the two never muddle together.
+fn morph_fades(open: f32) -> (f32, f32) {
+    (
+        1.0 - smoothstep(0.0, 0.35, open),
+        smoothstep(0.5, 0.95, open),
+    )
+}
+
+/// Where the compact music pill's art sits (and its corner radius) at a
+/// given pill size: a disc filling the left round end, `ART_INSET` from the
+/// end, the top and the bottom, like the art in every other pill.
+fn compact_art(pill: PillSize) -> (Rect, f32) {
+    let inset = expanded::ART_INSET;
+    let art = (pill.height - inset * 2.0).max(0.0);
+    (Rect::new(inset, inset, art, art), art * 0.5)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -791,25 +1137,11 @@ fn droplet_geometry(sample: &Sample, window_width: f32, window_height: f32) -> F
         if top { 0.0 } else { 1.0 },
     );
     if fullness >= 1.0 {
-        // The overshoot of an appearing pill is a soft swell away from the
-        // edge, like a drop settling, rather than a jump past its size.
-        let bloom = (sample.presence - 1.0).max(0.0);
-        let swell = |rect: Rect| {
-            squeeze(
-                rect,
-                1.0 + bloom * 0.9,
-                1.0 + bloom * 1.4,
-                top,
-                window_width,
-                window_height,
-                1.0,
-            )
-        };
         return FrameGeometry {
-            main: swell(frame.main),
-            main_corner: frame.main_corner * (1.0 + bloom * 0.9),
-            bubble: frame.bubble.map(swell),
-            bubble_corner: frame.bubble_corner * (1.0 + bloom * 0.9),
+            main: frame.main,
+            main_corner: frame.main_corner,
+            bubble: frame.bubble,
+            bubble_corner: frame.bubble_corner,
             taper: 0.0,
             taper_top: top,
             shell_alpha: 1.0,
@@ -860,7 +1192,9 @@ fn droplet_geometry(sample: &Sample, window_width: f32, window_height: f32) -> F
 /// shrunken pill.
 fn droplet_shape(fullness: f32) -> (f32, f32, f32) {
     let absorbed = 1.0 - fullness.clamp(0.0, 1.0);
-    let gather = smoothstep(0.0, 0.42, absorbed);
+    // The gather spans most of the first half, so the width draws in over
+    // many frames instead of snapping into a leaf.
+    let gather = smoothstep(0.0, 0.62, absorbed);
     let press = smoothstep(0.30, 1.0, absorbed);
     let width = (1.0 - 0.66 * gather) * (1.0 - 0.46 * press);
     let height = (1.0 - 0.22 * gather) * (1.0 - press);
@@ -905,6 +1239,12 @@ fn smoothstep(edge0: f32, edge1: f32, value: f32) -> f32 {
 }
 
 struct Gfx {
+    widget_navigation: bool,
+    widget_pages: u8,
+    widget_page: u8,
+    cpu_hot: bool,
+    widget_hover: Option<islet_core::widgets::WidgetHover>,
+    content_scale: f32,
     _device: ID3D11Device,
     _device_context: ID3D11DeviceContext,
     factory: ID2D1Factory1,
@@ -925,6 +1265,16 @@ struct Gfx {
     art: Vec<(u64, ID2D1BitmapBrush1)>,
     bar_levels: Option<[f32; BAR_COUNT]>,
     media_hover: Option<MediaHover>,
+    /// The music pill's small size (compact, or shrunk while playing), which
+    /// its expansion grows from. Set by the renderer each frame.
+    media_rest: PillSize,
+    /// The main pill's height from its size spring, before any droplet
+    /// squeeze: how far a card has opened from its small look to its big one.
+    main_spring_height: f32,
+    /// Set while drawing one part of an opening or closing card.
+    morph_part: Option<MorphPart>,
+    /// The art is drawn on its own while morphing, so the looks skip it.
+    skip_art: bool,
     pixel_width: u32,
     pixel_height: u32,
     dpi: f32,
@@ -1003,6 +1353,12 @@ impl Gfx {
         let device = device.ok_or(RenderError::InvalidSize)?;
         let device_context = device_context.ok_or(RenderError::InvalidSize)?;
         let dxgi_device: IDXGIDevice = stage("cast IDXGIDevice", device.cast())?;
+        let low_latency: IDXGIDevice1 = stage("cast IDXGIDevice1", dxgi_device.cast())?;
+        // Avoid buffering several refreshes of old motion on fast displays.
+        stage(
+            "SetMaximumFrameLatency",
+            low_latency.SetMaximumFrameLatency(1),
+        )?;
         let adapter: IDXGIAdapter = stage("GetAdapter", dxgi_device.GetAdapter())?;
         let dxgi_factory: IDXGIFactory2 = stage("GetParent IDXGIFactory2", adapter.GetParent())?;
 
@@ -1060,6 +1416,12 @@ impl Gfx {
 
         Ok(Self {
             _device: device,
+            content_scale: 1.0,
+            widget_navigation: false,
+            widget_pages: 0,
+            widget_page: 0,
+            cpu_hot: false,
+            widget_hover: None,
             _device_context: device_context,
             factory,
             _d2d_device: d2d_device,
@@ -1079,6 +1441,10 @@ impl Gfx {
             art: Vec::with_capacity(ART_CACHE_SIZE),
             bar_levels: None,
             media_hover: None,
+            media_rest: COMPACT,
+            main_spring_height: 0.0,
+            morph_part: None,
+            skip_art: false,
             pixel_width: config.pixel_width,
             pixel_height: config.pixel_height,
             dpi: config.dpi,
@@ -1119,15 +1485,37 @@ impl Gfx {
         progress: f32,
     ) -> RenderResult<()> {
         let transitioning = previous.is_some() && progress < 1.0;
+        self.widget_navigation = content.widget_navigation;
+        self.widget_pages = content.widget_pages;
+        self.widget_page = content.widget_page;
+        self.cpu_hot = content.cpu_hot;
+        // A card opening or closing is composed separately (see draw_morph).
+        // Not during a content cross-fade or while it is a droplet.
+        let morph = if transitioning || geometry.taper > 0.001 {
+            None
+        } else {
+            content.primary.as_ref().and_then(|card| {
+                morph_of(
+                    card,
+                    self.main_spring_height,
+                    self.media_rest,
+                    self.content_scale,
+                )
+            })
+        };
         self.dc.BeginDraw();
         self.dc.SetTransform(&Matrix3x2::identity());
         self.dc.Clear(Some(&TRANSPARENT));
 
         if geometry.main.width >= 0.5 && geometry.main.height >= 0.5 {
+            let alpha = pill_alpha(geometry.main, target.visible) * geometry.shell_alpha;
+            if self.cpu_hot && geometry.taper < 0.001 {
+                self.draw_heat_glow(geometry.main, geometry.main_corner, alpha)?;
+            }
             self.draw_pill(
                 geometry.main,
                 geometry.main_corner,
-                pill_alpha(geometry.main, target.visible) * geometry.shell_alpha,
+                alpha,
                 geometry.taper,
                 geometry.taper_top,
             )?;
@@ -1143,7 +1531,21 @@ impl Gfx {
                 }
             }
 
-            if !transitioning {
+            if morph.is_some() {
+                if let (Some(bubble), Some(card)) = (geometry.bubble, &content.secondary) {
+                    self.draw_card_in_slot(
+                        now,
+                        bubble,
+                        geometry.bubble_corner,
+                        card,
+                        content.accent,
+                        geometry.content_alpha,
+                        1.0,
+                        geometry.taper,
+                        geometry.taper_top,
+                    )?;
+                }
+            } else if !transitioning {
                 self.draw_snapshot(now, geometry, content, geometry.content_alpha, 1.0)?;
             }
         }
@@ -1152,8 +1554,119 @@ impl Gfx {
 
         if transitioning {
             self.draw_transition(now, geometry, previous, content, progress)?;
+        } else if let (Some(morph), Some(card)) = (morph, content.primary.as_ref()) {
+            self.draw_morph(now, geometry, card, content.accent, morph)?;
         }
         Ok(())
+    }
+
+    /// A card opening into its big look, or closing back. Each look keeps
+    /// its own layout at its final size, centred in the growing shape
+    /// (revealed, never reflowed), and they take turns, blurring out and
+    /// in, while a music card's art travels between them, sharp throughout.
+    unsafe fn draw_morph(
+        &mut self,
+        now: f64,
+        geometry: &FrameGeometry,
+        card: &ContentCard,
+        accent: [u8; 3],
+        morph: Morph,
+    ) -> RenderResult<()> {
+        self.ensure_content_layers()?;
+        let main_target = self._bitmap.clone().ok_or(RenderError::InvalidSize)?;
+        let layers = self
+            .content_layers
+            .as_ref()
+            .ok_or(RenderError::InvalidSize)?;
+        let small = (
+            layers[0].bitmap.clone(),
+            layers[0].input.clone(),
+            layers[0].effect.clone(),
+            layers[0].output.clone(),
+        );
+        let big = (
+            layers[1].bitmap.clone(),
+            layers[1].input.clone(),
+            layers[1].effect.clone(),
+            layers[1].output.clone(),
+        );
+        let (small_alpha, big_alpha) = morph_fades(morph.open);
+        let alpha = geometry.content_alpha;
+        let mut composed = Vec::with_capacity(2);
+        for (part, opacity, (bitmap, input, effect, output)) in [
+            (MorphPart::Small, small_alpha, small),
+            (MorphPart::Big, big_alpha, big),
+        ] {
+            if opacity <= 0.004 {
+                continue;
+            }
+            self.dc.SetTarget(&bitmap);
+            self.dc.BeginDraw();
+            self.dc.SetTransform(&Matrix3x2::identity());
+            self.dc.Clear(Some(&TRANSPARENT));
+            self.morph_part = Some(part);
+            let drawn = self.draw_card_in_slot(
+                now,
+                geometry.main,
+                geometry.main_corner,
+                card,
+                accent,
+                alpha * opacity,
+                1.0,
+                geometry.taper,
+                geometry.taper_top,
+            );
+            self.morph_part = None;
+            self.dc.EndDraw(None, None)?;
+            drawn?;
+            effect.SetInput(0, &input, true);
+            set_blur_deviation(&effect, 7.0 * (1.0 - opacity))?;
+            composed.push(output);
+        }
+
+        self.dc.SetTarget(&main_target);
+        self.dc.BeginDraw();
+        self.dc.SetTransform(&Matrix3x2::identity());
+        let rect = geometry.main;
+        self.dc.PushAxisAlignedClip(
+            &D2D_RECT_F {
+                left: rect.x,
+                top: rect.y,
+                right: rect.right(),
+                bottom: rect.bottom(),
+            },
+            D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+        );
+        for output in &composed {
+            self.dc.DrawImage(
+                output,
+                None,
+                None,
+                D2D1_INTERPOLATION_MODE_LINEAR,
+                D2D1_COMPOSITE_MODE_SOURCE_OVER,
+            );
+        }
+        self.dc.PopAxisAlignedClip();
+        let art = if matches!(card, ContentCard::Media(_)) {
+            self.morph_part = Some(MorphPart::Art);
+            let drawn = self.draw_card_in_slot(
+                now,
+                geometry.main,
+                geometry.main_corner,
+                card,
+                accent,
+                alpha,
+                1.0,
+                geometry.taper,
+                geometry.taper_top,
+            );
+            self.morph_part = None;
+            drawn
+        } else {
+            Ok(())
+        };
+        self.dc.EndDraw(None, None)?;
+        art
     }
 
     unsafe fn draw_transition(
@@ -1337,6 +1850,35 @@ impl Gfx {
         Ok(())
     }
 
+    /// A warm halo round the pill while the CPU is pegged. Static, so a busy
+    /// machine is not also asked to animate it.
+    unsafe fn draw_heat_glow(&mut self, rect: Rect, corner: f32, alpha: f32) -> RenderResult<()> {
+        if alpha <= 0.001 {
+            return Ok(());
+        }
+        let geometry = self.geometries.get(
+            &self.factory,
+            rect.width,
+            rect.height,
+            corner.min(rect.width * 0.5).min(rect.height * 0.5),
+            0.0,
+            false,
+        )?;
+        self.dc
+            .SetTransform(&Matrix3x2::translation(rect.x, rect.y));
+        for (width, strength) in [(9.0, 0.07), (5.0, 0.14), (2.5, 0.5)] {
+            self.set_color(color(HEAT_COLOR, strength * alpha));
+            self.dc.DrawGeometry(
+                &geometry,
+                &self.brush,
+                width,
+                None::<&ID2D1StrokeStyle>,
+            );
+        }
+        self.dc.SetTransform(&Matrix3x2::identity());
+        Ok(())
+    }
+
     unsafe fn draw_snapshot(
         &mut self,
         now: f64,
@@ -1433,14 +1975,24 @@ impl Gfx {
             self.dc
                 .PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
         }
+        let sizing = self.content_scale;
         let center = Vector2 {
-            X: rect.width * 0.5,
-            Y: rect.height * 0.5,
+            X: rect.width / sizing * 0.5,
+            Y: rect.height / sizing * 0.5,
         };
-        let transform =
-            Matrix3x2::scale_around(scale, scale, center) * Matrix3x2::translation(rect.x, rect.y);
+        let transform = Matrix3x2::scale_around(scale, scale, center)
+            * Matrix3x2::scale(sizing, sizing)
+            * Matrix3x2::translation(rect.x, rect.y);
         self.dc.SetTransform(&transform);
-        let drawn = self.draw_card(now, rect.width, rect.height, corner, card, accent, alpha);
+        let drawn = self.draw_card(
+            now,
+            rect.width / sizing,
+            rect.height / sizing,
+            corner / sizing,
+            card,
+            accent,
+            alpha,
+        );
         self.dc.SetTransform(&Matrix3x2::identity());
         if let Some(params) = &mut mask {
             self.dc.PopLayer();
@@ -1464,13 +2016,21 @@ impl Gfx {
         accent: [u8; 3],
         alpha: f32,
     ) -> RenderResult<()> {
+        if let Some(part) = self.morph_part {
+            return self.draw_card_part(now, width, height, card, accent, alpha, part);
+        }
         if width < 60.0 && height < 60.0 && !matches!(card, ContentCard::Dictation(_)) {
             return self.draw_bubble(now, width, height, corner, card, accent, alpha);
         }
         if height < 31.0 && !matches!(card, ContentCard::Dictation(_)) {
             return self.draw_tucked(now, width, height, card, accent, alpha);
         }
-        match card {
+        let drawn = match card {
+            ContentCard::Calculator(calculator) => {
+                self.draw_calculator(width, height, calculator, alpha)
+            }
+            ContentCard::Stats(stats) => self.draw_stats(width, height, stats, alpha),
+            ContentCard::Glance(glance) => self.draw_glance(width, height, glance, alpha),
             ContentCard::Media(media) => {
                 if height > 60.0 {
                     self.draw_media_expanded(now, width, height, media, accent, alpha)
@@ -1491,7 +2051,119 @@ impl Gfx {
             ContentCard::Dictation(dictation) => {
                 self.draw_dictation(now, width, height, dictation, accent, alpha)
             }
+        };
+        drawn?;
+        if height > 60.0
+            && self.widget_navigation
+            && matches!(
+                card,
+                ContentCard::Media(_)
+                    | ContentCard::Calculator(_)
+                    | ContentCard::Stats(_)
+                    | ContentCard::Agent(_)
+            )
+        {
+            self.draw_widget_navigation(width, height, alpha)?;
         }
+        Ok(())
+    }
+
+    /// One part of a morphing card, in the slot's local space (`width` x
+    /// `height` is the shape now). Each look is laid out at its own final
+    /// size and centred, so the shape reveals it rather than squeezing it.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn draw_card_part(
+        &mut self,
+        now: f64,
+        width: f32,
+        height: f32,
+        card: &ContentCard,
+        accent: [u8; 3],
+        alpha: f32,
+        part: MorphPart,
+    ) -> RenderResult<()> {
+        let Some(morph) = morph_of(
+            card,
+            self.main_spring_height,
+            self.media_rest,
+            self.content_scale,
+        ) else {
+            return Ok(());
+        };
+        let origin = |look: PillSize| ((width - look.width) * 0.5, (height - look.height) * 0.5);
+        if part == MorphPart::Art {
+            let ContentCard::Media(media) = card else {
+                return Ok(());
+            };
+            let (from, from_radius) = compact_art(morph.small);
+            let (small_x, small_y) = origin(morph.small);
+            let (big_x, big_y) = origin(morph.big);
+            let open = morph.open;
+            let lerp = |a: f32, b: f32| a + (b - a) * open;
+            let to = expanded::ART;
+            let art = Rect::new(
+                lerp(small_x + from.x, big_x + to.x),
+                lerp(small_y + from.y, big_y + to.y),
+                lerp(from.width, to.width),
+                lerp(from.height, to.height),
+            );
+            return self.draw_art(
+                art,
+                lerp(from_radius, expanded::ART_RADIUS),
+                media.art.as_ref(),
+                accent,
+                alpha,
+            );
+        }
+        let (small_alpha, big_alpha) = morph_fades(morph.open);
+        let (look, opacity) = if part == MorphPart::Small {
+            (morph.small, small_alpha)
+        } else {
+            (morph.big, big_alpha)
+        };
+        let (x, y) = origin(look);
+        // Arriving and leaving looks sit a touch smaller as they come and go.
+        let scale = 0.965 + 0.035 * opacity;
+        let mut base = Matrix3x2::identity();
+        self.dc.GetTransform(&mut base);
+        let local = Matrix3x2::scale_around(
+            scale,
+            scale,
+            Vector2 {
+                X: look.width * 0.5,
+                Y: look.height * 0.5,
+            },
+        ) * Matrix3x2::translation(x, y);
+        self.dc.SetTransform(&(local * base));
+        self.skip_art = true;
+        let (w, h) = (look.width, look.height);
+        let drawn = match (card, part) {
+            (ContentCard::Media(media), MorphPart::Small) => {
+                self.draw_media_compact(now, w, h, media, accent, alpha)
+            }
+            (ContentCard::Media(media), _) => {
+                self.draw_media_expanded(now, w, h, media, accent, alpha)
+            }
+            (ContentCard::Notification(notification), MorphPart::Small) => {
+                self.draw_notification_compact(w, h, notification, accent, alpha)
+            }
+            (ContentCard::Notification(notification), _) => {
+                self.draw_notification(w, h, notification, accent, alpha)
+            }
+            (ContentCard::Agent(agent), MorphPart::Small) => {
+                self.draw_agent_compact(now, w, h, agent, accent, alpha)
+            }
+            (ContentCard::Agent(agent), _) => self.draw_agent_expanded(w, h, agent, accent, alpha),
+            (ContentCard::Calculator(calculator), _) => {
+                self.draw_calculator(w, h, calculator, alpha)
+            }
+            (ContentCard::Stats(stats), _) => self.draw_stats(w, h, stats, alpha),
+            (ContentCard::Glance(glance), _) => self.draw_glance(w, h, glance, alpha),
+            (ContentCard::Dictation(_), _) => Ok(()),
+        };
+        self.skip_art = false;
+        self.dc.SetTransform(&base);
+        drawn
     }
 
     unsafe fn draw_media_compact(
@@ -1503,43 +2175,54 @@ impl Gfx {
         accent: [u8; 3],
         alpha: f32,
     ) -> RenderResult<()> {
-        let art = 24.0;
-        let art_y = (height - art) * 0.5;
-        // The compact pill is a stadium; clamping the art's corners to its
-        // half-size keeps the tile concentric with the pill's rounded ends.
-        self.draw_art(
-            Rect::new(8.0, art_y, art, art),
-            art * 0.5,
-            media.art.as_ref(),
-            accent,
-            alpha,
-        )?;
+        // Once music has played a while the pill narrows to the dictation
+        // pill's size. `shrunk` is 0 for the full pill and 1 for that small
+        // one, following the width so it tracks the spring: the title and
+        // artist fade out first, the art tucks into the round end and the bars
+        // settle into the middle of what is left.
+        let shrunk = 1.0 - smoothstep(110.0, 200.0, width);
+        // The compact pill is a stadium; a disc of half its height keeps the
+        // art concentric with the pill's rounded ends.
+        if !self.skip_art {
+            let (rect, radius) = compact_art(PillSize::new(width, height, height * 0.5));
+            self.draw_art(rect, radius, media.art.as_ref(), accent, alpha)?;
+        }
 
-        let text_w = (width - 104.0).max(10.0);
-        self.draw_text(
-            &media.title,
-            FormatId::CompactTitle,
-            40.0,
-            3.0,
-            text_w,
-            15.0,
-            color([255, 255, 255], 0.96 * alpha),
-        )?;
-        self.draw_text(
-            &media.artist,
-            FormatId::CompactSub,
-            40.0,
-            19.0,
-            text_w,
-            13.0,
-            color([173, 180, 199], 0.88 * alpha),
-        )?;
+        let text_alpha = smoothstep(150.0, 200.0, width);
+        if text_alpha > 0.0 {
+            let text_w = (width - 104.0).max(10.0);
+            self.draw_text(
+                &media.title,
+                FormatId::CompactTitle,
+                40.0,
+                3.0,
+                text_w,
+                15.0,
+                color([255, 255, 255], 0.96 * alpha * text_alpha),
+            )?;
+            self.draw_text(
+                &media.artist,
+                FormatId::CompactSub,
+                40.0,
+                19.0,
+                text_w,
+                13.0,
+                color([173, 180, 199], 0.88 * alpha * text_alpha),
+            )?;
+        }
 
-        let start = width - 46.0 - 10.0;
+        // The shrunk pill keeps every bar, the same size and spacing, at the
+        // right end with a small margin, leaving clear room after the art.
+        let full_start = width - 46.0 - 10.0;
+        let small_start = width - SHRUNK_BARS_RIGHT - ((BAR_COUNT - 1) as f32 * 8.0 + 2.8);
+        let start = full_start + (small_start - full_start) * shrunk;
         let mid = height * 0.5;
+        // Shorter peaks in the shrunk pill, so the bars keep clear of its
+        // top and bottom edges.
+        let reach = 15.0 + (SHRUNK_BAR_REACH - 15.0) * shrunk;
         for index in 0..BAR_COUNT {
             let level = self.bar_level(now, index, media.playing);
-            let bar_h = 3.0 + level * 15.0;
+            let bar_h = 3.0 + level * reach;
             self.fill_round_rect(
                 start + index as f32 * 8.0,
                 mid - bar_h * 0.5,
@@ -1594,6 +2277,8 @@ impl Gfx {
                     None,
                 )
             }
+            ContentCard::Glance(glance) => (glance_line(glance), None),
+            ContentCard::Calculator(_) | ContentCard::Stats(_) => return Ok(()),
             ContentCard::Dictation(_) => return Ok(()),
         };
 
@@ -1632,17 +2317,8 @@ impl Gfx {
         Ok(())
     }
 
-    /// Bar height 0..1: real loopback levels when fresh, otherwise a gentle
-    /// procedural wave while playing, and a low rest when paused.
     fn bar_level(&self, now: f64, index: usize, playing: bool) -> f32 {
-        if !playing {
-            return 0.12;
-        }
-        if let Some(levels) = self.bar_levels {
-            return levels[index % BAR_COUNT].clamp(0.0, 1.0);
-        }
-        let phase = now * 7.2 + index as f64 * 0.85;
-        (phase.sin() * 0.5 + 0.5) as f32 * 0.65 + 0.35
+        bar_level(self.bar_levels, now, index, playing)
     }
 
     unsafe fn draw_media_expanded(
@@ -1654,17 +2330,19 @@ impl Gfx {
         accent: [u8; 3],
         alpha: f32,
     ) -> RenderResult<()> {
-        self.draw_art(
-            expanded::ART,
-            expanded::ART_RADIUS,
-            media.art.as_ref(),
-            accent,
-            if self.media_hover == Some(MediaHover::Artwork) {
-                alpha * 0.92
-            } else {
-                alpha
-            },
-        )?;
+        if !self.skip_art {
+            self.draw_art(
+                expanded::ART,
+                expanded::ART_RADIUS,
+                media.art.as_ref(),
+                accent,
+                if self.media_hover == Some(MediaHover::Artwork) {
+                    alpha * 0.92
+                } else {
+                    alpha
+                },
+            )?;
+        }
 
         let text_x = expanded::TEXT_X;
         let text_w = expanded::TEXT_WIDTH;
@@ -1702,9 +2380,9 @@ impl Gfx {
         )?;
         self.fill_round_rect(
             expanded::PLAYER_WIDTH,
-            18.0,
+            20.0,
             1.0,
-            76.0,
+            80.0,
             0.5,
             color([255, 255, 255], 0.085 * alpha),
         )?;
@@ -2006,36 +2684,36 @@ impl Gfx {
         accent: [u8; 3],
         alpha: f32,
     ) -> RenderResult<()> {
-        let rounded = D2D1_ROUNDED_RECT {
-            rect: D2D_RECT_F {
-                left: rect.x,
-                top: rect.y,
-                right: rect.right(),
-                bottom: rect.bottom(),
-            },
-            radiusX: radius,
-            radiusY: radius,
-        };
-        if let Some(art) = art {
-            let brush = self.art_brush(art)?;
-            brush.SetOpacity(alpha.clamp(0.0, 1.0));
-            brush.SetTransform(
-                &(Matrix3x2::scale(
-                    rect.width / art.width.max(1) as f32,
-                    rect.height / art.height.max(1) as f32,
-                ) * Matrix3x2::translation(rect.x, rect.y)),
-            );
-            self.dc.FillRoundedRectangle(&rounded, &brush);
+        if rect.width < 0.5 || rect.height < 0.5 {
             return Ok(());
         }
-        self.fill_round_rect(
-            rect.x,
-            rect.y,
-            rect.width,
-            rect.height,
-            radius,
-            color(accent, 0.55 * alpha),
-        )?;
+        // The same outline as the pills (squircle corners, true half-circles
+        // when fully round), so the art inset in a card runs parallel to the
+        // card's own edge and the gap stays even around the corners.
+        let shape =
+            self.geometries
+                .get(&self.factory, rect.width, rect.height, radius, 0.0, false)?;
+        let mut base = Matrix3x2::identity();
+        self.dc.GetTransform(&mut base);
+        self.dc
+            .SetTransform(&(Matrix3x2::translation(rect.x, rect.y) * base));
+        if let Some(art) = art {
+            let brush = self.art_brush(art);
+            if let Ok(brush) = &brush {
+                brush.SetOpacity(alpha.clamp(0.0, 1.0));
+                brush.SetTransform(&Matrix3x2::scale(
+                    rect.width / art.width.max(1) as f32,
+                    rect.height / art.height.max(1) as f32,
+                ));
+                self.dc.FillGeometry(&shape, brush, None::<&ID2D1Brush>);
+            }
+            self.dc.SetTransform(&base);
+            return brush.map(|_| ());
+        }
+        self.set_color(color(accent, 0.55 * alpha));
+        self.dc
+            .FillGeometry(&shape, &self.brush, None::<&ID2D1Brush>);
+        self.dc.SetTransform(&base);
         let (cx, cy) = rect.center();
         let disc = rect.width.min(rect.height);
         self.fill_circle(cx, cy, disc * 0.2, color([255, 255, 255], 0.22 * alpha))?;
@@ -2502,8 +3180,52 @@ impl Gfx {
                     color(accent, 0.98 * alpha),
                 )?;
             }
-            ContentCard::Media(_) | ContentCard::Dictation(_) => {
+            ContentCard::Media(media) => {
+                let half = width.min(height) * 0.5;
+                self.draw_media_bubble(center_x, center_y, half, media, alpha)?;
+            }
+            ContentCard::Dictation(_) => {
                 self.fill_circle(center_x, center_y, 5.0, color(accent, alpha))?;
+            }
+            ContentCard::Calculator(_) | ContentCard::Stats(_) | ContentCard::Glance(_) => {
+                return Ok(())
+            }
+        }
+        Ok(())
+    }
+
+    /// The second player: its album art as a disc, with the same thin black
+    /// margin all the way round. A paused player dims under a pause mark.
+    unsafe fn draw_media_bubble(
+        &mut self,
+        cx: f32,
+        cy: f32,
+        half: f32,
+        media: &MediaCard,
+        alpha: f32,
+    ) -> RenderResult<()> {
+        let accent = media.accent.unwrap_or(DEFAULT_MEDIA_ACCENT);
+        let r = (half - BUBBLE_ART_INSET).max(2.0);
+        self.draw_art(
+            Rect::new(cx - r, cy - r, r * 2.0, r * 2.0),
+            r,
+            media.art.as_ref(),
+            accent,
+            if media.playing { alpha } else { alpha * 0.45 },
+        )?;
+        if !media.playing {
+            let bar_h = (r * 0.62).round();
+            let bar_w = (r * 0.17).max(2.0);
+            let gap = bar_w * 1.1;
+            for x in [cx - gap * 0.5 - bar_w, cx + gap * 0.5] {
+                self.fill_round_rect(
+                    x,
+                    cy - bar_h * 0.5,
+                    bar_w,
+                    bar_h,
+                    bar_w * 0.5,
+                    color([255, 255, 255], 0.95 * alpha),
+                )?;
             }
         }
         Ok(())
@@ -2703,6 +3425,10 @@ unsafe fn create_target_bitmap(
 #[derive(Clone, Copy, Debug)]
 #[repr(u8)]
 enum FormatId {
+    StatsValue,
+    CalculatorSmallResult,
+    CalculatorKey,
+    CalculatorResult,
     CompactTitle,
     CompactSub,
     Title,
@@ -2717,6 +3443,10 @@ enum FormatId {
 }
 
 struct TextFormats {
+    stats_value: IDWriteTextFormat,
+    calculator_small_result: IDWriteTextFormat,
+    calculator_key: IDWriteTextFormat,
+    calculator_result: IDWriteTextFormat,
     compact_title: IDWriteTextFormat,
     compact_sub: IDWriteTextFormat,
     title: IDWriteTextFormat,
@@ -2733,6 +3463,34 @@ struct TextFormats {
 impl TextFormats {
     unsafe fn new(factory: &IDWriteFactory) -> RenderResult<Self> {
         Ok(Self {
+            stats_value: create_format(
+                factory,
+                30.0,
+                DWRITE_FONT_WEIGHT_DEMI_BOLD,
+                DWRITE_TEXT_ALIGNMENT_LEADING,
+                DWRITE_PARAGRAPH_ALIGNMENT_NEAR,
+            )?,
+            calculator_small_result: create_format(
+                factory,
+                20.0,
+                DWRITE_FONT_WEIGHT_NORMAL,
+                DWRITE_TEXT_ALIGNMENT_TRAILING,
+                DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
+            )?,
+            calculator_key: create_format(
+                factory,
+                12.0,
+                DWRITE_FONT_WEIGHT_MEDIUM,
+                DWRITE_TEXT_ALIGNMENT_CENTER,
+                DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
+            )?,
+            calculator_result: create_format(
+                factory,
+                26.0,
+                DWRITE_FONT_WEIGHT_NORMAL,
+                DWRITE_TEXT_ALIGNMENT_TRAILING,
+                DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
+            )?,
             compact_title: create_format(
                 factory,
                 13.0,
@@ -2815,6 +3573,10 @@ impl TextFormats {
 
     fn get(&self, id: FormatId) -> &IDWriteTextFormat {
         match id {
+            FormatId::StatsValue => &self.stats_value,
+            FormatId::CalculatorSmallResult => &self.calculator_small_result,
+            FormatId::CalculatorKey => &self.calculator_key,
+            FormatId::CalculatorResult => &self.calculator_result,
             FormatId::CompactTitle => &self.compact_title,
             FormatId::CompactSub => &self.compact_sub,
             FormatId::Title => &self.title,
@@ -3012,6 +3774,22 @@ impl GeometryCache {
     }
 }
 
+/// Bezier handle length for a corner, as a fraction of its radius. A card's
+/// corners use a slightly softened (squircle) curve; once the corners meet
+/// in a capsule, the ends become true half-circles, so a small pill reads as
+/// a proper capsule instead of a rounded box. Blended so a resize never jumps.
+fn corner_control(radius: f32, short_side: f32) -> f32 {
+    /// Handle length that makes a cubic Bezier follow a quarter circle.
+    const CIRCLE: f32 = 0.552_284_8;
+    const SQUIRCLE: f32 = 0.48;
+    let roundness = if short_side > 0.0 {
+        (radius / (short_side * 0.5)).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    SQUIRCLE + (CIRCLE - SQUIRCLE) * smoothstep(0.85, 1.0, roundness)
+}
+
 /// The island's outline: a squircle that can also draw itself together into a
 /// leaf. With `taper` at 0 it is the plain rounded pill. As `taper` approaches
 /// 1 every point is pulled toward the centre line in proportion to how far it
@@ -3028,7 +3806,7 @@ unsafe fn create_squircle(
     let width = width.max(1.0);
     let height = height.max(1.0);
     let radius = corner.max(0.0).min(width * 0.5).min(height * 0.5);
-    let control = radius * 0.48;
+    let control = radius * corner_control(radius, width.min(height));
     let warp = |point: Vector2| {
         if taper <= 0.0 {
             return point;
@@ -3196,6 +3974,144 @@ mod tests {
         assert!((animator.sample(4.4).anchor).abs() < 0.012);
     }
 
+    #[test]
+    fn the_expanded_cover_follows_the_card_corner_curve() {
+        use islet_core::island::MEDIA;
+        // Same corner curve family for the card and the cover inset in it:
+        // both are cards (not capsules), so both use the squircle handle, and
+        // the cover's radius is the card's minus the inset.
+        let card = corner_control(MEDIA.corner, MEDIA.height);
+        let cover = corner_control(expanded::ART_RADIUS, expanded::ART.height);
+        assert!((card - cover).abs() < 1e-6, "{card} vs {cover}");
+        assert_eq!(MEDIA.corner - expanded::ART_RADIUS, expanded::ART_INSET);
+    }
+
+    #[test]
+    fn capsules_have_round_ends_and_cards_keep_soft_corners() {
+        // A fully round pill (radius = half its height): true half-circles.
+        assert!((corner_control(16.0, 32.0) - 0.552_284_8).abs() < 1e-6);
+        // The expanded card's corners keep the squircle.
+        assert!((corner_control(38.0, 120.0) - 0.48).abs() < 1e-6);
+        // In between it blends, without a jump.
+        let mut previous = corner_control(0.0, 32.0);
+        for step in 1..=100 {
+            let next = corner_control(16.0 * step as f32 / 100.0, 32.0);
+            assert!(next >= previous - 1e-6 && next - previous < 0.01);
+            previous = next;
+        }
+    }
+
+    #[test]
+    fn opening_hands_over_between_looks_without_overlap() {
+        use islet_core::island::{MEDIA, MEDIA_CONDENSED};
+        let card = ContentCard::Media(MediaCard {
+            title: "Song".to_owned(),
+            artist: "Artist".to_owned(),
+            source: "Spotify".to_owned(),
+            playing: true,
+            timeline: None,
+            art: None,
+            accent: None,
+            scrub: None,
+            volume: None,
+        });
+        // At either end the card is simply drawn in that look.
+        assert!(morph_of(&card, COMPACT.height, COMPACT, 1.0).is_none());
+        assert!(morph_of(&card, MEDIA.height, COMPACT, 1.0).is_none());
+        // Overshoot past either end is still that end.
+        assert!(morph_of(&card, MEDIA.height + 4.0, COMPACT, 1.0).is_none());
+        // In between it grows from whichever small size it rested at.
+        let halfway = (MEDIA_CONDENSED.height + MEDIA.height) * 0.5;
+        let morph = morph_of(&card, halfway, MEDIA_CONDENSED, 1.0).unwrap();
+        assert_eq!(morph.small, MEDIA_CONDENSED);
+        assert_eq!(morph.big, MEDIA);
+        assert!((morph.open - 0.5).abs() < 1e-6);
+
+        // Custom sizing must finish the shared-element animation at every
+        // supported expanded size, especially 80% (96 physical dp, 120 local).
+        for scale in [0.8, 1.0, 1.25] {
+            assert!(morph_of(&card, MEDIA.height * scale, MEDIA_CONDENSED, scale).is_none());
+            let mid = morph_of(&card, halfway * scale, MEDIA_CONDENSED, scale).unwrap();
+            assert!((mid.open - 0.5).abs() < 1e-6);
+        }
+
+        // The looks take turns: never both on screen at once, small first out.
+        for step in 0..=100 {
+            let (small, big) = morph_fades(step as f32 / 100.0);
+            assert!(small.min(big) < 1e-6, "both visible at {step}");
+        }
+        assert_eq!(morph_fades(0.0), (1.0, 0.0));
+        assert_eq!(morph_fades(1.0), (0.0, 1.0));
+
+        // The art is centred in the pill's round end: the same margin from
+        // the end as from the top and bottom, at both sizes.
+        let (rest, radius) = compact_art(COMPACT);
+        assert_eq!((rest.x, rest.y, rest.width), (4.0, 4.0, 28.0));
+        assert_eq!(radius, 14.0);
+        assert_eq!(rest.x + rest.width * 0.5, COMPACT.height * 0.5);
+        let (shrunk, _) = compact_art(MEDIA_CONDENSED);
+        assert_eq!((shrunk.x, shrunk.y, shrunk.width), (4.0, 4.0, 24.0));
+        // The expanded cover keeps the same gap, its corners following the
+        // card's.
+        assert_eq!((expanded::ART.x, expanded::ART.y), (4.0, 4.0));
+        assert_eq!(expanded::ART_RADIUS, MEDIA.corner - 4.0);
+    }
+
+    #[test]
+    fn a_new_look_waits_for_the_hidden_midpoint_of_a_trip() {
+        use islet_core::island::{DictationCard, COMPACT, DICTATION};
+        let config = RendererConfig {
+            hwnd: HWND(std::ptr::null_mut()),
+            pixel_width: 520,
+            pixel_height: 1040,
+            dpi: 96.0,
+            logical_width: 520.0,
+            logical_height: 1040.0,
+            anchor_top: true,
+        };
+        let mut renderer = Renderer::new(
+            config,
+            Arc::new(Mutex::new(HitRegion::default())),
+            Arc::new(BarLevels::default()),
+            0.0,
+        )
+        .unwrap();
+        let music = ContentSnapshot {
+            widget_navigation: false,
+            primary: None,
+            secondary: None,
+            accent: [1, 2, 3],
+            ..Default::default()
+        };
+        renderer.set_snapshot(LayoutTarget::single(COMPACT), music, 0.0);
+        assert!(renderer.animator.is_settled(2.0));
+
+        // Dictation starts: travel to the bottom, with a new look.
+        let dictation = ContentSnapshot {
+            widget_navigation: false,
+            primary: Some(ContentCard::Dictation(DictationCard::default())),
+            secondary: None,
+            accent: [255, 255, 255],
+            ..Default::default()
+        };
+        renderer.set_anchor(false, 2.0);
+        renderer.set_snapshot(LayoutTarget::single(DICTATION), dictation.clone(), 2.0);
+        // The departing droplet keeps the music pill's shape.
+        renderer.apply_deferred(2.2);
+        assert_eq!(renderer.target.main, COMPACT);
+        assert_eq!(renderer.animator.sample(2.2).main_width, COMPACT.width);
+
+        // Frame by frame, as the render loop does: past the midpoint it comes
+        // out of the bottom as the dictation pill, already at its size.
+        for frame in 0..=54 {
+            renderer.apply_deferred(2.2 + f64::from(frame) / 180.0);
+        }
+        assert_eq!(renderer.target.main, DICTATION);
+        assert_eq!(renderer.content, dictation);
+        assert!(renderer.previous_content.is_none());
+        assert_eq!(renderer.animator.sample(2.5).main_width, DICTATION.width);
+    }
+
     fn shown_animator(top: bool) -> Animator {
         let mut animator = Animator::new(LayoutTarget::HIDDEN, if top { 0.0 } else { 1.0 }, 0.0);
         animator.set_target(LayoutTarget::single(islet_core::island::COMPACT), 0.0);
@@ -3227,15 +4143,14 @@ mod tests {
                 assert!((early.main.bottom() - 1080.0).abs() < 1e-3, "{early:?}");
             }
 
-            // It swells slightly past its size and settles back.
-            let widest = (0..60)
-                .map(|step| geometry_of(&animator, f64::from(step) * 0.01).main.width)
-                .fold(0.0_f32, f32::max);
-            assert!(
-                widest > compact.width + 1.0,
-                "expected a soft swell: {widest}"
-            );
-            assert!(widest < compact.width * 1.08, "swell too big: {widest}");
+            // It grows steadily into its size and lands without a wobble past it.
+            let mut previous = 0.0_f32;
+            for step in 0..90 {
+                let width = geometry_of(&animator, f64::from(step) / 180.0).main.width;
+                assert!(width >= previous - 1e-3, "never shrinks back: {step}");
+                assert!(width <= compact.width + 1e-3, "no overshoot: {width}");
+                previous = width;
+            }
             assert!(animator.is_settled(1.4));
             let rest = geometry_of(&animator, 1.4);
             assert!((rest.main.width - compact.width).abs() < 0.5);
@@ -3292,6 +4207,7 @@ mod tests {
 
     fn sample_at(anchor: f32) -> Sample {
         Sample {
+            content_scale: 1.0,
             main_width: 220.0,
             main_height: 36.0,
             main_corner: 18.0,
@@ -3398,9 +4314,9 @@ mod tests {
 
     #[test]
     fn the_travelling_shape_tapers_to_a_leaf_tip() {
-        // A quarter of the way out of the top edge: it has gathered into a
-        // leaf whose tail points away from the edge.
-        let leaf = geometry_at(0.21);
+        // About halfway into the top edge: it has gathered into a leaf whose
+        // tail points away from the edge, before the shell starts to fade.
+        let leaf = geometry_at(0.27);
         assert!(leaf.taper_top);
         assert!(leaf.taper > 0.85, "expected a full leaf: {leaf:?}");
         assert!(

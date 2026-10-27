@@ -72,9 +72,23 @@ pub fn is_browser_name(name: &str) -> bool {
     NAMES.iter().any(|browser| contains_word(&name, browser))
 }
 
+/// Apps whose media sessions are voice notes and calls, never music.
+const CHAT_APPS: &[&str] = &[
+    "whatsapp", "telegram", "discord", "teams", "zoom", "skype", "signal", "messenger", "slack",
+];
+
+/// Whether a session's app id or name is a chat app.
+#[must_use]
+pub fn is_chat_app(app: &str) -> bool {
+    let app = app.to_lowercase();
+    CHAT_APPS.iter().any(|chat| app.contains(chat))
+}
+
 /// What the platform layer knows about one session.
 #[derive(Clone, Copy, Debug)]
 pub struct SessionFacts<'a> {
+    /// The session's app id (or name).
+    pub app: &'a str,
     pub is_browser: bool,
     /// The app itself marked the content as video (native apps only; browsers
     /// always say music).
@@ -112,7 +126,7 @@ impl MusicFilter {
             return true;
         }
         if !facts.is_browser {
-            return !facts.flagged_video;
+            return !facts.flagged_video && !is_chat_app(facts.app);
         }
         let title = normalize(facts.title);
         let playing_tab = (!title.is_empty())
@@ -135,6 +149,42 @@ impl MusicFilter {
                 .iter()
                 .any(|tab| self.site_of(tab) == Site::Listed),
         }
+    }
+
+    /// The youtube.com tab playing this session, when the title heuristic
+    /// rejected it. The platform layer can then look for the channel's
+    /// "Official Artist Channel" badge on that page.
+    #[must_use]
+    pub fn doubtful_youtube_tab<'t>(
+        &self,
+        facts: SessionFacts<'_>,
+        tab_titles: &'t [String],
+    ) -> Option<&'t String> {
+        if !self.music_only || !facts.is_browser {
+            return None;
+        }
+        let title = normalize(facts.title);
+        if title.is_empty() {
+            return None;
+        }
+        tab_titles
+            .iter()
+            .find(|tab| normalize(tab).contains(&title))
+            .filter(|tab| self.site_of(tab) == Site::YouTube)
+            .filter(|_| !looks_like_music(facts.title, facts.artist))
+    }
+
+    /// Whether a tab title belongs to one of the listed music sites.
+    #[must_use]
+    pub fn is_music_site_tab(&self, tab_title: &str) -> bool {
+        self.music_only && self.site_of(tab_title) == Site::Listed
+    }
+
+    /// Whether `tab_title` is the tab playing the track titled `track`.
+    #[must_use]
+    pub fn tab_names_track(tab_title: &str, track: &str) -> bool {
+        let track = normalize(track);
+        !track.is_empty() && normalize(tab_title).contains(&track)
     }
 
     fn site_of(&self, tab_title: &str) -> Site {
@@ -202,12 +252,24 @@ pub fn looks_like_music(title: &str, channel: &str) -> bool {
         return true;
     }
 
+    if is_episode(&title_lower) {
+        return false;
+    }
+
     const NOT_MUSIC: &[&str] = &[
         "trailer",
         "teaser",
         "podcast",
         "episode",
         "ep.",
+        "stand-up",
+        "standup",
+        "stand up comedy",
+        "full show",
+        "roast",
+        "sketch",
+        "prank",
+        "challenge",
         "reaction",
         "reacts",
         "review",
@@ -246,8 +308,12 @@ pub fn looks_like_music(title: &str, channel: &str) -> bool {
         "music video",
         "(mv)",
         "[mv]",
-        "feat.",
-        "ft.",
+        // A bracketed credit is a song's; a bare "ft." also lists show guests
+        // ("Show S2 EP8 ft. ...") and is only trusted below with "Artist - Song".
+        "(feat.",
+        "[feat.",
+        "(ft.",
+        "[ft.",
         "remix",
         "prod.",
         "slowed",
@@ -266,7 +332,8 @@ pub fn looks_like_music(title: &str, channel: &str) -> bool {
         return true;
     }
 
-    // "Artist - Song" where the channel is the artist.
+    // "Artist - Song" where the channel is the artist, or that shape with a
+    // featured artist ("Artist - Song ft. Other").
     if let Some((left, _)) = title_lower.split_once(" - ") {
         let left = left.trim();
         let channel = channel_lower.trim();
@@ -276,8 +343,36 @@ pub fn looks_like_music(title: &str, channel: &str) -> bool {
         {
             return true;
         }
+        if title_lower.contains("feat.") || title_lower.contains("ft.") {
+            return true;
+        }
     }
     false
+}
+
+/// Episode numbering: "EP8", "Ep 12", "S2E5", "S2 EP8", "Season 3".
+fn is_episode(title_lower: &str) -> bool {
+    let words: Vec<&str> = title_lower
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect();
+    let digits = |text: &str| !text.is_empty() && text.chars().all(|c| c.is_ascii_digit());
+    words.iter().enumerate().any(|(index, word)| {
+        let next = words.get(index + 1).copied().unwrap_or("");
+        // "ep8", "ep 8", "season 3"
+        if let Some(rest) = word.strip_prefix("ep") {
+            if digits(rest) || (rest.is_empty() && digits(next)) {
+                return true;
+            }
+        }
+        if *word == "season" && digits(next) {
+            return true;
+        }
+        // "s2e5"
+        word.strip_prefix('s')
+            .and_then(|rest| rest.split_once('e'))
+            .is_some_and(|(season, episode)| digits(season) && digits(episode))
+    })
 }
 
 fn normalize(text: &str) -> String {
@@ -319,6 +414,7 @@ mod tests {
 
     fn browser<'a>(title: &'a str, artist: &'a str) -> SessionFacts<'a> {
         SessionFacts {
+            app: "Firefox",
             is_browser: true,
             flagged_video: false,
             title,
@@ -333,6 +429,7 @@ mod tests {
     #[test]
     fn music_apps_count_unless_they_flag_video() {
         let app = SessionFacts {
+            app: "Spotify.exe",
             is_browser: false,
             flagged_video: false,
             title: "White Iverson",
@@ -346,6 +443,20 @@ mod tests {
             },
             &[]
         ));
+    }
+
+    #[test]
+    fn chat_apps_are_never_music() {
+        let whatsapp = SessionFacts {
+            app: "5319275A.WhatsAppDesktop_cv1g1gvanyjgm!App",
+            is_browser: false,
+            flagged_video: false,
+            title: "(65) WhatsApp",
+            artist: "",
+        };
+        assert!(!filter().is_music(whatsapp, &[]));
+        assert!(is_chat_app("Discord"));
+        assert!(!is_chat_app("SpotifyAB.SpotifyMusic_zpdnekdrzrea0!Spotify"));
     }
 
     #[test]
@@ -450,6 +561,67 @@ mod tests {
             "Podcast Episode 12 - Music Industry",
             "Talk Show"
         ));
+    }
+
+    #[test]
+    fn shows_with_guests_are_not_music() {
+        // The real report: a comedy show episode whose guests are listed "ft.".
+        let title =
+            "INDIA\u{2019}S GOT LATENT S2 EP8 ft. MC Stan, Tanmay Bhat, Madhur Virli, Arpit Bala";
+        assert!(!looks_like_music(title, "Samay Raina"));
+        let open = tabs(&[&format!("{title} - YouTube")]);
+        assert!(!filter().is_music(browser(title, "Samay Raina"), &open));
+
+        assert!(!looks_like_music(
+            "The Late Show Ep 12 ft. Some Guest",
+            "Late Show"
+        ));
+        assert!(!looks_like_music(
+            "Hot Ones S21E3 ft. A Rapper",
+            "First We Feast"
+        ));
+        assert!(!looks_like_music(
+            "Season 3 Finale ft. Everyone",
+            "Some Show"
+        ));
+        assert!(!looks_like_music(
+            "Stand-up special ft. friends",
+            "Comedian"
+        ));
+    }
+
+    #[test]
+    fn only_rejected_youtube_tracks_are_doubtful() {
+        let show = "INDIA\u{2019}S GOT LATENT S2 EP8 ft. MC Stan";
+        let open = tabs(&[
+            &format!("{show} - YouTube"),
+            "Drake - Passionfruit - YouTube",
+            "Kesariya - JioSaavn",
+        ]);
+        let doubtful = filter().doubtful_youtube_tab(browser(show, "Samay Raina"), &open);
+        assert_eq!(doubtful, Some(&open[0]));
+        // Already music by its title, or not on YouTube: nothing to check.
+        assert!(filter()
+            .doubtful_youtube_tab(browser("Drake - Passionfruit", "Drake"), &open)
+            .is_none());
+        assert!(filter()
+            .doubtful_youtube_tab(browser("Kesariya", "Arijit Singh"), &open)
+            .is_none());
+    }
+
+    #[test]
+    fn song_credits_still_count() {
+        assert!(looks_like_music("Secondhand (feat. Rema)", "Don Toliver"));
+        assert!(looks_like_music("Calm Down [ft. Selena Gomez]", "Rema"));
+        assert!(looks_like_music(
+            "Rema - Calm Down ft. Selena Gomez",
+            "Mavin Records"
+        ));
+        // Words that merely start with "ep" or "s" are not episode numbers.
+        assert!(looks_like_music("Epic - Slowed", "Someone"));
+        assert!(!is_episode("epic slowed version"));
+        assert!(!is_episode("s club 7 never had a dream"));
+        assert!(is_episode("s2e5 recap"));
     }
 
     #[test]

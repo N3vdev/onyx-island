@@ -72,7 +72,7 @@ impl AppState {
         self.nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
         self.nid.uCallbackMessage = WM_APP_TRAY;
         self.nid.hIcon = self.icon;
-        copy_wide(&mut self.nid.szTip, "Islet \u{00b7} idle");
+        copy_wide(&mut self.nid.szTip, "Onyx \u{00b7} idle");
 
         if unsafe { Shell_NotifyIconW(NIM_ADD, &self.nid) }.as_bool() {
             self.tray_added = true;
@@ -161,10 +161,15 @@ pub fn run(
     demo_state: Option<usize>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let hinstance = unsafe { GetModuleHandleW(None)? };
-    let icon = icon::create().or_else(|error| {
-        tracing::warn!(%error, "custom tray icon failed; using stock icon");
-        unsafe { LoadIconW(None, IDI_APPLICATION) }
-    })?;
+    let icon = icon::load_app(HINSTANCE(hinstance.0))
+        .or_else(|error| {
+            tracing::warn!(%error, "app icon unavailable for the tray; drawing one");
+            icon::create()
+        })
+        .or_else(|error| {
+            tracing::warn!(%error, "custom tray icon failed; using stock icon");
+            unsafe { LoadIconW(None, IDI_APPLICATION) }
+        })?;
 
     let class_name = w!("IsletTrayWindow");
     let window_class = WNDCLASSW {
@@ -208,7 +213,7 @@ pub fn run(
         CreateWindowExW(
             WINDOW_EX_STYLE(0),
             class_name,
-            w!("Islet"),
+            w!("Onyx"),
             WINDOW_STYLE(0),
             CW_USEDEFAULT,
             CW_USEDEFAULT,
@@ -240,7 +245,7 @@ pub fn run(
                     | WS_EX_NOREDIRECTIONBITMAP.0,
             ),
             island_class_name,
-            w!("Islet"),
+            w!("Onyx"),
             WS_POPUP,
             0,
             0,
@@ -287,7 +292,7 @@ pub fn run(
     tracing::info!(hwnd = ?island_hwnd, demo, "island window created");
     // A restart reconnects the same live preview without polling settings.
     unsafe {
-        if let Ok(settings) = FindWindowW(None, w!("Islet Settings")) {
+        if let Ok(settings) = FindWindowW(None, w!("Onyx Settings")) {
             if let Ok(anchor) =
                 FindWindowExW(Some(settings), None, w!("STATIC"), w!("IsletPreviewAnchor"))
             {

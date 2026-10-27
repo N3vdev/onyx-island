@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use eframe::egui::{self, Color32, RichText};
-use islet_asr::{ModelManager, ModelSpec, ModelStatus, MODELS};
+use islet_asr::{AddOn, ModelManager, ModelSpec, ModelStatus, AI_CLEANUP, MODELS};
 use islet_audio::{list_input_devices, InputDevice};
 use islet_core::config::{InjectionMethod, Replacement};
 use islet_core::hotkey::{modifier_bit, name_for_vk, Combo, Modifiers, VK_ESCAPE};
@@ -167,6 +167,39 @@ impl DictationUi {
         });
         self.messages.retain(|(id, _, _)| *id != spec.id);
         self.jobs.push((spec.id, job));
+    }
+
+    fn start_addon_download(&mut self, addon: &'static AddOn) {
+        let job = Job {
+            kind: JobKind::Download,
+            progress: Arc::new(Mutex::new((0, addon.total_size()))),
+            cancel: Arc::new(AtomicBool::new(false)),
+            result: Arc::new(Mutex::new(None)),
+        };
+        let (progress, cancel, result) = (
+            Arc::clone(&job.progress),
+            Arc::clone(&job.cancel),
+            Arc::clone(&job.result),
+        );
+        let manager = ModelManager::new(self.manager.root());
+        std::thread::spawn(move || {
+            let outcome = manager
+                .download_addon(
+                    addon,
+                    &mut |p| {
+                        if let Ok(mut shared) = progress.lock() {
+                            *shared = (p.done, p.total);
+                        }
+                    },
+                    &cancel,
+                )
+                .map_err(|error| error.to_string());
+            if let Ok(mut slot) = result.lock() {
+                *slot = Some(outcome);
+            }
+        });
+        self.messages.retain(|(id, _, _)| *id != addon.id);
+        self.jobs.push((addon.id, job));
     }
 
     fn start_verify(&mut self, spec: &'static ModelSpec) {
@@ -534,6 +567,132 @@ fn model_card(app: &mut SettingsApp, ui: &mut egui::Ui, spec: &'static ModelSpec
     }
 }
 
+/// The AI cleanup download row and its on/off switch.
+fn ai_cleanup_card(app: &mut SettingsApp, ui: &mut egui::Ui) {
+    let addon = &AI_CLEANUP;
+    let status = app.dictation_ui.manager.addon_status(addon);
+    let job_state = app.dictation_ui.job_for(addon.id).map(|job| {
+        let (done, total) = job.progress.lock().map_or((0, 0), |p| *p);
+        (done, total)
+    });
+    let message = app
+        .dictation_ui
+        .messages
+        .iter()
+        .find(|(id, _, _)| *id == addon.id)
+        .map(|(_, text, good)| (text.clone(), *good));
+    let size_mb = addon.total_size() / 1_000_000;
+
+    ui.label(
+        RichText::new(
+            "An optional language model that runs on this PC and rewrites each dictation: \
+             it drops what you corrected, removes rambling, fixes grammar, and lays out lists. \
+             It adds about a second or two after you stop, and uses about 1.8 GB of memory \
+             while loaded (it unloads with the speech model).",
+        )
+        .small()
+        .color(MUTED),
+    );
+    ui.add_space(6.0);
+
+    let mut download = false;
+    let mut cancel = false;
+    let mut delete = false;
+    ui.horizontal(|ui| {
+        ui.vertical(|ui| {
+            ui.label(RichText::new(addon.name).strong());
+            ui.label(
+                RichText::new(format!(
+                    "{} \u{b7} {} \u{b7} {size_mb} MB",
+                    addon.maker, addon.license
+                ))
+                .small()
+                .color(MUTED),
+            );
+            ui.label(RichText::new(addon.summary).small().color(MUTED));
+        });
+        ui.with_layout(
+            egui::Layout::right_to_left(egui::Align::Center),
+            |ui| match (job_state, status) {
+                (Some((done, total)), _) => {
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                    ui.add(
+                        egui::ProgressBar::new(done as f32 / total.max(1) as f32)
+                            .desired_width(150.0)
+                            .text(format!("{} / {} MB", done / 1_000_000, total / 1_000_000)),
+                    );
+                }
+                (None, ModelStatus::Installed) => {
+                    if ui.button("Delete").clicked() {
+                        delete = true;
+                    }
+                    ui.label(RichText::new("Installed").color(OK));
+                }
+                (None, ModelStatus::Partial { bytes }) => {
+                    if ui.button("Resume").clicked() {
+                        download = true;
+                    }
+                    ui.label(
+                        RichText::new(format!("{} MB downloaded", bytes / 1_000_000)).color(MUTED),
+                    );
+                }
+                (None, ModelStatus::Missing) => {
+                    if ui.button(format!("Download ({size_mb} MB)")).clicked() {
+                        download = true;
+                    }
+                }
+            },
+        );
+    });
+    if let Some((text, good)) = message {
+        ui.label(
+            RichText::new(text)
+                .small()
+                .color(if good { OK } else { DANGER }),
+        );
+    }
+    ui.add_space(6.0);
+    divider(ui);
+    let installed = status == ModelStatus::Installed;
+    let dictation = &mut app.config.dictation;
+    row(
+        ui,
+        "Rewrite with AI",
+        if installed {
+            "If a rewrite is slow or looks wrong, the normal cleaned text is typed instead."
+        } else {
+            "Download the model above to turn this on."
+        },
+        |ui| {
+            ui.add_enabled_ui(installed, |ui| {
+                toggle(ui, &mut dictation.ai_cleanup, "Rewrite with AI");
+            });
+        },
+    );
+
+    if download {
+        app.dictation_ui.start_addon_download(addon);
+    }
+    if cancel {
+        if let Some(job) = app.dictation_ui.job_for(addon.id) {
+            job.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+    if delete {
+        app.config.dictation.ai_cleanup = false;
+        match app.dictation_ui.manager.delete_addon(addon) {
+            Ok(()) => app
+                .dictation_ui
+                .set_message(addon.id, "Removed from this PC.".to_owned(), true),
+            Err(error) => app
+                .dictation_ui
+                .set_message(addon.id, format!("Could not remove: {error}"), false),
+        }
+    }
+}
+
 pub fn show(app: &mut SettingsApp, ui: &mut egui::Ui) {
     let ctx = ui.ctx().clone();
     app.dictation_ui.poll_jobs();
@@ -630,6 +789,19 @@ pub fn show(app: &mut SettingsApp, ui: &mut egui::Ui) {
     });
 
     card(ui, "Microphone", |ui| {
+        row(
+            ui,
+            "Pause media during dictation",
+            "Pause playing music and videos when recording starts. Resume them yourself afterward.",
+            |ui| {
+                toggle(
+                    ui,
+                    &mut app.config.dictation.pause_media,
+                    "Pause media during dictation",
+                );
+            },
+        );
+        divider(ui);
         let devices = app.dictation_ui.devices.clone();
         let selected_name = if app.config.dictation.microphone.is_empty() {
             "System default".to_owned()
@@ -792,6 +964,8 @@ pub fn show(app: &mut SettingsApp, ui: &mut egui::Ui) {
             .color(MUTED),
         );
     });
+
+    card(ui, "AI cleanup", |ui| ai_cleanup_card(app, ui));
 
     card(ui, "Personal dictionary", |ui| {
         ui.label(

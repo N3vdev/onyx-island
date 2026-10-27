@@ -1,0 +1,364 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-10-27T12:28:39.1766314Z",
+  "title": "Design System: Islet Settings",
+  "extensions": {
+    "colorMeta": {
+      "background": {
+        "role": "neutral",
+        "displayName": "background",
+        "tonalRamp": [
+          "oklch(15% 0.0044 264.46)",
+          "oklch(26% 0.0044 264.46)",
+          "oklch(38% 0.0044 264.46)",
+          "oklch(49% 0.0044 264.46)",
+          "oklch(61% 0.0044 264.46)",
+          "oklch(72% 0.0044 264.46)",
+          "oklch(84% 0.0044 264.46)",
+          "oklch(95% 0.0044 264.46)"
+        ]
+      },
+      "sidebar": {
+        "role": "neutral",
+        "displayName": "sidebar",
+        "tonalRamp": [
+          "oklch(15% 0.0043 264.47)",
+          "oklch(26% 0.0043 264.47)",
+          "oklch(38% 0.0043 264.47)",
+          "oklch(49% 0.0043 264.47)",
+          "oklch(61% 0.0043 264.47)",
+          "oklch(72% 0.0043 264.47)",
+          "oklch(84% 0.0043 264.47)",
+          "oklch(95% 0.0043 264.47)"
+        ]
+      },
+      "card": {
+        "role": "neutral",
+        "displayName": "card",
+        "tonalRamp": [
+          "oklch(15% 0.0060 271.14)",
+          "oklch(26% 0.0060 271.14)",
+          "oklch(38% 0.0060 271.14)",
+          "oklch(49% 0.0060 271.14)",
+          "oklch(61% 0.0060 271.14)",
+          "oklch(72% 0.0060 271.14)",
+          "oklch(84% 0.0060 271.14)",
+          "oklch(95% 0.0060 271.14)"
+        ]
+      },
+      "card-line": {
+        "role": "neutral",
+        "displayName": "card line",
+        "tonalRamp": [
+          "oklch(15% 0.0077 264.46)",
+          "oklch(26% 0.0077 264.46)",
+          "oklch(38% 0.0077 264.46)",
+          "oklch(49% 0.0077 264.46)",
+          "oklch(61% 0.0077 264.46)",
+          "oklch(72% 0.0077 264.46)",
+          "oklch(84% 0.0077 264.46)",
+          "oklch(95% 0.0077 264.46)"
+        ]
+      },
+      "text": {
+        "role": "neutral",
+        "displayName": "text",
+        "tonalRamp": [
+          "oklch(15% 0.0068 277.16)",
+          "oklch(26% 0.0068 277.16)",
+          "oklch(38% 0.0068 277.16)",
+          "oklch(49% 0.0068 277.16)",
+          "oklch(61% 0.0068 277.16)",
+          "oklch(72% 0.0068 277.16)",
+          "oklch(84% 0.0068 277.16)",
+          "oklch(95% 0.0068 277.16)"
+        ]
+      },
+      "muted": {
+        "role": "neutral",
+        "displayName": "muted",
+        "tonalRamp": [
+          "oklch(15% 0.0123 264.49)",
+          "oklch(26% 0.0123 264.49)",
+          "oklch(38% 0.0123 264.49)",
+          "oklch(49% 0.0123 264.49)",
+          "oklch(61% 0.0123 264.49)",
+          "oklch(72% 0.0123 264.49)",
+          "oklch(84% 0.0123 264.49)",
+          "oklch(95% 0.0123 264.49)"
+        ]
+      },
+      "accent": {
+        "role": "primary",
+        "displayName": "accent",
+        "tonalRamp": [
+          "oklch(15% 0.0542 158.60)",
+          "oklch(26% 0.0542 158.60)",
+          "oklch(38% 0.0542 158.60)",
+          "oklch(49% 0.0542 158.60)",
+          "oklch(61% 0.0542 158.60)",
+          "oklch(72% 0.0542 158.60)",
+          "oklch(84% 0.0542 158.60)",
+          "oklch(95% 0.0542 158.60)"
+        ]
+      },
+      "selection": {
+        "role": "neutral",
+        "displayName": "selection",
+        "tonalRamp": [
+          "oklch(15% 0.0082 255.56)",
+          "oklch(26% 0.0082 255.56)",
+          "oklch(38% 0.0082 255.56)",
+          "oklch(49% 0.0082 255.56)",
+          "oklch(61% 0.0082 255.56)",
+          "oklch(72% 0.0082 255.56)",
+          "oklch(84% 0.0082 255.56)",
+          "oklch(95% 0.0082 255.56)"
+        ]
+      },
+      "control": {
+        "role": "neutral",
+        "displayName": "control",
+        "tonalRamp": [
+          "oklch(15% 0.0113 285.54)",
+          "oklch(26% 0.0113 285.54)",
+          "oklch(38% 0.0113 285.54)",
+          "oklch(49% 0.0113 285.54)",
+          "oklch(61% 0.0113 285.54)",
+          "oklch(72% 0.0113 285.54)",
+          "oklch(84% 0.0113 285.54)",
+          "oklch(95% 0.0113 285.54)"
+        ]
+      },
+      "control-hover": {
+        "role": "neutral",
+        "displayName": "control hover",
+        "tonalRamp": [
+          "oklch(15% 0.0144 285.49)",
+          "oklch(26% 0.0144 285.49)",
+          "oklch(38% 0.0144 285.49)",
+          "oklch(49% 0.0144 285.49)",
+          "oklch(61% 0.0144 285.49)",
+          "oklch(72% 0.0144 285.49)",
+          "oklch(84% 0.0144 285.49)",
+          "oklch(95% 0.0144 285.49)"
+        ]
+      },
+      "control-active": {
+        "role": "neutral",
+        "displayName": "control active",
+        "tonalRamp": [
+          "oklch(15% 0.0174 285.43)",
+          "oklch(26% 0.0174 285.43)",
+          "oklch(38% 0.0174 285.43)",
+          "oklch(49% 0.0174 285.43)",
+          "oklch(61% 0.0174 285.43)",
+          "oklch(72% 0.0174 285.43)",
+          "oklch(84% 0.0174 285.43)",
+          "oklch(95% 0.0174 285.43)"
+        ]
+      },
+      "input": {
+        "role": "neutral",
+        "displayName": "input",
+        "tonalRamp": [
+          "oklch(15% 0.0062 285.70)",
+          "oklch(26% 0.0062 285.70)",
+          "oklch(38% 0.0062 285.70)",
+          "oklch(49% 0.0062 285.70)",
+          "oklch(61% 0.0062 285.70)",
+          "oklch(72% 0.0062 285.70)",
+          "oklch(84% 0.0062 285.70)",
+          "oklch(95% 0.0062 285.70)"
+        ]
+      },
+      "dots": {
+        "role": "neutral",
+        "displayName": "dots",
+        "tonalRamp": [
+          "oklch(15% 0.0062 258.36)",
+          "oklch(26% 0.0062 258.36)",
+          "oklch(38% 0.0062 258.36)",
+          "oklch(49% 0.0062 258.36)",
+          "oklch(61% 0.0062 258.36)",
+          "oklch(72% 0.0062 258.36)",
+          "oklch(84% 0.0062 258.36)",
+          "oklch(95% 0.0062 258.36)"
+        ]
+      },
+      "danger": {
+        "role": "neutral",
+        "displayName": "danger",
+        "tonalRamp": [
+          "oklch(15% 0.1776 22.64)",
+          "oklch(26% 0.1776 22.64)",
+          "oklch(38% 0.1776 22.64)",
+          "oklch(49% 0.1776 22.64)",
+          "oklch(61% 0.1776 22.64)",
+          "oklch(72% 0.1776 22.64)",
+          "oklch(84% 0.1776 22.64)",
+          "oklch(95% 0.1776 22.64)"
+        ]
+      }
+    },
+    "motion": [
+      {
+        "name": "widget-transition",
+        "value": "160ms",
+        "purpose": "Finite state transitions; zero when Windows client-area animations are disabled."
+      },
+      {
+        "name": "page-fade",
+        "value": "160ms; opacity = 0.75 + 0.25 * (1 - (1 - t)^3)",
+        "purpose": "Page body fade, skipped when system animations are disabled."
+      },
+      {
+        "name": "settled-widget",
+        "value": "event-driven; existing finite morph and cross-fade",
+        "purpose": "Unchanged settled snapshots skip redraw; calculator input adds no polling worker. Existing media and dictation motion remains independent."
+      }
+    ],
+    "typographyMeta": {
+      "headline": {
+        "displayName": "Page heading",
+        "purpose": "Dedicated bundled Nunito Bold face for page and editor titles."
+      }
+    },
+    "notes": [
+      "Tonal ramps are synthesized OKLCH panel aids, not additional shipped palette tokens.",
+      "Native egui components are represented by portable HTML/CSS visual translations; snippet focus states approximate toolkit behavior. No runtime performance claims are made.",
+      "Widget dimensions are native logical units, uniformly scaled by the existing expanded-size preference. Native calculator key labels use the incumbent renderer typography; they do not introduce a shared display-font token."
+    ]
+  },
+  "components": [
+    {
+      "name": "Button",
+      "kind": "button",
+      "refersTo": "button",
+      "description": "Portable translation of the dark native button; focus approximates egui.",
+      "html": "<button class=\"ds-button\">Customize...</button>",
+      "css": ".ds-button{background:#202026;color:#ecedf2;border:1px solid #2f3135;border-radius:8px;padding:6px 12px;font:14px \"Nunito\",sans-serif}.ds-button:hover{background:#2c2c34}.ds-button:focus-visible{outline:2px solid #a4ccb4;outline-offset:2px}.ds-button:active{background:#363640}"
+    },
+    {
+      "name": "Apply changes",
+      "kind": "button",
+      "description": "Light commit action in the draft editor; portable focus approximation.",
+      "html": "<button class=\"ds-button ds-apply\">Apply changes</button>",
+      "css": ".ds-button{background:#202026;color:#ecedf2;border:1px solid #2f3135;border-radius:8px;padding:6px 12px;font:14px \"Nunito\",sans-serif}.ds-button:hover{background:#2c2c34}.ds-button:focus-visible{outline:2px solid #a4ccb4;outline-offset:2px}.ds-button:active{background:#363640}.ds-apply{background:#ebebeb;color:#141414}.ds-apply:hover{background:#f5f5f5}.ds-apply:active{background:#dedede}"
+    },
+    {
+      "name": "Reset action",
+      "kind": "button",
+      "description": "Frameless secondary action next to music-site entry.",
+      "html": "<button class=\"ds-reset\">Reset</button>",
+      "css": ".ds-reset{background:transparent;color:#a6aab2;border:0;border-radius:8px;padding:6px 12px;font:14px \"Nunito\",sans-serif}.ds-reset:hover{background:#2c2c34;color:#ecedf2}.ds-reset:focus-visible{outline:1px solid #a4ccb4}.ds-reset:active{background:#363640}"
+    },
+    {
+      "name": "Text field",
+      "kind": "input",
+      "description": "Native single-line entry translated to portable HTML; focus approximates toolkit behavior.",
+      "html": "<input class=\"ds-input\" aria-label=\"Music site\" placeholder=\"Add a music site or URL\">",
+      "css": ".ds-input{background:#0e0e11;color:#ecedf2;border:1px solid #2f3135;border-radius:8px;padding:6px;font:14px \"Nunito\",sans-serif}.ds-input::placeholder{color:#a6aab2}.ds-input:hover{border-color:#a6aab2}.ds-input:focus-visible{outline:1px solid #a4ccb4}"
+    },
+    {
+      "name": "Navigation",
+      "kind": "nav",
+      "description": "36-point selected row within the 164-point rail; vector geometry translates the authored General icon.",
+      "html": "<nav class=\"ds-rail\"><button class=\"ds-nav\" aria-current=\"page\"><svg viewBox=\"0 0 20 20\" width=\"20\" height=\"20\" aria-hidden=\"true\"><path d=\"M3 5h14M3 10h14M3 15h14\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.4\"/><g fill=\"currentColor\"><circle cx=\"8\" cy=\"5\" r=\"2.2\"/><circle cx=\"13\" cy=\"10\" r=\"2.2\"/><circle cx=\"9\" cy=\"15\" r=\"2.2\"/></g></svg>General</button></nav>",
+      "css": ".ds-rail{width:140px;padding:18px 12px;background:#151618}.ds-nav{display:flex;align-items:center;gap:8px;width:140px;height:36px;padding:0 7px;background:rgba(255,255,255,.09);color:#ecedf2;border:1px solid #2f3135;border-radius:6px;font:700 13px \"Nunito\",sans-serif}.ds-nav:hover{color:#ecedf2}.ds-nav:focus-visible{outline:1px solid #ecedf2;outline-offset:-2px}"
+    },
+    {
+      "name": "Music site",
+      "kind": "chip",
+      "description": "Native capsule translated with a vector removal cross; does not canonize the source text glyph.",
+      "html": "<span class=\"ds-chip\">Spotify<button aria-label=\"Remove Spotify\"><svg width=\"12\" height=\"12\" viewBox=\"0 0 12 12\" aria-hidden=\"true\"><path d=\"m3 3 6 6m0-6-6 6\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.4\"/></svg></button></span>",
+      "css": ".ds-chip{display:inline-flex;gap:4px;align-items:center;background:#202026;color:#ecedf2;border-radius:14px;padding:3px 4px 3px 12px;font:14px \"Nunito\",sans-serif}.ds-chip button{background:transparent;border:0;border-radius:8px;color:#a6aab2;padding:6px}.ds-chip button:hover{background:#2c2c34;color:#ecedf2}.ds-chip button:focus-visible{outline:1px solid #a4ccb4}"
+    },
+    {
+      "name": "Setting group",
+      "kind": "card",
+      "refersTo": "card",
+      "description": "Outlined graphite group with native spacing.",
+      "html": "<section class=\"ds-card\">Position<p>Screen edge the island sits on.</p></section>",
+      "css": ".ds-card{background:#1a1b1e;color:#ecedf2;border:1px solid #2f3135;border-radius:10px;padding:16px 18px;font:14px \"Nunito\",sans-serif}.ds-card p{color:#a6aab2;font-size:12px;margin-bottom:0}"
+    },
+    {
+      "name": "Widget page indicator",
+      "kind": "nav",
+      "description": "Portable static translation of the native right-edge vertical page dots, without Scroll text. Shown only when the expanded island offers another activity page; upper dot is activity, lower is Calculator, and scrolling alone switches pages.",
+      "html": "<div class=\"ds-widget-pages\" role=\"img\" aria-label=\"Calculator, page 2 of 2\"><span class=\"ds-widget-dots\" aria-hidden=\"true\"><i></i><i class=\"ds-current\"></i></span></div>",
+      "css": ".ds-widget-pages{position:relative;width:160px;height:80px;background:#101113;border-radius:24px}.ds-widget-dots{position:absolute;right:6px;top:50%;transform:translateY(-50%);display:flex;flex-direction:column;gap:8px;pointer-events:none}.ds-widget-dots i{display:block;width:4px;height:4px;border-radius:50%;background:rgba(236,237,242,.25)}.ds-widget-dots .ds-current{background:rgba(236,237,242,.9)}"
+    },
+    {
+      "name": "Calculator keys",
+      "kind": "custom",
+      "description": "Portable appearance translation of numeric, operator, and Equals keys in the native calculator. Native input uses click and hover; browser focus is illustrative.",
+      "html": "<div class=\"ds-calc-keys\"><button>7</button><button class=\"ds-op\">+</button><button class=\"ds-equals\">=</button></div>",
+      "css": ".ds-calc-keys{display:flex;gap:6px;background:#101113;padding:12px}.ds-calc-keys button{width:52px;height:24px;border:0;border-radius:8px;background:rgba(255,255,255,.085);color:#ecedf2;font:500 12px sans-serif}.ds-calc-keys .ds-op{background:rgba(164,204,180,.13)}.ds-calc-keys .ds-equals{background:#a4ccb4;color:#101412}.ds-calc-keys button:hover{background:rgba(255,255,255,.2)}.ds-calc-keys .ds-op:hover{background:rgba(164,204,180,.2)}.ds-calc-keys .ds-equals:hover{background:rgba(164,204,180,.8)}.ds-calc-keys button:focus-visible{outline:1px solid #a4ccb4;outline-offset:2px}"
+    }
+  ],
+  "narrative": {
+    "northStar": "A compact desktop control workspace with the real island",
+    "overview": "Near-black canvas, charcoal navigation, softly outlined graphite groups, and rounded Nunito text make a restrained native control workspace. Fine static dots identify the island preview and full-screen sizing canvas. The actual island supplies the live content; settings supplies clear controls and feedback.\n\nThis refresh supersedes the former purple atmosphere and wide navigation rail. It preserves the bundled regular and bold Nunito faces, matching native Windows titlebar, right-aligned controls, visible focus, and real island preview. Source authority is `crates/islet-settings/src/ui.rs`, `customize.rs`, `preview.rs`, and `main.rs`, with sizing behavior in core configuration, island layout, app window integration, and renderer. Measurements are egui logical points, expressed as px in portable tokens; they are not physical screenshot pixels. This record governs settings and the shipped widget extension; the island retains its independent visual language. Widget source authority is `crates/islet-render/src/widgets.rs`, `crates/islet-core/src/widgets.rs`, `crates/islet-core/src/island.rs`, and `crates/islet-app/src/island_window.rs`.",
+    "keyCharacteristics": [
+      "Narrow navigation with authored line icons and restrained active rows.",
+      "Graphite groups, fine outlines, and a static dotted canvas.",
+      "Compact Nunito hierarchy with dedicated bold headings.",
+      "A native island preview and draft-only full-screen sizing.",
+      "Opt-in native tools with scroll-only page navigation and finite state changes."
+    ],
+    "rules": [
+      {
+        "name": "State Accent",
+        "body": "Reserve the cool accent for state and links; keep navigation and setting groups graphite.",
+        "section": "colors"
+      },
+      {
+        "name": "Utility Type",
+        "body": "Preserve the page-title, setting-label, description, and metadata hierarchy with real bundled bold faces for headings.",
+        "section": "typography"
+      },
+      {
+        "name": "Static Canvas",
+        "body": "Keep the dot grid still; animate interaction state rather than the workspace texture.",
+        "section": "elevation"
+      },
+      {
+        "name": "Proportional Expansion",
+        "body": "Scale expanded content and its container together; preserve compact dimensions.",
+        "section": "components"
+      },
+      {
+        "name": "Expanded-Only Widgets",
+        "body": "Show widget names, icons, and cards only in the expanded island. Enabling or selecting a widget must preserve compact activity and the configured Hidden or Sliver idle appearance; collapse remembers the selection for later expansion.",
+        "section": "components"
+      },
+      {
+        "name": "Scroll Navigation",
+        "body": "Switch widget pages by scrolling over the settled expanded island. When another activity page is available, show two noninteractive dots stacked vertically at the right edge, centered on the current expanded card. The upper dot identifies the activity page and the lower dot Calculator. Keep Scroll text out of the island; do not add navigation arrows or make the dots clickable.",
+        "section": "components"
+      },
+      {
+        "name": "Settled Widget",
+        "body": "Reuse the existing finite island morph and cross-fade for page changes; unchanged settled content snapshots must not trigger redraw. Calculator input and hover are event-driven and add no polling worker or background animation loop.",
+        "section": "components"
+      }
+    ],
+    "dos": [
+      "**Do** pair setting labels and descriptions with right-aligned controls.",
+      "**Do** preserve visible keyboard focus and meaningful control metadata.",
+      "**Do** keep native caption controls and match their frame to the sidebar.",
+      "**Do** use the real island for preview and per-edge sizing feedback.",
+      "**Do** keep sizing edits as drafts until Apply changes.",
+      "**Do** preserve the readable calculator result and active-input tail across supported expanded scales.",
+      "**Do** keep dictation and urgent notices ahead of optional widget pages."
+    ],
+    "donts": [
+      "**Don't** restore the superseded purple atmosphere or wide sidebar.",
+      "**Don't** add independent width and height controls or resize the compact pill through expanded sizing.",
+      "**Don't** introduce decorative background motion.",
+      "**Don't** add widget navigation arrows or clickable page dots; scrolling is the page navigation mechanism.",
+      "**Don't** promote decorative kickers, glyph icons, or system display faces into shared components."
+    ]
+  }
+}

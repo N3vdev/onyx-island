@@ -6,17 +6,17 @@ use eframe::egui::{
     self, Align, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Layout,
     Margin, RichText, Stroke, TextStyle,
 };
-use islet_core::config::{IdleStyle, MonitorChoice, ScreenPosition};
+use islet_core::config::{ExpandTrigger, IdleGlance, IdleStyle, MonitorChoice, ScreenPosition};
 
 use crate::{Page, SettingsApp};
 
-const BG: Color32 = Color32::from_rgb(12, 9, 15);
-const SIDEBAR: Color32 = Color32::from_rgb(3, 3, 4);
-const CARD: Color32 = Color32::from_rgb(18, 15, 21);
-const CARD_LINE: Color32 = Color32::from_rgb(46, 39, 51);
+const BG: Color32 = Color32::from_rgb(16, 17, 19);
+const SIDEBAR: Color32 = Color32::from_rgb(21, 22, 24);
+const CARD: Color32 = Color32::from_rgb(26, 27, 30);
+const CARD_LINE: Color32 = Color32::from_rgb(47, 49, 53);
 const TEXT: Color32 = Color32::from_rgb(236, 237, 242);
-const MUTED: Color32 = Color32::from_rgb(170, 160, 178);
-const ACCENT: Color32 = Color32::from_rgb(184, 119, 226);
+const MUTED: Color32 = Color32::from_rgb(166, 170, 178);
+const ACCENT: Color32 = Color32::from_rgb(164, 204, 180);
 const DANGER: Color32 = Color32::from_rgb(255, 110, 110);
 
 pub fn install_theme(ctx: &egui::Context) {
@@ -47,7 +47,7 @@ pub fn install_theme(ctx: &egui::Context) {
 
     let mut style = (*ctx.style()).clone();
     style.text_styles = [
-        (TextStyle::Heading, bold_font(28.0)),
+        (TextStyle::Heading, bold_font(25.0)),
         (TextStyle::Body, FontId::proportional(14.0)),
         (TextStyle::Button, FontId::proportional(14.0)),
         (TextStyle::Small, FontId::proportional(12.0)),
@@ -69,7 +69,7 @@ pub fn install_theme(ctx: &egui::Context) {
     visuals.window_fill = BG;
     visuals.extreme_bg_color = Color32::from_rgb(14, 14, 17);
     visuals.override_text_color = Some(TEXT);
-    visuals.selection.bg_fill = Color32::from_rgb(67, 39, 83);
+    visuals.selection.bg_fill = Color32::from_rgb(48, 51, 55);
     visuals.selection.stroke = Stroke::new(1.0, ACCENT);
     visuals.hyperlink_color = ACCENT;
     for widget in [
@@ -100,7 +100,7 @@ pub fn install_titlebar_theme() {
 
     // The native window exists before eframe invokes the app creation callback.
     unsafe {
-        let Ok(hwnd) = FindWindowW(None, w!("Islet Settings")) else {
+        let Ok(hwnd) = FindWindowW(None, w!("Onyx Settings")) else {
             return;
         };
         let colorref = |color: Color32| {
@@ -122,152 +122,146 @@ pub fn install_titlebar_theme() {
     }
 }
 
-/// Static vertex colors: no blur pass, textures, or idle animation.
-fn atmosphere(ui: &egui::Ui, rect: egui::Rect) {
-    let mut mesh = egui::Mesh::default();
-    const N: u32 = 64;
-    for y in 0..=N {
-        for x in 0..=N {
-            let u = x as f32 / N as f32;
-            let v = y as f32 / N as f32;
-            let glow = (-((u - 0.78).powi(2) * 3.0 + v.powi(2) * 10.0)).exp();
-            let color = Color32::from_rgb(
-                (12.0 + 47.0 * glow) as u8,
-                (9.0 + 21.0 * glow) as u8,
-                (15.0 + 53.0 * glow) as u8,
-            );
-            let py = v * rect.height();
-            let edge = py.min(rect.height() - py);
-            let inset = if edge < 22.0 {
-                22.0 - (22.0_f32.powi(2) - (22.0 - edge).powi(2)).sqrt()
-            } else {
-                0.0
-            };
-            mesh.colored_vertex(
-                egui::pos2(
-                    rect.left() + inset + u * (rect.width() - 2.0 * inset),
-                    rect.top() + py,
-                ),
-                color,
+/// A static grid like the user's canvas reference; no idle animation.
+pub(crate) fn dot_grid(ui: &egui::Ui, rect: egui::Rect) {
+    let painter = ui.painter().with_clip_rect(rect);
+    let spacing = 20.0;
+    for y in 0..=(rect.height() / spacing) as usize {
+        for x in 0..=(rect.width() / spacing) as usize {
+            painter.circle_filled(
+                rect.min + egui::vec2(x as f32 * spacing + 10.0, y as f32 * spacing + 10.0),
+                0.65,
+                Color32::from_rgb(38, 40, 43),
             );
         }
     }
-    for y in 0..N {
-        for x in 0..N {
-            let i = y * (N + 1) + x;
-            mesh.add_triangle(i, i + 1, i + N + 1);
-            mesh.add_triangle(i + 1, i + N + 2, i + N + 1);
-        }
-    }
-    ui.painter().add(egui::Shape::mesh(mesh));
 }
 
 pub fn draw(app: &mut SettingsApp, ctx: &egui::Context) {
+    if app.customization.is_some() {
+        crate::customize::show(app, ctx);
+        return;
+    }
     let previous_page = app.page;
     egui::SidePanel::left("nav")
-        .exact_width(224.0)
+        .exact_width(164.0)
         .resizable(false)
         .frame(
             egui::Frame::new()
                 .fill(SIDEBAR)
-                .inner_margin(Margin::same(20)),
+                .inner_margin(Margin::symmetric(12, 18)),
         )
         .show(ctx, |ui| sidebar(app, ui));
     if previous_page != app.page {
         app.page_changed = std::time::Instant::now();
     }
     egui::CentralPanel::default()
-        .frame(egui::Frame::new().fill(SIDEBAR).inner_margin(Margin {
-            left: 0,
-            right: 8,
-            top: 8,
-            bottom: 8,
-        }))
-        .show(ctx, |ui| {
-            let panel = ui.max_rect();
-            ui.painter().rect_filled(panel, CornerRadius::same(22), BG);
-            // Keep the mesh inside the curved panel, with a narrow dark rim.
-            atmosphere(ui, panel);
+        .frame(
             egui::Frame::new()
-                .inner_margin(Margin::symmetric(30, 20))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        egui::Frame::new()
-                            .fill(Color32::BLACK)
-                            .stroke(Stroke::new(1.0, CARD_LINE))
-                            .corner_radius(CornerRadius::same(18))
-                            .inner_margin(Margin::symmetric(12, 6))
-                            .show(ui, |ui| {
-                                ui.label(RichText::new("Personalize your island").size(11.0));
-                            });
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            ui.label(
-                                RichText::new(if app.status.is_some() {
-                                    "Check changes below"
-                                } else {
-                                    "Changes saved automatically"
-                                })
-                                .size(11.0)
-                                .color(MUTED),
-                            );
-                        });
-                    });
-                    ui.add_space(10.0);
-                    let (stage, _) = ui.allocate_exact_size(
-                        egui::vec2(ui.available_width(), 148.0),
-                        egui::Sense::hover(),
-                    );
-                    let slot = egui::Rect::from_min_size(
-                        egui::pos2(stage.center().x - 244.0, stage.top()),
-                        egui::vec2(488.0, 130.0),
-                    );
-                    app.preview.update(ctx, slot);
-                    ui.painter().text(
-                        egui::pos2(stage.center().x, stage.bottom() - 5.0),
-                        egui::Align2::CENTER_CENTER,
-                        if app.preview.connected() {
-                            "Live preview  /  Hover to expand"
+                .fill(BG)
+                .inner_margin(Margin::symmetric(28, 20)),
+        )
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Settings").font(bold_font(17.0)));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(
+                        RichText::new(if app.status.is_some() {
+                            "Could not save changes"
                         } else {
-                            "Connecting to your island..."
-                        },
-                        FontId::proportional(11.0),
-                        MUTED,
-                    );
-                    ui.add_space(18.0);
-                    let mut scroll_area = egui::ScrollArea::vertical();
-                    if let Some(offset) = app.initial_scroll.take() {
-                        scroll_area = scroll_area.vertical_scroll_offset(offset);
-                    }
-                    scroll_area
-                        .id_salt(match app.page {
-                            Page::General => "general",
-                            Page::NowPlaying => "media",
-                            Page::Dictation => "dictation",
-                            Page::About => "about",
+                            "All changes saved"
                         })
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            let progress = if app.animations {
-                                (app.page_changed.elapsed().as_secs_f32() / 0.2).min(1.0)
-                            } else {
-                                1.0
-                            };
-                            ui.set_opacity(0.5 + 0.5 * (1.0 - (1.0 - progress).powi(3)));
-                            if progress < 1.0 {
-                                ctx.request_repaint();
-                            }
-                            match app.page {
-                                Page::General => general(app, ui),
-                                Page::NowPlaying => now_playing(app, ui),
-                                Page::Dictation => crate::dictation_page::show(app, ui),
-                                Page::About => about(app, ui),
-                            }
-                            if let Some(status) = &app.status {
-                                ui.add_space(8.0);
-                                ui.label(RichText::new(status).color(DANGER));
-                            }
-                        });
+                        .size(11.0)
+                        .color(if app.status.is_some() {
+                            DANGER
+                        } else {
+                            MUTED
+                        }),
+                    );
                 });
+            });
+            ui.add_space(18.0);
+            let (stage, _) = ui.allocate_exact_size(
+                egui::vec2(
+                    ui.available_width(),
+                    if app.config.widgets.calculator {
+                        264.0
+                    } else {
+                        216.0
+                    },
+                ),
+                egui::Sense::hover(),
+            );
+            ui.painter().rect(
+                stage,
+                CornerRadius::same(12),
+                Color32::from_rgb(19, 20, 22),
+                Stroke::new(1.0, CARD_LINE),
+                egui::StrokeKind::Inside,
+            );
+            dot_grid(ui, stage.shrink(1.0));
+            ui.painter().text(
+                stage.left_top() + egui::vec2(16.0, 16.0),
+                egui::Align2::LEFT_TOP,
+                "Your island",
+                bold_font(12.0),
+                TEXT,
+            );
+            let caption = if app.preview.connected() {
+                match app.config.general.expand_on {
+                    ExpandTrigger::Hover => "Hover to expand",
+                    ExpandTrigger::Click => "Click to expand",
+                }
+            } else {
+                "Connecting to island..."
+            };
+            ui.painter().text(
+                stage.right_bottom() - egui::vec2(16.0, 12.0),
+                egui::Align2::RIGHT_BOTTOM,
+                caption,
+                FontId::proportional(11.0),
+                MUTED,
+            );
+            let slot = egui::Rect::from_center_size(
+                stage.center() + egui::vec2(0.0, 9.0),
+                egui::vec2(
+                    stage.width().min(720.0),
+                    if app.config.widgets.calculator {
+                        232.0
+                    } else {
+                        168.0
+                    },
+                ),
+            );
+            app.preview.update(ctx, slot, None);
+            ui.add_space(24.0);
+            let mut scroll = egui::ScrollArea::vertical()
+                .id_salt(("settings-page", app.page as usize))
+                .auto_shrink([false, false]);
+            if let Some(offset) = app.initial_scroll.take() {
+                scroll = scroll.vertical_scroll_offset(offset);
+            }
+            scroll.show(ui, |ui| {
+                let progress = if app.animations {
+                    (app.page_changed.elapsed().as_secs_f32() / 0.16).min(1.0)
+                } else {
+                    1.0
+                };
+                ui.set_opacity(0.75 + 0.25 * (1.0 - (1.0 - progress).powi(3)));
+                if progress < 1.0 {
+                    ctx.request_repaint();
+                }
+                match app.page {
+                    Page::General => general(app, ui),
+                    Page::NowPlaying => now_playing(app, ui),
+                    Page::Dictation => crate::dictation_page::show(app, ui),
+                    Page::Widgets => widgets(app, ui),
+                    Page::About => about(app, ui),
+                }
+                if let Some(status) = &app.status {
+                    ui.label(RichText::new(status).color(DANGER));
+                }
+            });
         });
 }
 
@@ -276,117 +270,51 @@ fn bold_font(size: f32) -> FontId {
 }
 
 fn sidebar(app: &mut SettingsApp, ui: &mut egui::Ui) {
-    ui.add_space(8.0);
     ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 12.0;
-        let (logo, _) = ui.allocate_exact_size(egui::vec2(38.0, 38.0), egui::Sense::hover());
-        ui.painter().rect(
-            logo,
-            CornerRadius::same(13),
-            Color32::from_rgb(26, 20, 32),
-            Stroke::new(1.0, CARD_LINE),
-            egui::StrokeKind::Inside,
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::hover());
+        ui.painter().rect_stroke(
+            egui::Rect::from_center_size(rect.center(), egui::vec2(20.0, 10.0)),
+            CornerRadius::same(5),
+            Stroke::new(2.0, TEXT),
+            egui::StrokeKind::Middle,
         );
-        let pill = egui::Rect::from_center_size(logo.center(), egui::vec2(23.0, 12.0));
-        ui.painter().rect_filled(pill, CornerRadius::same(6), TEXT);
-        ui.painter()
-            .circle_filled(logo.center() + egui::vec2(6.0, 0.0), 2.5, ACCENT);
-        ui.vertical(|ui| {
-            ui.spacing_mut().item_spacing.y = 0.0;
-            ui.label(RichText::new("Islet").font(bold_font(22.0)));
-            ui.label(RichText::new("Personal settings").size(11.0).color(MUTED));
-        });
+        ui.label(RichText::new("Onyx").font(bold_font(19.0)));
     });
-    ui.add_space(32.0);
-    let (nav, _) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), 256.0),
-        egui::Sense::hover(),
-    );
+    ui.add_space(25.0);
     let pages = [
-        (Page::General, "General", "Position & behavior"),
-        (Page::NowPlaying, "Now Playing", "Playback & music sites"),
-        (Page::Dictation, "Dictation", "Voice typing & models"),
-        (Page::About, "About Islet", "App & privacy"),
+        (Page::General, "General"),
+        (Page::NowPlaying, "Now Playing"),
+        (Page::Dictation, "Dictation"),
+        (Page::Widgets, "Widgets"),
     ];
-    // Resolve input first, then move one shared selection surface between rows.
-    let items: Vec<_> = pages
-        .iter()
-        .enumerate()
-        .map(|(i, (page, label, subtitle))| {
-            let rect = egui::Rect::from_min_size(
-                nav.min + egui::vec2(0.0, i as f32 * 66.0),
-                egui::vec2(nav.width(), 58.0),
-            );
-            let response = ui
-                .interact(
-                    rect,
-                    ui.make_persistent_id(("settings-nav", i)),
-                    egui::Sense::click(),
-                )
-                .on_hover_cursor(egui::CursorIcon::PointingHand);
-            if response.clicked() {
-                app.page = *page;
-            }
-            (rect, response, *page, *label, *subtitle)
-        })
-        .collect();
-    let index = pages
-        .iter()
-        .position(|(page, _, _)| *page == app.page)
-        .unwrap_or(0) as f32;
-    let slide = ui.ctx().animate_value_with_time(
-        ui.make_persistent_id("nav-selection"),
-        index,
-        if app.animations { 0.22 } else { 0.0 },
-    );
-    let selection = egui::Rect::from_min_size(
-        nav.min + egui::vec2(0.0, slide * 66.0),
-        egui::vec2(nav.width(), 58.0),
-    );
-    ui.painter().rect(
-        selection,
-        CornerRadius::same(15),
-        Color32::from_rgb(33, 24, 41),
-        Stroke::new(1.0, Color32::from_rgb(57, 40, 69)),
-        egui::StrokeKind::Inside,
-    );
-    for (rect, response, page, label, subtitle) in items {
-        nav_item(ui, app.page == page, page, label, subtitle, rect, response);
+    for (page, label) in pages {
+        let (rect, response) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 36.0), egui::Sense::click());
+        if response.clicked() {
+            app.page = page;
+        }
+        nav_item(ui, app.page == page, page, label, rect, response);
     }
-    ui.add_space(20.0);
-    // A quiet footer replaces the promotional card; it reports the real preview connection.
-    ui.add_space((ui.available_height() - 79.0).max(12.0));
+    ui.add_space((ui.available_height() - 102.0).max(12.0));
     divider(ui);
-    ui.add_space(14.0);
-    ui.horizontal(|ui| {
-        let (dot, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
-        ui.painter().circle_filled(
-            dot.center(),
-            3.0,
-            if app.preview.connected() {
-                ACCENT
-            } else {
-                MUTED
-            },
-        );
-        ui.label(
-            RichText::new(if app.preview.connected() {
-                "Island connected"
-            } else {
-                "Connecting island"
-            })
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 36.0), egui::Sense::click());
+    if response.clicked() {
+        app.page = Page::About;
+    }
+    nav_item(
+        ui,
+        app.page == Page::About,
+        Page::About,
+        "About Onyx",
+        rect,
+        response,
+    );
+    ui.add_space(6.0);
+    ui.label(
+        RichText::new(format!("Version {}", env!("CARGO_PKG_VERSION")))
             .size(11.0)
             .color(MUTED),
-        );
-    });
-    ui.add_space(2.0);
-    ui.label(
-        RichText::new(format!(
-            "Islet for Windows  /  {}",
-            env!("CARGO_PKG_VERSION")
-        ))
-        .size(10.0)
-        .color(MUTED),
     );
 }
 
@@ -395,7 +323,6 @@ fn nav_item(
     selected: bool,
     page: Page,
     label: &str,
-    subtitle: &str,
     rect: egui::Rect,
     response: egui::Response,
 ) {
@@ -405,30 +332,27 @@ fn nav_item(
     let active = ui
         .ctx()
         .animate_bool_responsive(response.id.with("selected"), selected);
-    if !selected {
-        ui.painter().rect_filled(
+    let fill = Color32::from_white_alpha((active * 23.0 + (1.0 - active) * hover * 10.0) as u8);
+    ui.painter().rect_filled(rect, CornerRadius::same(6), fill);
+    if selected {
+        ui.painter().rect_stroke(
             rect,
-            CornerRadius::same(15),
-            Color32::from_white_alpha((hover * 12.0) as u8),
+            CornerRadius::same(6),
+            Stroke::new(1.0, CARD_LINE),
+            egui::StrokeKind::Inside,
         );
     }
     if response.has_focus() {
         ui.painter().rect_stroke(
-            rect.shrink(2.0),
-            CornerRadius::same(13),
+            rect.shrink(1.0),
+            CornerRadius::same(6),
             Stroke::new(1.0, TEXT),
             egui::StrokeKind::Inside,
         );
     }
-    let center = egui::pos2(rect.left() + 23.0 + hover, rect.center().y);
-    let icon_rect = egui::Rect::from_center_size(center, egui::vec2(30.0, 30.0));
-    ui.painter().rect_filled(
-        icon_rect,
-        CornerRadius::same(10),
-        Color32::from_rgba_unmultiplied(154, 91, 193, (active * 35.0) as u8),
-    );
-    let color = if selected {
-        Color32::from_rgb(219, 177, 247)
+    let center = egui::pos2(rect.left() + 17.0, rect.center().y);
+    let color = if selected || response.hovered() {
+        TEXT
     } else {
         MUTED
     };
@@ -479,6 +403,21 @@ fn nav_item(
                 );
             }
         }
+        Page::Widgets => {
+            for dy in [-4.0, 4.0] {
+                for dx in [-4.0, 4.0] {
+                    ui.painter().rect_stroke(
+                        egui::Rect::from_center_size(
+                            center + egui::vec2(dx, dy),
+                            egui::vec2(5.0, 5.0),
+                        ),
+                        CornerRadius::same(1),
+                        stroke,
+                        egui::StrokeKind::Middle,
+                    );
+                }
+            }
+        }
         Page::About => {
             ui.painter().circle_stroke(center, 7.0, stroke);
             ui.painter()
@@ -490,7 +429,7 @@ fn nav_item(
         }
     }
     ui.painter().text(
-        egui::pos2(rect.left() + 48.0, rect.center().y - 9.0),
+        egui::pos2(rect.left() + 35.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
         label,
         if selected {
@@ -503,23 +442,6 @@ fn nav_item(
         } else {
             MUTED
         },
-    );
-    ui.painter().text(
-        egui::pos2(rect.left() + 48.0, rect.center().y + 10.0),
-        egui::Align2::LEFT_CENTER,
-        subtitle,
-        FontId::proportional(10.0),
-        MUTED,
-    );
-    let arrow = egui::pos2(rect.right() - 13.0, rect.center().y);
-    let stroke = Stroke::new(1.3, ACCENT.gamma_multiply(active));
-    ui.painter().line_segment(
-        [arrow + egui::vec2(-2.0, -3.0), arrow + egui::vec2(1.0, 0.0)],
-        stroke,
-    );
-    ui.painter().line_segment(
-        [arrow + egui::vec2(1.0, 0.0), arrow + egui::vec2(-2.0, 3.0)],
-        stroke,
     );
     response.widget_info(|| {
         egui::WidgetInfo::selected(
@@ -542,8 +464,8 @@ pub(crate) fn card(ui: &mut egui::Ui, title: &str, contents: impl FnOnce(&mut eg
     egui::Frame::new()
         .fill(CARD)
         .stroke(Stroke::new(1.0, CARD_LINE))
-        .corner_radius(CornerRadius::same(16))
-        .inner_margin(Margin::symmetric(20, 18))
+        .corner_radius(CornerRadius::same(10))
+        .inner_margin(Margin::symmetric(18, 16))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             contents(ui);
@@ -629,19 +551,50 @@ pub(crate) fn segmented<T: PartialEq + Copy>(
 }
 
 fn general(app: &mut SettingsApp, ui: &mut egui::Ui) {
-    header(ui, "General", "Make a little room for what matters.");
+    header(ui, "General", "Where your island lives and how it behaves.");
+    let mut customize = false;
     let general = &mut app.config.general;
     card(ui, "Placement", |ui| {
-        row(ui, "Position", "Screen edge the island sits on.", |ui| {
-            segmented(
+        row(
+            ui,
+            "Position",
+            "Dynamic sits at the top and moves to the bottom when an app is behind it. Top and Bottom stay put.",
+            |ui| {
+                segmented(
+                    ui,
+                    &mut general.position,
+                    &[
+                        (ScreenPosition::Dynamic, "Dynamic"),
+                        (ScreenPosition::Top, "Top"),
+                        (ScreenPosition::Bottom, "Bottom"),
+                    ],
+                );
+            },
+        );
+        divider(ui);
+        row(
+            ui,
+            "Customize sizing",
+            "Adjust edge spacing and the size of the expanded view.",
+            |ui| {
+                customize = ui.button("Customize...").clicked();
+            },
+        );
+        if general.position.docks_over_apps() {
+            divider(ui);
+            row(
                 ui,
-                &mut general.position,
-                &[
-                    (ScreenPosition::Bottom, "Bottom"),
-                    (ScreenPosition::Top, "Top"),
-                ],
+                "Stay over empty space",
+                "Keep the island at the top when the app behind it has nothing there.",
+                |ui| {
+                    toggle(
+                        ui,
+                        &mut general.stay_over_empty_space,
+                        "Stay over empty space",
+                    );
+                },
             );
-        });
+        }
         divider(ui);
         row(
             ui,
@@ -662,16 +615,64 @@ fn general(app: &mut SettingsApp, ui: &mut egui::Ui) {
     card(ui, "Behavior", |ui| {
         row(
             ui,
-            "When idle",
-            "Disappear completely, or leave a thin sliver.",
+            "Open the island",
+            "Show the full view when you hover over it, or only when you click.",
             |ui| {
                 segmented(
                     ui,
-                    &mut general.idle_style,
-                    &[(IdleStyle::Hidden, "Hidden"), (IdleStyle::Sliver, "Sliver")],
+                    &mut general.expand_on,
+                    &[
+                        (ExpandTrigger::Hover, "Hover"),
+                        (ExpandTrigger::Click, "Click"),
+                    ],
                 );
             },
         );
+        divider(ui);
+        row(
+            ui,
+            "Always show the island",
+            "Keep it on screen with something useful when nothing is playing.",
+            |ui| {
+                toggle(ui, &mut general.always_on, "Always show the island");
+            },
+        );
+        divider(ui);
+        if general.always_on {
+            row(
+                ui,
+                "When nothing is playing",
+                match general.glance {
+                    IdleGlance::Clock => {
+                        "The time. Hover the island for your music player."
+                    }
+                    IdleGlance::Stats => "CPU and memory use, updated every two seconds.",
+                },
+                |ui| {
+                    segmented(
+                        ui,
+                        &mut general.glance,
+                        &[
+                            (IdleGlance::Clock, "Clock"),
+                            (IdleGlance::Stats, "Stats"),
+                        ],
+                    );
+                },
+            );
+        } else {
+            row(
+                ui,
+                "When idle",
+                "Disappear completely, or leave a thin sliver.",
+                |ui| {
+                    segmented(
+                        ui,
+                        &mut general.idle_style,
+                        &[(IdleStyle::Hidden, "Hidden"), (IdleStyle::Sliver, "Sliver")],
+                    );
+                },
+            );
+        }
         divider(ui);
         row(
             ui,
@@ -681,25 +682,20 @@ fn general(app: &mut SettingsApp, ui: &mut egui::Ui) {
                 toggle(ui, &mut general.hide_in_fullscreen, "Hide in full screen");
             },
         );
-        divider(ui);
-        row(
-            ui,
-            "Dock over apps",
-            "Move to the bottom when an app overlaps. Return when the space is clear.",
-            |ui| {
-                toggle(ui, &mut general.tuck_behind_windows, "Dock over apps");
-            },
-        );
+
         divider(ui);
         row(
             ui,
             "Start with Windows",
-            "Launch Islet when you sign in.",
+            "Launch Onyx when you sign in.",
             |ui| {
                 toggle(ui, &mut general.start_with_windows, "Start with Windows");
             },
         );
     });
+    if customize {
+        app.open_customization(ui.ctx());
+    }
 }
 
 fn now_playing(app: &mut SettingsApp, ui: &mut egui::Ui) {
@@ -828,6 +824,35 @@ fn now_playing(app: &mut SettingsApp, ui: &mut egui::Ui) {
     }
 }
 
+fn widgets(app: &mut SettingsApp, ui: &mut egui::Ui) {
+    header(ui, "Widgets", "Small tools, right inside your island.");
+    card(ui, "Available widgets", |ui| {
+        row(
+            ui,
+            "Calculator",
+            "Quick arithmetic with percentages, sign changes, and normal operator precedence.",
+            |ui| {
+                toggle(ui, &mut app.config.widgets.calculator, "Calculator");
+            },
+        );
+        divider(ui);
+        row(
+            ui,
+            "System stats",
+            "Live CPU, GPU, memory, network, and temperature. The island's edge glows orange \
+             while the CPU is maxed out.",
+            |ui| {
+                toggle(ui, &mut app.config.widgets.system_stats, "System stats");
+            },
+        );
+    });
+    ui.add_space(4.0);
+    ui.label(RichText::new("Using widgets").font(bold_font(14.0)));
+    ui.label(RichText::new("Expand the island, then scroll to switch between your current activity and each widget.").color(MUTED));
+    ui.add_space(4.0);
+    ui.label(RichText::new("Widgets appear only in expanded mode. The collapsed island keeps your current activity or configured idle appearance.").small().color(MUTED));
+}
+
 fn about(app: &mut SettingsApp, ui: &mut egui::Ui) {
     header(ui, "About", "A Dynamic Island for Windows.");
     card(ui, "Application", |ui| {
@@ -852,7 +877,7 @@ fn about(app: &mut SettingsApp, ui: &mut egui::Ui) {
     card(ui, "Privacy", |ui| {
         ui.label(
             RichText::new(
-                "Everything runs on this PC. To tell music from video, Islet reads the titles of \
+                "Everything runs on this PC. To tell music from video, Onyx reads the titles of \
                  open browser tabs in memory when a track changes; titles are never stored or sent \
                  anywhere.",
             )
@@ -861,7 +886,11 @@ fn about(app: &mut SettingsApp, ui: &mut egui::Ui) {
         ui.add_space(8.0);
         ui.label(
             RichText::new(
-                "Dictation listens for your hotkey system-wide, but only to start and stop                  recording: other keystrokes are never stored, logged, or sent anywhere. The                  microphone is on only while you hold the hotkey (or in hands-free mode); audio                  is turned into text by a model on this PC and discarded. What you say is not                  saved or logged.",
+                "Dictation listens for your hotkey system-wide, but only to start and stop \
+                 recording: other keystrokes are never stored, logged, or sent anywhere. The \
+                 microphone is on only while you hold the hotkey (or in hands-free mode); audio \
+                 is turned into text by a model on this PC and discarded. What you say is not \
+                 saved or logged.",
             )
             .color(MUTED),
         );

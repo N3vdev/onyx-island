@@ -3,3 +3,7 @@
 *.pdb
 *.log
 .DS_Store
+/dist
+/.playwright-mcp
+/.impeccable/review
+/website/.firebase

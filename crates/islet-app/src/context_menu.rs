@@ -37,7 +37,7 @@ const ENTRIES: &[(usize, Option<&str>)] = &[
     (PAUSE_DICTATION, Some("Pause dictation")),
     (101, None),
     (RESTART, Some("Restart app")),
-    (QUIT, Some("Quit Islet")),
+    (QUIT, Some("Quit Onyx")),
 ];
 
 struct Popup {

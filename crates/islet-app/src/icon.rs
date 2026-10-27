@@ -1,13 +1,35 @@
 use std::ffi::c_void;
 
-use windows::core::BOOL;
+use windows::core::{BOOL, PCWSTR};
+use windows::Win32::Foundation::{HANDLE, HINSTANCE};
 use windows::Win32::Graphics::Gdi::{
     CreateBitmap, CreateDIBSection, DeleteObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
     DIB_RGB_COLORS, HGDIOBJ,
 };
-use windows::Win32::UI::WindowsAndMessaging::{CreateIconIndirect, DestroyIcon, HICON, ICONINFO};
+use windows::Win32::UI::WindowsAndMessaging::{
+    CreateIconIndirect, DestroyIcon, GetSystemMetrics, LoadImageW, HICON, ICONINFO, IMAGE_ICON,
+    LR_DEFAULTCOLOR, SM_CXSMICON, SM_CYSMICON,
+};
 
 const SIZE: usize = 32;
+
+/// The app's own icon (resource 1, from `assets/onyx.ico`), at the tray's
+/// small-icon size, so Windows picks the frame drawn for that size.
+pub fn load_app(instance: HINSTANCE) -> windows::core::Result<HICON> {
+    let (width, height) = unsafe { (GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON)) };
+    let handle: HANDLE = unsafe {
+        LoadImageW(
+            Some(instance),
+            // MAKEINTRESOURCE(1): the resource id travels in the pointer.
+            PCWSTR(std::ptr::without_provenance(1)),
+            IMAGE_ICON,
+            width,
+            height,
+            LR_DEFAULTCOLOR,
+        )?
+    };
+    Ok(HICON(handle.0))
+}
 
 /// Builds the tray icon at runtime.
 ///
@@ -73,7 +95,7 @@ pub fn create() -> windows::core::Result<HICON> {
     icon
 }
 
-/// Deletes an icon created by [`create`].
+/// Deletes an icon from [`create`] or [`load_app`].
 pub fn destroy(icon: HICON) {
     if !icon.is_invalid() {
         unsafe {
