@@ -917,6 +917,11 @@ impl Controller {
             .is_some_and(|session| session.peak < SILENCE_PEAK);
         self.session = None;
         let text = transcript::clean(raw, &self.text_options);
+        tracing::info!(
+            recognized_correction_cues = transcript::correction_cue_count(raw),
+            remaining_correction_cues = transcript::correction_cue_count(&text),
+            "Dictation correction summary"
+        );
         if text.is_empty() {
             self.phase = Phase::Idle;
             self.recording_ended();
@@ -975,10 +980,17 @@ impl Controller {
             Ok(rewrite) => {
                 let rewrite = transcript::unwrap_rewrite(&rewrite);
                 if transcript::accept_rewrite(&job.fallback, &rewrite) {
-                    tracing::info!(polish_ms, "AI cleanup applied");
+                    if rewrite == job.fallback {
+                        tracing::info!(polish_ms, "AI cleanup retained rule-cleaned text");
+                    } else {
+                        tracing::info!(polish_ms, "AI cleanup applied");
+                    }
                     rewrite
                 } else {
-                    tracing::info!(polish_ms, "AI cleanup rewrite refused; typing the cleaned text");
+                    tracing::info!(
+                        polish_ms,
+                        "AI cleanup rewrite refused; typing the cleaned text"
+                    );
                     job.fallback
                 }
             }
@@ -994,6 +1006,7 @@ impl Controller {
     }
 
     fn insert(&mut self, mut text: String, timing: Timing) {
+        text = transcript::format_numbers(&text);
         let Timing {
             stopped_at,
             worker_ms,
@@ -1009,7 +1022,7 @@ impl Controller {
             InjectionMethod::Unicode => Method::Unicode,
         };
         let text_ready = stopped_at.map(|at| at.elapsed());
-        match islet_input::insert_text(&text, method) {
+        match islet_input::insert_text_with_clipboard(&text, method, self.config.copy_to_clipboard) {
             Ok(report) => {
                 tracing::info!(
                     tail_audio_ms,
@@ -1019,6 +1032,7 @@ impl Controller {
                     release_to_inserted_ms = stopped_at.map(|at| at.elapsed().as_millis() as u64),
                     method = ?report.method,
                     clipboard_restored = report.clipboard_restored,
+                    clipboard_saved = report.clipboard_saved,
                     "dictation inserted"
                 );
                 if self.config.tones {
@@ -1029,6 +1043,13 @@ impl Controller {
                 self.phase = Phase::Idle;
                 self.recording_ended();
                 self.hide();
+                if self.config.copy_to_clipboard && !report.clipboard_saved {
+                    self.notice(
+                        "Text inserted",
+                        "Could not copy it to the clipboard.",
+                        AlertLevel::Error,
+                    );
+                }
             }
             Err(error) => {
                 tracing::error!(%error, "could not insert the dictated text");

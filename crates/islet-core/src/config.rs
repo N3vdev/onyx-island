@@ -159,6 +159,8 @@ pub struct DictationConfig {
     pub filler_removal: bool,
     pub spoken_punctuation: bool,
     pub injection: InjectionMethod,
+    /// Keep the final dictated text available for another paste after insertion.
+    pub copy_to_clipboard: bool,
     pub history: bool,
     pub model: String,
     pub keep_warm: bool,
@@ -264,6 +266,7 @@ impl Default for DictationConfig {
             filler_removal: true,
             spoken_punctuation: true,
             injection: InjectionMethod::Clipboard,
+            copy_to_clipboard: true,
             history: false,
             model: "parakeet-tdt-0.6b-v3-int8".to_owned(),
             keep_warm: false,
@@ -572,6 +575,20 @@ mod tests {
         assert!(config.general.hide_in_fullscreen);
         assert_eq!(config.keysounds.volume, 1.0);
         assert_eq!(config.dictation.push_to_talk, "Ctrl+Win");
+    }
+
+    #[test]
+    fn clipboard_copy_defaults_on_and_an_explicit_off_choice_round_trips() {
+        let legacy = Config::from_toml("[dictation]\ntrailing_space = false\n").unwrap();
+        assert!(legacy.dictation.copy_to_clipboard);
+        assert!(!legacy.dictation.trailing_space);
+        let off = Config::from_toml("[dictation]\ncopy_to_clipboard = false\n").unwrap();
+        assert!(!off.dictation.copy_to_clipboard);
+        assert!(!Config::from_toml(&off.to_toml().unwrap())
+            .unwrap()
+            .dictation
+            .copy_to_clipboard);
+        assert!(Config::default().dictation.copy_to_clipboard);
     }
 
     #[test]

@@ -585,10 +585,9 @@ fn ai_cleanup_card(app: &mut SettingsApp, ui: &mut egui::Ui) {
 
     ui.label(
         RichText::new(
-            "An optional language model that runs on this PC and rewrites each dictation: \
-             it drops what you corrected, removes rambling, fixes grammar, and lays out lists. \
-             It adds about a second or two after you stop, and uses about 1.8 GB of memory \
-             while loaded (it unloads with the speech model).",
+            "Onyx Cleanup runs Gemma 3 270M locally on your CPU. Long dictation is processed in short chunks, \
+             with correction rules and fact checks before insertion. Rejected chunks keep the rule-cleaned text. \
+             This experimental model is 278 MiB; cleanup quality and time vary with the passage."
         )
         .small()
         .color(MUTED),
@@ -639,7 +638,7 @@ fn ai_cleanup_card(app: &mut SettingsApp, ui: &mut egui::Ui) {
                     );
                 }
                 (None, ModelStatus::Missing) => {
-                    if ui.button(format!("Download ({size_mb} MB)")).clicked() {
+                    if ui.button(format!("Install ({size_mb} MB)")).clicked() {
                         download = true;
                     }
                 }
@@ -663,7 +662,7 @@ fn ai_cleanup_card(app: &mut SettingsApp, ui: &mut egui::Ui) {
         if installed {
             "If a rewrite is slow or looks wrong, the normal cleaned text is typed instead."
         } else {
-            "Download the model above to turn this on."
+            "Install the local model supplied with this build to turn this on."
         },
         |ui| {
             ui.add_enabled_ui(installed, |ui| {
@@ -683,12 +682,14 @@ fn ai_cleanup_card(app: &mut SettingsApp, ui: &mut egui::Ui) {
     if delete {
         app.config.dictation.ai_cleanup = false;
         match app.dictation_ui.manager.delete_addon(addon) {
-            Ok(()) => app
-                .dictation_ui
-                .set_message(addon.id, "Removed from this PC.".to_owned(), true),
-            Err(error) => app
-                .dictation_ui
-                .set_message(addon.id, format!("Could not remove: {error}"), false),
+            Ok(()) => {
+                app.dictation_ui
+                    .set_message(addon.id, "Removed from this PC.".to_owned(), true)
+            }
+            Err(error) => {
+                app.dictation_ui
+                    .set_message(addon.id, format!("Could not remove: {error}"), false)
+            }
         }
     }
 }
@@ -890,7 +891,7 @@ pub fn show(app: &mut SettingsApp, ui: &mut egui::Ui) {
         row(
             ui,
             "How text is inserted",
-            "Paste is fastest and keeps your clipboard. Type works where pasting does not.",
+            "Paste inserts through the clipboard. Type works where pasting does not.",
             |ui| {
                 segmented(
                     ui,
@@ -899,6 +900,19 @@ pub fn show(app: &mut SettingsApp, ui: &mut egui::Ui) {
                         (InjectionMethod::Clipboard, "Paste"),
                         (InjectionMethod::Unicode, "Type"),
                     ],
+                );
+            },
+        );
+        divider(ui);
+        row(
+            ui,
+            "Copy dictation to clipboard",
+            "Keep the finished text for Ctrl+V and Windows clipboard history (Win+V), when enabled. Turn off to preserve your previous clipboard.",
+            |ui| {
+                toggle(
+                    ui,
+                    &mut dictation.copy_to_clipboard,
+                    "Copy dictation to clipboard",
                 );
             },
         );

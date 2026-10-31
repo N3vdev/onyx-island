@@ -118,6 +118,31 @@ const WM_APP_DICTATION: u32 = WM_APP + 30;
 /// Extra room around a morphing island's window region for spring overshoot.
 const REGION_MORPH_MARGIN_DP: f32 = 12.0;
 
+/// Anchors are invisible child windows; only the settings root determines
+/// whether the live island belongs inside its preview.
+fn preview_anchor_visible(anchor: HWND) -> bool {
+    if !unsafe { IsWindow(Some(anchor)) }.as_bool() {
+        return false;
+    }
+    let root = unsafe { GetAncestor(anchor, GA_ROOT) };
+    if root.is_invalid()
+        || unsafe { IsIconic(root) }.as_bool()
+        || !unsafe { IsWindowVisible(root) }.as_bool()
+    {
+        return false;
+    }
+    let mut cloaked = 0u32;
+    unsafe {
+        let _ = windows::Win32::Graphics::Dwm::DwmGetWindowAttribute(
+            root,
+            windows::Win32::Graphics::Dwm::DWMWA_CLOAKED,
+            (&mut cloaked as *mut u32).cast(),
+            std::mem::size_of::<u32>() as u32,
+        );
+    }
+    cloaked == 0
+}
+
 const DEMO_INTERVAL_MS: u32 = 3_000;
 /// Hover reconciliation while the pointer is over the pill. Catches the pill
 /// shrinking out from under a stationary cursor, which produces no messages.
@@ -571,8 +596,11 @@ impl IslandHost {
             }
             PREVIEW_ATTACH => {
                 let anchor = HWND(wparam.0 as *mut _);
-                if unsafe { IsWindow(Some(anchor)) }.as_bool() {
+                if preview_anchor_visible(anchor) {
                     if self.preview == Some(anchor) {
+                        if self.preview_pending == Some(None) {
+                            self.preview_pending = Some(Some(anchor));
+                        }
                         self.refresh_preview();
                         self.send_snapshot();
                     } else if self.preview_pending != Some(Some(anchor)) {
@@ -590,11 +618,11 @@ impl IslandHost {
                 Some(LRESULT(0))
             }
             PREVIEW_DETACH => {
-                if self.preview.is_some_and(|h| h.0 as usize == wparam.0)
-                    || self.preview_pending == Some(Some(HWND(wparam.0 as *mut _)))
+                if self.preview_pending != Some(None)
+                    && (self.preview.is_some_and(|h| h.0 as usize == wparam.0)
+                        || self.preview_pending == Some(Some(HWND(wparam.0 as *mut _))))
                 {
-                    self.preview_pending = Some(None);
-                    self.begin_departure();
+                    self.detach_preview();
                 }
                 Some(LRESULT(0))
             }
@@ -608,7 +636,15 @@ impl IslandHost {
                             let _ = RemovePropW(old, w!("IsletPreviewAttached"));
                         }
                     }
-                    self.preview = next.filter(|h| unsafe { IsWindow(Some(*h)) }.as_bool());
+                    self.preview = next.filter(|h| {
+                        let visible = preview_anchor_visible(*h);
+                        if !visible {
+                            unsafe {
+                                let _ = RemovePropW(*h, w!("IsletPreviewAttached"));
+                            }
+                        }
+                        visible
+                    });
                     if self.preview.is_none() {
                         self.set_fullscreen_hidden(false);
                     }
@@ -2252,6 +2288,21 @@ impl IslandHost {
         }
     }
 
+    fn detach_preview(&mut self) {
+        if self.preview_pending == Some(None) {
+            return;
+        }
+        if let Some(Some(pending)) = self.preview_pending {
+            if self.preview != Some(pending) {
+                unsafe {
+                    let _ = RemovePropW(pending, w!("IsletPreviewAttached"));
+                }
+            }
+        }
+        self.preview_pending = Some(None);
+        self.begin_departure();
+    }
+
     fn refresh_preview(&mut self) {
         let Some(anchor) = self.preview else {
             return;
@@ -2270,9 +2321,11 @@ impl IslandHost {
         let root = unsafe { GetAncestor(anchor, GA_ROOT) };
         // Keep an independent window: owning it across processes would destroy
         // the island if settings crashed. Match the settings z-order explicitly.
-        let hidden =
-            unsafe { IsIconic(root) }.as_bool() || !unsafe { IsWindowVisible(root) }.as_bool();
-        self.set_fullscreen_hidden(hidden);
+        if !preview_anchor_visible(anchor) {
+            self.detach_preview();
+            return;
+        }
+        self.set_fullscreen_hidden(false);
         let mut rect = windows::Win32::Foundation::RECT::default();
         if unsafe { GetWindowRect(anchor, &mut rect) }.is_err() {
             return;

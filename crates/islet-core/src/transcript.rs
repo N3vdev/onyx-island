@@ -8,6 +8,10 @@
 
 use crate::config::{DictationConfig, Replacement};
 
+mod corrections;
+mod facts;
+mod safety;
+
 /// What to clean, taken from the user's settings.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TextOptions {
@@ -235,7 +239,9 @@ fn hedge_at(tokens: &[Token], index: usize) -> usize {
         .find(|words| {
             words.iter().enumerate().all(|(offset, word)| {
                 tokens.get(index + offset).is_some_and(|token| {
-                    !token.verbatim && norm(token) == *word && token.lead.is_empty()
+                    !token.verbatim
+                        && norm(token) == *word
+                        && token.lead.is_empty()
                         && (offset + 1 == words.len() || token.trail.is_empty())
                 })
             })
@@ -263,20 +269,23 @@ fn remove_fillers(tokens: Vec<Token>) -> Vec<Token> {
             && !token.verbatim
             && token.key() == "oh"
             && token.trail.is_empty()
-            && tokens.get(index + 1).is_some_and(|next| !next.word.is_empty());
+            && tokens
+                .get(index + 1)
+                .is_some_and(|next| !next.word.is_empty());
         let hedge = hedge_at(&tokens, index);
         if hedge > 0
             && out.last().is_some_and(|previous| {
                 previous.trail.is_empty() && HEDGE_LEAD_INS.contains(&norm(previous).as_str())
             })
             && tokens[index + hedge - 1].trail.is_empty()
-            && tokens.get(index + hedge).is_some_and(|next| !next.word.is_empty())
+            && tokens
+                .get(index + hedge)
+                .is_some_and(|next| !next.word.is_empty())
         {
             index += hedge;
             continue;
         }
-        let is_filler =
-            !token.verbatim && (FILLERS.contains(&token.key().as_str()) || stray_oh);
+        let is_filler = !token.verbatim && (FILLERS.contains(&token.key().as_str()) || stray_oh);
         let is_you_know = at_clause_start
             && !token.verbatim
             && token.key() == "you"
@@ -461,6 +470,12 @@ fn remove_stutters(tokens: Vec<Token>) -> Vec<Token> {
 
 #[derive(Clone, Copy)]
 enum Cue {
+    /// "No, it's not X, it's Y": verify the explicitly denied value before
+    /// replacing the preceding quantity. Never treat a general negation as a redo.
+    Contrast,
+    /// A full repeated clause may change a verified recipient or quantity.
+    /// Other differences, including negation and actions, are not inferred.
+    VerifiedRestate,
     /// "five cars, I mean six cars": swap the words just before for the ones
     /// after. `strong` cues are unambiguous; the others are also ordinary
     /// speech ("I mean, it works"), so they only count in the middle of a clause.
@@ -470,9 +485,28 @@ enum Cue {
     /// "sorry my bad. Instead of X, ...": the sentence after is a redo of the
     /// words before, so it takes their place.
     Restate,
+    /// Single ambiguous words only act when a typed phrase can be resolved.
+    Scoped,
 }
 
 const CUES: &[(&[&str], Cue)] = &[
+    (&["no", "that", "is", "wrong"], Cue::VerifiedRestate),
+    (&["let", "me", "correct", "that"], Cue::VerifiedRestate),
+    (&["no", "it's", "not"], Cue::Contrast),
+    (&["no", "it", "is", "not"], Cue::Contrast),
+    (&["no", "it", "isn't"], Cue::Contrast),
+    (&["no", "it", "was", "not"], Cue::Contrast),
+    (&["no", "it", "wasn't"], Cue::Contrast),
+    (&["no", "that's", "not"], Cue::Contrast),
+    (&["no", "that", "is", "not"], Cue::Contrast),
+    (&["actually", "it's", "not"], Cue::Contrast),
+    (&["actually", "it", "is", "not"], Cue::Contrast),
+    (&["no", "not"], Cue::Contrast),
+    (&["no", "i'm", "sorry"], Cue::Replace { strong: true }),
+    (&["no", "i", "am", "sorry"], Cue::Replace { strong: true }),
+    (&["actually", "make", "that"], Cue::Replace { strong: true }),
+    (&["make", "that"], Cue::Replace { strong: true }),
+    (&["no", "sorry"], Cue::Replace { strong: true }),
     (&["sorry", "i", "mean"], Cue::Replace { strong: true }),
     (&["no", "wait"], Cue::Replace { strong: true }),
     (&["wait", "no"], Cue::Replace { strong: true }),
@@ -498,21 +532,47 @@ const CUES: &[(&[&str], Cue)] = &[
     (&["my", "bad"], Cue::Restate),
     (&["my", "mistake"], Cue::Restate),
     (&["let", "me", "rephrase"], Cue::Restate),
+    (&["sorry"], Cue::Scoped),
+    (&["i'm", "sorry"], Cue::Scoped),
+    (&["i", "am", "sorry"], Cue::Scoped),
+    (&["actually"], Cue::Scoped),
+    (&["no"], Cue::Scoped),
 ];
 
 /// Most words a spoken correction replaces; people fix a word or a short
 /// phrase, and a longer guess would eat text that was meant to stay.
-const CORRECTION_WORDS: usize = 2;
+const CORRECTION_WORDS: usize = 4;
 
 fn cue_at(tokens: &[Token], index: usize) -> Option<(usize, Cue)> {
     CUES.iter().find_map(|(words, cue)| {
         let matches = words.iter().enumerate().all(|(offset, word)| {
-            tokens
-                .get(index + offset)
-                .is_some_and(|token| !token.verbatim && token.key() == *word)
+            tokens.get(index + offset).is_some_and(|token| {
+                !token.verbatim
+                    && norm(token) == *word
+                    && !token.lead.contains(['"', '\'', '\u{201c}', '\u{2018}'])
+                    && !token.trail.contains(['"', '\'', '\u{201d}', '\u{2019}'])
+            })
         });
         matches.then_some((words.len(), *cue))
     })
+}
+
+/// Count candidate multiword correction phrases for data-free diagnostics.
+/// This reports presence, not whether an ambiguous phrase is a correction.
+#[must_use]
+pub fn correction_cue_count(text: &str) -> usize {
+    let tokens: Vec<_> = text.split_whitespace().map(Token::parse).collect();
+    let mut at = 0;
+    let mut count = 0;
+    while at < tokens.len() {
+        if let Some((length, _)) = cue_at(&tokens, at).filter(|(length, _)| *length > 1) {
+            count += 1;
+            at += length;
+        } else {
+            at += 1;
+        }
+    }
+    count
 }
 
 fn clause_boundary(token: &Token) -> bool {
@@ -526,9 +586,32 @@ fn closes_phrase(token: &Token) -> bool {
 /// Words that open a question or a clause, so two of them back to back can be
 /// a restart: "can I just can't we just use".
 const RESTART_OPENERS: &[&str] = &[
-    "can", "can't", "could", "couldn't", "should", "shouldn't", "would", "wouldn't", "do",
-    "don't", "does", "doesn't", "is", "isn't", "are", "aren't", "will", "won't", "what",
-    "why", "how", "i", "we", "let's", "it", "they",
+    "can",
+    "can't",
+    "could",
+    "couldn't",
+    "should",
+    "shouldn't",
+    "would",
+    "wouldn't",
+    "do",
+    "don't",
+    "does",
+    "doesn't",
+    "is",
+    "isn't",
+    "are",
+    "aren't",
+    "will",
+    "won't",
+    "what",
+    "why",
+    "how",
+    "i",
+    "we",
+    "let's",
+    "it",
+    "they",
 ];
 
 /// "can I just can't we just use" -> "can't we just use": two phrases of the
@@ -584,6 +667,17 @@ fn resolve_corrections(tokens: Vec<Token>) -> Vec<Token> {
     let mut index = 0;
     while index < tokens.len() {
         if let Some((len, cue)) = cue_at(&tokens, index) {
+            if matches!(cue, Cue::Replace { strong: true })
+                && corrections::reverse_denial(&tokens, index + len)
+            {
+                if let Some(end) = corrections::reverse_recipient(&tokens, &mut out, index + len) {
+                    index = end;
+                } else {
+                    out.extend_from_slice(&tokens[index..index + len]);
+                    index += len;
+                }
+                continue;
+            }
             if let Some(next) = apply_cue(&tokens, &mut out, index, len, cue) {
                 index = next;
                 continue;
@@ -605,7 +699,50 @@ fn apply_cue(
 ) -> Option<usize> {
     let cue_end = index + len;
     let last_cue = &tokens[cue_end - 1];
+    if matches!(cue, Cue::Replace { .. })
+        && tokens.get(cue_end).is_some_and(|t| {
+            matches!(
+                norm(t).as_str(),
+                "i" | "we" | "you" | "he" | "she" | "they" | "it"
+            )
+        })
+        && tokens.get(cue_end + 1).is_some_and(|t| {
+            matches!(
+                norm(t).as_str(),
+                "am" | "is"
+                    | "are"
+                    | "was"
+                    | "were"
+                    | "have"
+                    | "has"
+                    | "do"
+                    | "does"
+                    | "can"
+                    | "will"
+                    | "should"
+            )
+        })
+    {
+        return corrections::verified_restate(tokens, out, cue_end);
+    }
+    if matches!(cue, Cue::Scoped) && out.last().is_some_and(Token::ends_sentence) {
+        return (norm(&tokens[index]) != "no")
+            .then(|| corrections::scoped_after_sentence(tokens, out, cue_end))
+            .flatten();
+    }
+    if !matches!(
+        cue,
+        Cue::Contrast | Cue::VerifiedRestate | Cue::Scratch | Cue::Restate
+    ) && (!matches!(cue, Cue::Replace { strong: false }) || !closes_phrase(last_cue))
+    {
+        if let Some(end) = corrections::apply(tokens, out, cue_end, !matches!(cue, Cue::Scoped)) {
+            return Some(end);
+        }
+    }
     match cue {
+        Cue::Contrast => corrections::contrast(tokens, out, cue_end),
+        Cue::VerifiedRestate => corrections::verified_restate(tokens, out, cue_end),
+        Cue::Scoped => None,
         Cue::Scratch => {
             // Only when it ends its clause ("scratch that." / "scratch that, ...").
             if !(closes_phrase(last_cue) || cue_end == tokens.len()) || out.is_empty() {
@@ -643,13 +780,19 @@ fn apply_cue(
             if redo.first().is_some_and(|t| t.key() == "that") && redo.len() > 2 {
                 redo.remove(0);
             }
-            if redo.len() < 2 || redo.iter().any(|t| t.verbatim) {
+            if redo.len() < 2 {
+                return corrections::apply(tokens, out, cue_end, true);
+            }
+            if redo.iter().any(|t| t.verbatim) {
                 return None;
             }
             // The redo starts with the same words the first try did.
-            let start = (0..out.len().saturating_sub(1)).rev().find(|&at| {
-                out[at].key() == redo[0].key() && out[at + 1].key() == redo[1].key()
-            })?;
+            let start = (0..out.len().saturating_sub(1))
+                .rev()
+                .find(|&at| out[at].key() == redo[0].key() && out[at + 1].key() == redo[1].key());
+            let Some(start) = start else {
+                return corrections::apply(tokens, out, cue_end, true);
+            };
             out.truncate(start);
             let starts_clause = out.last().is_none_or(clause_boundary);
             if !starts_clause && redo[0].word != "I" {
@@ -667,7 +810,8 @@ fn apply_cue(
             }
             let mut replacement: Vec<Token> = Vec::new();
             let mut next = cue_end;
-            while replacement.len() < CORRECTION_WORDS {
+            let wanted = corrections::replacement_words(tokens, cue_end, out).min(CORRECTION_WORDS);
+            while replacement.len() < wanted {
                 let Some(token) = tokens.get(next) else { break };
                 if token.verbatim || token.word.is_empty() {
                     break;
@@ -684,7 +828,10 @@ fn apply_cue(
             let mut removable = 0;
             for position in (0..out.len()).rev() {
                 let last = position + 1 == out.len();
-                if removable == replacement.len() || is_break(&out[position]) {
+                if removable == replacement.len()
+                    || is_break(&out[position])
+                    || (out[position].verbatim && out[position].word.starts_with(['"', '\u{201c}']))
+                {
                     break;
                 }
                 if !last && out[position].ends_sentence() {
@@ -693,7 +840,7 @@ fn apply_cue(
                 removable += 1;
             }
             let crosses_sentence = out.last().is_some_and(Token::ends_sentence);
-            if removable == 0 || (!strong && crosses_sentence && replacement.len() != 1) {
+            if removable == 0 || (!strong && crosses_sentence) {
                 return None;
             }
             let carried_end = out
@@ -723,18 +870,74 @@ fn apply_cue(
 
 /// Words that name what a list holds: "a few things", "three steps".
 const LIST_NOUNS: &[&str] = &[
-    "points", "items", "things", "features", "steps", "ideas", "options", "tasks", "reasons",
-    "requirements", "notes", "changes", "problems", "issues", "questions", "goals", "suggestions",
-    "tips", "ways", "examples", "parts", "bugs", "fixes", "apps", "screens", "pages", "rules",
-    "priorities", "todos", "topics", "benefits", "pros", "cons", "concerns", "updates", "areas",
-    "list", "agenda", "stuff",
+    "pointers",
+    "points",
+    "items",
+    "things",
+    "features",
+    "steps",
+    "ideas",
+    "options",
+    "tasks",
+    "reasons",
+    "requirements",
+    "notes",
+    "changes",
+    "problems",
+    "issues",
+    "questions",
+    "goals",
+    "suggestions",
+    "tips",
+    "ways",
+    "examples",
+    "parts",
+    "bugs",
+    "fixes",
+    "apps",
+    "screens",
+    "pages",
+    "rules",
+    "priorities",
+    "todos",
+    "topics",
+    "benefits",
+    "pros",
+    "cons",
+    "concerns",
+    "updates",
+    "areas",
+    "list",
+    "agenda",
+    "stuff",
 ];
 
 /// Words that announce a number of something: "here are", "a few", "three".
 const LIST_ANNOUNCERS: &[&str] = &[
-    "here are", "here's", "these are", "the following", "list of", "a few", "a couple", "some",
-    "several", "multiple", "few", "two", "three", "four", "five", "six", "2", "3", "4", "5",
-    "my", "our", "main", "key",
+    "here are",
+    "here's",
+    "these are",
+    "the following",
+    "list of",
+    "a few",
+    "a couple",
+    "some",
+    "several",
+    "multiple",
+    "few",
+    "two",
+    "three",
+    "four",
+    "five",
+    "six",
+    "2",
+    "3",
+    "4",
+    "5",
+    "my",
+    "our",
+    "main",
+    "key",
 ];
 
 fn introduces_list(sentence: &str) -> bool {
@@ -760,6 +963,7 @@ enum Marker {
 
 /// Spoken item markers, longest first so "first of all" beats "first".
 const MARKERS: &[(&str, Marker)] = &[
+    ("start with", Marker::Rank(1)),
     ("first of all", Marker::Rank(1)),
     ("number one", Marker::Rank(1)),
     ("point one", Marker::Rank(1)),
@@ -792,8 +996,7 @@ const MARKERS: &[(&str, Marker)] = &[
     ("then", Marker::Continue),
 ];
 
-/// "Second, we race." -> (Rank(2), "we race.").
-fn split_marker(sentence: &str) -> Option<(Marker, &str)> {
+fn marker_prefix(sentence: &str) -> Option<(Marker, &str)> {
     MARKERS.iter().find_map(|(phrase, marker)| {
         let head = sentence.get(..phrase.len())?;
         let rest = &sentence[phrase.len()..];
@@ -801,6 +1004,68 @@ fn split_marker(sentence: &str) -> Option<(Marker, &str)> {
         (head.eq_ignore_ascii_case(phrase) && whole_word)
             .then(|| (*marker, rest.trim_start_matches([',', ':', ' ', '-'])))
     })
+}
+
+fn strip_words<'a>(text: &'a str, words: &str) -> Option<&'a str> {
+    let head = text.get(..words.len())?;
+    let rest = &text[words.len()..];
+    (head.eq_ignore_ascii_case(words) && rest.chars().next().is_none_or(|c| !c.is_alphanumeric()))
+        .then(|| rest.trim_start_matches([',', ':', ' ', '-']))
+}
+
+/// Recognize explicit item scaffolding without treating "the first car"
+/// or other ordinary ordinal descriptions as list markers.
+fn named_marker(sentence: &str) -> Option<(Marker, &str)> {
+    let sentence = strip_words(sentence, "the").unwrap_or(sentence);
+    let (marker, rest) = marker_prefix(sentence)?;
+    if !matches!(marker, Marker::Rank(_)) {
+        return None;
+    }
+    for link in ["will be to", "will be", "is to", "is"] {
+        if let Some(body) = strip_words(rest, link) {
+            return Some((marker, body));
+        }
+    }
+    for noun in [
+        "one",
+        "feature",
+        "point",
+        "pointer",
+        "item",
+        "step",
+        "thing",
+        "task",
+        "option",
+        "requirement",
+        "suggestion",
+        "reason",
+    ] {
+        let Some(after) = strip_words(rest, noun) else {
+            continue;
+        };
+        if after.is_empty() {
+            return Some((marker, after));
+        }
+        for link in ["will be to", "will be", "is to", "is"] {
+            if let Some(body) = strip_words(after, link) {
+                return Some((marker, body));
+            }
+        }
+    }
+    None
+}
+
+/// "And the second feature will be to sync." -> (Rank(2), "sync.").
+fn split_marker(sentence: &str) -> Option<(Marker, &str)> {
+    let mut sentence = sentence;
+    for _ in 0..3 {
+        if let Some(rest) = strip_words(sentence, "and").or_else(|| strip_words(sentence, "so")) {
+            sentence = rest;
+        } else {
+            break;
+        }
+    }
+    named_marker(sentence).or_else(|| marker_prefix(sentence))
 }
 
 fn capitalized(text: &str) -> String {
@@ -815,8 +1080,15 @@ fn sentences(text: &str) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut start = 0;
     let mut chars = text.char_indices().peekable();
+    let mut quoted = None;
     while let Some((at, c)) = chars.next() {
-        if matches!(c, '.' | '?' | '!' | ':')
+        if quoted == Some(c) {
+            quoted = None;
+        } else if quoted.is_none() && (c == '"' || c == '\u{201c}') {
+            quoted = Some(if c == '"' { '"' } else { '\u{201d}' });
+        }
+        if quoted.is_none()
+            && matches!(c, '.' | '?' | '!' | ':')
             && chars.peek().is_none_or(|(_, next)| next.is_whitespace())
         {
             parts.push(text[start..=at].trim());
@@ -833,11 +1105,18 @@ fn sentences(text: &str) -> Vec<&str> {
 fn heading(lead: &[&str]) -> String {
     let mut out = lead.join(" ");
     if !out.is_empty() {
-        let trimmed = out.trim_end_matches(['.', ':']).len();
+        let trimmed = out.trim_end_matches(['.', ':', ',', ';']).len();
         out.truncate(trimmed);
         out.push(':');
     }
     out
+}
+
+fn explicit_bullets(text: &str) -> bool {
+    let text = text.to_lowercase();
+    ["bullet points", "make a list", "as bullets"]
+        .iter()
+        .any(|phrase| text.contains(phrase))
 }
 
 /// "First, X. Second, Y. Finally, Z." -> one bullet per spoken marker; the
@@ -847,10 +1126,18 @@ fn spoken_list(parts: &[&str]) -> Option<String> {
     let first = parts
         .iter()
         .position(|part| split_marker(part).is_some_and(|(m, _)| m == Marker::Rank(1)))?;
-    parts[first + 1..]
+    let ranked = parts[first + 1..]
         .iter()
-        .any(|part| split_marker(part).is_some_and(|(m, _)| m == Marker::Rank(2)))
-        .then_some(())?;
+        .any(|part| split_marker(part).is_some_and(|(m, _)| m == Marker::Rank(2)));
+    let requested = explicit_bullets(&parts[..first].join(" "))
+        && parts[first + 1..]
+            .iter()
+            .filter(|part| split_marker(part).is_some_and(|(m, _)| m == Marker::Continue))
+            .count()
+            >= 2;
+    if !ranked && !requested {
+        return None;
+    }
     let mut items: Vec<String> = Vec::new();
     for part in &parts[first..] {
         match split_marker(part) {
@@ -877,6 +1164,78 @@ fn spoken_list(parts: &[&str]) -> Option<String> {
     Some(out)
 }
 
+/// An ASR result may omit every sentence stop. Require an explicit list
+/// announcement followed by consecutive numbered markers; never split on
+/// "or" or an ordinary continuation inside an item.
+fn unpunctuated_list(text: &str) -> Option<String> {
+    if text.contains(['"', '\u{201c}', '\u{201d}']) {
+        return None;
+    }
+    let mut cursor = 0;
+    let mut markers = Vec::new();
+    for word in text.split_whitespace() {
+        let at = cursor + text[cursor..].find(word)?;
+        cursor = at + word.len();
+        if let Some((marker, body)) = split_marker(&text[at..]) {
+            let body_at = text.len() - body.len();
+            if !markers
+                .iter()
+                .any(|&(_, _, previous_body)| previous_body == body_at)
+            {
+                markers.push((marker, at, body_at));
+            }
+        }
+    }
+    let first = markers
+        .iter()
+        .position(|&(marker, _, _)| marker == Marker::Rank(1))?;
+    let (_, start, _) = markers[first];
+    let lead = text[..start].trim();
+    let last = lead
+        .split_whitespace()
+        .last()?
+        .trim_matches(|c: char| !c.is_alphanumeric())
+        .to_lowercase();
+    let requested = explicit_bullets(lead);
+    if !(introduces_list(lead) || requested)
+        || !(LIST_NOUNS.contains(&last.as_str())
+            || matches!(last.as_str(), "want" | "include" | "need"))
+    {
+        return None;
+    }
+    let mut chosen = vec![markers[first]];
+    let mut expected = 2;
+    for &(marker, at, body) in &markers[first + 1..] {
+        let tail = &text[at..];
+        if marker == Marker::Rank(expected)
+            || (requested
+                && marker == Marker::Continue
+                && ["next", "finally", "and finally"]
+                    .iter()
+                    .any(|marker| strip_words(tail, marker).is_some()))
+        {
+            chosen.push((marker, at, body));
+            expected += 1;
+        }
+    }
+    if chosen.len() < 2
+        || (!chosen.iter().any(|&(m, _, _)| m == Marker::Rank(2)) && chosen.len() < 3)
+    {
+        return None;
+    }
+    let mut out = capitalized(&heading(&[lead]));
+    for (index, &(_, _, body)) in chosen.iter().enumerate() {
+        let stop = chosen.get(index + 1).map_or(text.len(), |&(_, at, _)| at);
+        let item = text[body..stop].trim();
+        if item.is_empty() {
+            return None;
+        }
+        out.push_str("\n- ");
+        out.push_str(&capitalized(item));
+    }
+    Some(out)
+}
+
 /// Spots a list in what was said and lays it out as bullets:
 /// "Here are a few points. A. B." or "I want three things: A. B." puts the
 /// sentences after the announcement on bullet lines, and "First, A. Second,
@@ -888,6 +1247,9 @@ fn bulletize(text: String) -> String {
     }
     let parts = sentences(&text);
     if let Some(list) = spoken_list(&parts) {
+        return list;
+    }
+    if let Some(list) = unpunctuated_list(&text) {
         return list;
     }
     let Some(intro) = parts.iter().position(|part| introduces_list(part)) else {
@@ -981,8 +1343,15 @@ fn within_edits(a: &str, b: &str, limit: usize) -> bool {
 
 /// Openers a chat model uses when it answers instead of rewriting.
 const ANSWER_OPENERS: &[&str] = &[
-    "sure", "certainly", "of course", "here is", "here's the", "the cleaned", "cleaned text",
-    "i'm sorry", "as an ai",
+    "sure",
+    "certainly",
+    "of course",
+    "here is",
+    "here's the",
+    "the cleaned",
+    "cleaned text",
+    "i'm sorry",
+    "as an ai",
 ];
 
 /// Strips what a model sometimes wraps around its answer.
@@ -999,30 +1368,58 @@ pub fn unwrap_rewrite(text: &str) -> String {
     text.trim().to_owned()
 }
 
+/// Data-free reasons for retaining the rule-cleaned fallback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RewriteRejection {
+    Empty,
+    Quantity,
+    Calendar,
+    Negation,
+    MissingAuxiliary,
+    Action,
+    Entity,
+    Question,
+    AppendedAnswer,
+    Length,
+    AssistantReply,
+    NovelContent,
+    ListStructure,
+    QuotedText,
+}
+
 /// Whether a language model's rewrite of `original` can be typed instead of
 /// it. The model may drop words, fix grammar, and lay out a list, but it must
 /// not answer, add content, or wander off: anything suspicious keeps the
-/// rule-cleaned text, which is never worse than today.
+/// rule-cleaned fallback. This does not prove semantic equivalence.
 #[must_use]
 pub fn accept_rewrite(original: &str, rewrite: &str) -> bool {
+    rewrite_rejection(original, rewrite).is_none()
+}
+
+/// Explains a rejection without returning or logging any dictated text.
+#[must_use]
+pub fn rewrite_rejection(original: &str, rewrite: &str) -> Option<RewriteRejection> {
     let before = content_words(original);
     let after = content_words(rewrite);
     if after.is_empty() || before.is_empty() {
-        return false;
+        return Some(RewriteRejection::Empty);
+    }
+    if let Some(reason) = safety::rejection(original, rewrite) {
+        return Some(reason);
     }
     // Shorter is expected (fillers, restarts); much longer means new content.
     if after.len() > before.len() + before.len() / 5 + 3 || after.len() * 4 < before.len() {
-        return false;
+        return Some(RewriteRejection::Length);
     }
     let lower = rewrite.trim_start().to_lowercase();
     let opener = |text: &str| ANSWER_OPENERS.iter().any(|opener| text.starts_with(opener));
     if opener(&lower) && !opener(&original.trim_start().to_lowercase()) {
-        return false;
+        return Some(RewriteRejection::AssistantReply);
     }
     // A question must stay a question, or the model answered it.
     let asked = original.contains('?');
     if asked && !rewrite.contains('?') {
-        return false;
+        return Some(RewriteRejection::Question);
     }
     // Every longer word must come from what was said (or be a spelling fix
     // of it), apart from the odd synonym ("instead" for "alternative").
@@ -1038,13 +1435,190 @@ pub fn accept_rewrite(original: &str, rewrite: &str) -> bool {
             })
         })
         .count();
-    novel <= 1 + after.len() / 10
+    (novel > 1 + after.len() / 10).then_some(RewriteRejection::NovelContent)
+}
+
+fn written_decimal_or_clock(tokens: &[Token], at: usize) -> Option<(String, usize)> {
+    if tokens.get(at)?.verbatim {
+        return None;
+    }
+    facts::spoken_decimal(tokens, at).or_else(|| {
+        if tokens[at].word.chars().all(char::is_alphabetic) {
+            facts::clock(tokens, at).and_then(|q| {
+                let last = norm(&tokens[q.end - 1]).replace('.', "");
+                if !matches!(last.as_str(), "am" | "pm") {
+                    return None;
+                }
+                let (hour, minute) = q.value.split_once(':')?;
+                let hour = hour.parse::<u32>().ok()?;
+                Some((
+                    format!(
+                        "{}:{minute} {}",
+                        if hour % 12 == 0 { 12 } else { hour % 12 },
+                        last.to_uppercase()
+                    ),
+                    q.end,
+                ))
+            })
+        } else {
+            None
+        }
+    })
+}
+
+/// Normalize only explicit spoken decimal points and clock suffixes before
+/// filler removal. In particular, "oh" inside "point oh five" is a digit.
+fn written_numbers(tokens: Vec<Token>) -> Vec<Token> {
+    let mut out = Vec::with_capacity(tokens.len());
+    let mut at = 0;
+    while at < tokens.len() {
+        if let Some((value, end)) = written_decimal_or_clock(&tokens, at) {
+            let mut replacement: Vec<_> = value.split_whitespace().map(Token::parse).collect();
+            replacement.first_mut().unwrap().lead = tokens[at].lead.clone();
+            replacement.last_mut().unwrap().trail = tokens[end - 1].trail.clone();
+            out.extend(replacement);
+            at = end;
+        } else {
+            out.push(tokens[at].clone());
+            at += 1;
+        }
+    }
+    out
+}
+
+/// Final presentation pass, after cleanup/fallback selection, so a language
+/// model cannot turn numeric counts back into words. Keep whitespace, quoted
+/// wording, likely proper names, and pronoun "one" intact.
+#[must_use]
+pub fn format_numbers(text: &str) -> String {
+    let mut cursor = 0;
+    let spans: Vec<_> = text
+        .split_whitespace()
+        .map(|word| {
+            let start = cursor + text[cursor..].find(word).unwrap();
+            cursor = start + word.len();
+            (start, cursor)
+        })
+        .collect();
+    let tokens: Vec<_> = text.split_whitespace().map(Token::parse).collect();
+    let quote =
+        |marks: &str| marks.contains(['"', '\'', '\u{201c}', '\u{201d}', '\u{2018}', '\u{2019}']);
+    let mut quoted = false;
+    let protected: Vec<_> = tokens
+        .iter()
+        .map(|token| {
+            if quote(&token.lead) {
+                quoted = true;
+            }
+            let protected = quoted;
+            if quote(&token.trail) {
+                quoted = false;
+            }
+            protected
+        })
+        .collect();
+    let capital = |token: &Token| token.word.chars().next().is_some_and(char::is_uppercase);
+    let mut result = String::with_capacity(text.len());
+    let mut copied = 0;
+    let mut at = 0;
+    while at < tokens.len() {
+        if protected[at] {
+            at += 1;
+            continue;
+        }
+        let explicit = written_decimal_or_clock(&tokens, at);
+        let cardinal = explicit.is_none();
+        let value = explicit
+            .or_else(|| facts::spoken_number(&tokens, at).map(|(n, end)| (n.to_string(), end)));
+        let Some((value, end)) = value else {
+            at += 1;
+            continue;
+        };
+        let pronoun = cardinal
+            && end == at + 1
+            && norm(&tokens[at]) == "one"
+            && facts::quantity(&tokens, at).is_none();
+        let proper_name = cardinal
+            && capital(&tokens[at])
+            && ((at > 0 && capital(&tokens[at - 1]) && !tokens[at - 1].ends_sentence())
+                || (!tokens[end - 1].ends_sentence() && tokens.get(end).is_some_and(capital)));
+        if pronoun || proper_name || protected[at..end].iter().any(|v| *v) {
+            at = end;
+            continue;
+        }
+        let start = spans[at].0 + tokens[at].lead.len();
+        let stop = spans[end - 1].1 - tokens[end - 1].trail.len();
+        result.push_str(&text[copied..start]);
+        result.push_str(&value);
+        copied = stop;
+        at = end;
+    }
+    result.push_str(&text[copied..]);
+    let formatted: Vec<_> = result.split_whitespace().map(Token::parse).collect();
+    if facts::quantities(&tokens) == facts::quantities(&formatted) {
+        result
+    } else {
+        text.to_owned()
+    }
+}
+
+/// Keep balanced quotations opaque to automatic word/phrase cleanup.
+fn literal_tokens(text: &str) -> Vec<Token> {
+    let mut result = Vec::new();
+    let mut opened = None;
+    let mut copied = 0;
+    for (at, ch) in text.char_indices() {
+        if let Some((start, close)) = opened {
+            if ch == close {
+                result.extend(text[copied..start].split_whitespace().map(Token::parse));
+                let end = at + ch.len_utf8();
+                let punctuation = text[end..]
+                    .chars()
+                    .take_while(|c| matches!(c, '.' | ',' | ';' | ':' | '?' | '!' | ')' | ']'))
+                    .count();
+                result.push(Token {
+                    lead: String::new(),
+                    word: text[start..end].to_owned(),
+                    trail: text[end..end + punctuation].to_owned(),
+                    verbatim: true,
+                });
+                copied = end + punctuation;
+                opened = None;
+            }
+        } else if ch == '"' || ch == '\u{201c}' {
+            opened = Some((at, if ch == '"' { '"' } else { '\u{201d}' }));
+        }
+    }
+    result.extend(text[copied..].split_whitespace().map(Token::parse));
+    result
 }
 
 /// Cleans one recognised utterance.
 #[must_use]
 pub fn clean(text: &str, options: &TextOptions) -> String {
-    let tokens: Vec<Token> = text.split_whitespace().map(Token::parse).collect();
+    // Existing paragraphs and list markers are structural boundaries, not
+    // stutters or punctuation to flatten. Spoken breaks created below still
+    // go through the usual whole-utterance path.
+    if text.contains('\n') {
+        return text
+            .split('\n')
+            .map(|line| {
+                let line = line.trim_end_matches('\r');
+                let body = line.trim_start();
+                if let Some(marker) = ["- ", "* ", "\u{2022} "]
+                    .iter()
+                    .find(|marker| body.starts_with(**marker))
+                {
+                    let indent = &line[..line.len() - body.len()];
+                    format!("{indent}{marker}{}", clean(&body[marker.len()..], options))
+                } else {
+                    clean(line, options)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+    let tokens = literal_tokens(text);
     if tokens.is_empty() {
         return String::new();
     }
@@ -1054,9 +1628,13 @@ pub fn clean(text: &str, options: &TextOptions) -> String {
     } else {
         apply_phrases(&tokens, &phrases)
     };
+    if options.spoken_punctuation {
+        tokens = written_numbers(tokens);
+    }
     if options.filler_removal {
         tokens = remove_stutters(resolve_corrections(drop_restarts(remove_fillers(tokens))));
     }
+    safety::punctuate_questions(&mut tokens);
     let text = render(&tokens);
     if options.filler_removal {
         bulletize(text)
@@ -1311,7 +1889,10 @@ mod tests {
             "We have six cars on the track."
         );
         assert_eq!(
-            clean("All the outcomes will be different. No wait, randomized.", &o),
+            clean(
+                "All the outcomes will be different. No wait, randomized.",
+                &o
+            ),
             "All the outcomes will be randomized."
         );
         assert_eq!(clean("It is blue or rather green.", &o), "It is green.");
@@ -1382,7 +1963,10 @@ mod tests {
             "Okay, so what I want now is can't we just use VS Code?"
         );
         assert_eq!(clean("It basically works.", &o), "It basically works.");
-        assert_eq!(clean("Let's say hello to them.", &o), "Let's say hello to them.");
+        assert_eq!(
+            clean("Let's say hello to them.", &o),
+            "Let's say hello to them."
+        );
         assert_eq!(
             clean("Can I just can't we just go now?", &o),
             "Can't we just go now?"
@@ -1403,11 +1987,17 @@ mod tests {
     fn lists_are_spotted_without_a_command() {
         let o = options();
         assert_eq!(
-            clean("I want three things in the app. It needs AR. It needs races. It needs bets.", &o),
+            clean(
+                "I want three things in the app. It needs AR. It needs races. It needs bets.",
+                &o
+            ),
             "I want three things in the app:\n- It needs AR.\n- It needs races.\n- It needs bets."
         );
         assert_eq!(
-            clean("Some ideas for the game: cars race on the desk. Friends can bet.", &o),
+            clean(
+                "Some ideas for the game: cars race on the desk. Friends can bet.",
+                &o
+            ),
             "Some ideas for the game:\n- Cars race on the desk.\n- Friends can bet."
         );
         assert_eq!(
@@ -1441,6 +2031,142 @@ mod tests {
     }
 
     #[test]
+    fn pointers_with_named_ordinals_preserve_prelude_and_make_separate_items() {
+        let source = "Send the report to Daniel that we have completed 222 checks. And I wanted to add a few pointers. The first one is add a new feature where the users can enter prompt and it will generate a data set. And the second feature will be to customize teams. And third feature will be to host the files on a cloud platform.";
+        let expected = "Send the report to Daniel that we have completed 222 checks. And I wanted to add a few pointers:\n- Add a new feature where the users can enter prompt and it will generate a data set.\n- Customize teams.\n- Host the files on a cloud platform.";
+        let result = clean(source, &options());
+        assert_eq!(result, expected);
+        assert_eq!(format_numbers(&result), expected);
+        assert_eq!(
+            clean("A few pointers. Keep the files. Save the logs.", &options()),
+            "A few pointers:\n- Keep the files.\n- Save the logs."
+        );
+    }
+
+    #[test]
+    fn named_list_markers_keep_related_sentences_and_negative_instructions() {
+        assert_eq!(clean("Here are some pointers. The first point is keep 222 files. Do not overwrite the backups. And the second item is to save the logs. And finally, notify Daniel.", &options()),
+            "Here are some pointers:\n- Keep 222 files. Do not overwrite the backups.\n- Save the logs.\n- Notify Daniel.");
+        for source in [
+            "The first car won. The second car lost.",
+            "The first one is finished. The meeting is tomorrow.",
+            "I have a few pointers. Let me think.",
+            "He said \"the first one is broken\". She said \"the second one is fine\".",
+        ] {
+            assert_eq!(clean(source, &options()), source);
+        }
+    }
+
+    #[test]
+    fn unpunctuated_announced_lists_keep_alternatives_and_multi_sentence_items() {
+        assert_eq!(clean("here are the tasks step one use custom lighting or use auto RGB step two ask Ingrid Cole to confirm step three keep 12 archived files", &options()),
+            "Here are the tasks:\n- Use custom lighting or use auto RGB\n- Ask Ingrid Cole to confirm\n- Keep 12 archived files");
+        assert_eq!(clean("here are the points that I want to include first add a prompt box the second one is customize teams and the third is host the files", &options()),
+            "Here are the points that I want to include:\n- Add a prompt box\n- Customize teams\n- Host the files");
+        for source in [
+            "The first car won and the second car lost.",
+            "Here are our notes about the first car and the second car.",
+            "Here are the tasks review step one before discussing step two.",
+            "The label says \"here are the tasks step one save step two close\".",
+        ] {
+            assert_eq!(clean(source, &options()), source);
+        }
+    }
+
+    #[test]
+    fn cleaning_existing_lists_keeps_markers_paragraphs_and_item_boundaries() {
+        for source in [
+            "Tasks:\n- Keep 222 checks.\n- Customize teams.\n- Host the files.",
+            "Keep archive_v4.csv.\n\n* Ask Ingrid Cole to check it.\n  * Do not upload the backup.\n",
+            "- Save the logs.\n\u{2022} Keep 12 receipts.",
+        ] {
+            assert_eq!(clean(source, &options()), source);
+        }
+        assert_eq!(
+            clean(
+                "Tasks:\n- Um, keep the the files.\n- Do not upload the backup.",
+                &options()
+            ),
+            "Tasks:\n- Keep the files.\n- Do not upload the backup."
+        );
+        assert_eq!(
+            clean(
+                "Send it to Ingrid.\n\nLet me correct that: send it to Karim.",
+                &options()
+            ),
+            "Send it to Ingrid.\n\nLet me correct that: send it to Karim."
+        );
+    }
+
+    #[test]
+    fn list_rewrites_cannot_drop_an_instruction_or_move_facts_between_items() {
+        let source = "Tasks:\n- Check the sensors or ask the supervisor to review them. Keep the original calibration sheet with the instrument.\n- Send 12 receipts to Ingrid Cole.\n- Keep 8 archived files.";
+        assert!(!accept_rewrite(source, "Tasks:\n- Check the sensors or ask the supervisor to review them.\n- Send 12 receipts to Ingrid Cole.\n- Keep 8 archived files."));
+        assert!(!accept_rewrite(source, "Tasks:\n- Check the sensors. Keep the original calibration sheet with the instrument.\n- Send 12 receipts to Ingrid Cole.\n- Keep 8 archived files."));
+        assert!(!accept_rewrite(
+            "Tasks:\n- Send 12 receipts to Ingrid Cole.\n- Ask Karim Shah to review 8 files.",
+            "Tasks:\n- Send 12 receipts to Karim Shah.\n- Ask Ingrid Cole to review 8 files."
+        ));
+        assert!(accept_rewrite(
+            "Tasks:\n- She dont have the calibration sheets.\n- Keep 12 files.",
+            "Tasks:\n- She does not have the calibration sheets.\n- Keep 12 files."
+        ));
+    }
+
+    #[test]
+    fn model_rewrites_must_preserve_existing_bullet_structure() {
+        let source = "Pointers:\n- Keep 222 checks.\n- Customize teams.\n- Host the files.";
+        assert_eq!(
+            rewrite_rejection(
+                source,
+                "Pointers: Keep 222 checks. Customize teams. Host the files."
+            ),
+            Some(RewriteRejection::ListStructure)
+        );
+        assert_eq!(
+            rewrite_rejection(
+                source,
+                "Pointers:\n- Keep 222 checks. Customize teams.\n- Host the files."
+            ),
+            Some(RewriteRejection::ListStructure)
+        );
+        assert!(accept_rewrite(
+            source,
+            "Pointers:\n* Keep 222 checks.\n* Customize teams.\n* Host the files."
+        ));
+        assert!(accept_rewrite(source, source));
+    }
+
+    #[test]
+    fn conversational_ordinals_keep_alternatives_in_their_own_item() {
+        let source = "Okay, so here's something I'm trying to build and here are few points that I want to include: So first, can you please add a mode where the user can select a custom lighting. Or they can select an auto RGB mode. The second one is let the user enter a prompt and based on that it will select the colours. And the third is if the user clicks a button then it should update it real time.";
+        let expected = "Okay, so here's something I'm trying to build and here are few points that I want to include:\n- Can you please add a mode where the user can select a custom lighting. Or they can select an auto RGB mode.\n- Let the user enter a prompt and based on that it will select the colours.\n- If the user clicks a button then it should update it real time.";
+        assert_eq!(clean(source, &options()), expected);
+        assert_eq!(format_numbers(expected), expected);
+        assert_eq!(clean("A few pointers. And so first, use custom lighting. Or use RGB. And the second is enter a prompt. And the third is update on click.", &options()),
+            "A few pointers:\n- Use custom lighting. Or use RGB.\n- Enter a prompt.\n- Update on click.");
+    }
+
+    #[test]
+    fn ordinal_detection_does_not_merge_declared_alternative_options_or_plain_prose() {
+        assert_eq!(
+            clean(
+                "Here are two options. Use custom lighting. Or use RGB.",
+                &options()
+            ),
+            "Here are two options:\n- Use custom lighting.\n- Or use RGB."
+        );
+        for source in [
+            "So first, check it. Then we can decide.",
+            "The first car won. And the second car lost.",
+            "And so the first car won. The second car lost.",
+            "The third is ready. We can continue.",
+        ] {
+            assert_eq!(clean(source, &options()), source);
+        }
+    }
+
+    #[test]
     fn rewrites_that_answer_or_add_content_are_refused() {
         let asked = "What is the capital of France?";
         assert!(!accept_rewrite(asked, "The capital of France is Paris."));
@@ -1451,7 +2177,7 @@ mod tests {
         ));
         assert!(accept_rewrite(
             "Okay, so what I want now is basically let's say can I just can't we just use VS Code? as an alternative to X code.",
-            "Can we just use VS Code instead of X code?"
+            "Can't we just use VS Code instead of X code?"
         ));
         assert!(accept_rewrite(
             "Here are few points that I want inside my app. It should have dark mode. It should sync with iCloud.",
@@ -1468,5 +2194,850 @@ mod tests {
         assert!(!accept_rewrite("Hello there.", ""));
         assert_eq!(unwrap_rewrite("<dictation>Hi.</dictation>"), "Hi.");
         assert_eq!(unwrap_rewrite("\"Hi.\""), "Hi.");
+    }
+
+    #[test]
+    fn full_schedule_corrections_keep_only_the_final_choice() {
+        let o = options();
+        for (source, expected) in [
+            (
+                "Meet Thursday at 4 pm actually make that Friday at 10 30 am before lunch.",
+                "Meet Friday at 10 30 am before lunch.",
+            ),
+            (
+                "Book Monday at 3 pm no wait Wednesday at 9:45 am for the review.",
+                "Book Wednesday at 9:45 am for the review.",
+            ),
+            (
+                "Book Monday at 3 pm no wait Wednesday.",
+                "Book Wednesday at 3 pm.",
+            ),
+            (
+                "Start at 6 pm no wait 7:15 pm and keep the room.",
+                "Start at 7:15 pm and keep the room.",
+            ),
+            (
+                "Use Monday, no wait Tuesday, no wait Friday.",
+                "Use Friday.",
+            ),
+        ] {
+            assert_eq!(clean(source, &o), expected);
+        }
+    }
+
+    #[test]
+    fn corrections_do_not_eat_the_next_clause_or_lowercase_names() {
+        let o = options();
+        for (source, expected) in [
+            (
+                "Email it to Leonie no sorry to Darius before noon.",
+                "Email it to Darius before noon.",
+            ),
+            (
+                "Send it to Petra, sorry I mean Theo after the review.",
+                "Send it to Theo after the review.",
+            ),
+            (
+                "Set the amount to 3200 rupees no wait 2800 including tax.",
+                "Set the amount to 2800 rupees including tax.",
+            ),
+            (
+                "It took 4.5 hours sorry I mean 3.25 hours at 900 rupees per hour.",
+                "It took 3.25 hours at 900 rupees per hour.",
+            ),
+            (
+                "Test the login issue I mean the logout issue before release.",
+                "Test the logout issue before release.",
+            ),
+            (
+                "Make it blue, I mean green before Friday.",
+                "Make it green before Friday.",
+            ),
+        ] {
+            assert_eq!(clean(source, &o), expected);
+        }
+    }
+
+    #[test]
+    fn punctuated_apologies_replace_complete_spoken_counts() {
+        for (source, expected) in [
+            ("Run two hundred and fourteen checks. No, I'm sorry, two hundred and ten checks.",
+             "Run two hundred and ten checks."),
+            ("Use two hundred fourteen cores. No, I am sorry, two hundred ten cores. Keep six passages.",
+             "Use two hundred ten cores. Keep six passages."),
+            ("Run twenty-seven checks, no, I\u{2019}m sorry, twenty-nine checks before Friday.",
+             "Run twenty-nine checks before Friday."),
+            ("Use two hundred and fourteen codes. No, I'm sorry, two hundred and ten cores.",
+             "Use two hundred and ten cores."),
+            ("Set the budget to two thousand three hundred rupees, no wait two thousand one hundred rupees including tax.",
+             "Set the budget to two thousand one hundred rupees including tax."),
+        ] {
+            assert_eq!(clean(source, &options()), expected);
+        }
+        for source in [
+            "No, I'm sorry you missed two hundred checks.",
+            "I am sorry we lost twenty files.",
+            "We ran two hundred checks and six passages.",
+            "The old count was two hundred and fourteen and the new count is two hundred and ten.",
+        ] {
+            assert_eq!(clean(source, &options()), source);
+        }
+    }
+
+    #[test]
+    fn spoken_counts_accept_digit_formatting_but_reject_changed_facts() {
+        for (source, expected) in [
+            (
+                "Run two hundred and ten checks and six passages.",
+                "Run 210 checks and 6 passages.",
+            ),
+            ("Run twenty-seven checks.", "Run 27 checks."),
+            (
+                "Set the total to one thousand two hundred and fifty rupees.",
+                "Set the total to 1250 rupees.",
+            ),
+            (
+                "Keep one million two hundred thousand files.",
+                "Keep 1200000 files.",
+            ),
+            ("Keep four and six separate.", "Keep 4 and 6 separate."),
+            ("Keep the price at $five.", "Keep the price at 5 dollars."),
+            (
+                "Set it to minus twenty-five percent.",
+                "Set it to -25 percent.",
+            ),
+        ] {
+            assert!(
+                accept_rewrite(source, expected),
+                "{:?}",
+                rewrite_rejection(source, expected)
+            );
+        }
+        for (source, wrong) in [
+            (
+                "Run two hundred and ten checks and six passages.",
+                "Run 214 checks and 6 passages.",
+            ),
+            ("Keep four and six separate.", "Keep 46 separate."),
+            ("Keep the price at $five.", "Keep the price at 5 rupees."),
+            (
+                "Set it to minus twenty-five percent.",
+                "Set it to 25 percent.",
+            ),
+            (
+                "Keep the original two hundred and fourteen and the new two hundred and ten.",
+                "Keep the new 210.",
+            ),
+        ] {
+            assert_eq!(
+                rewrite_rejection(source, wrong),
+                Some(RewriteRejection::Quantity)
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_spoken_points_and_clock_minutes_are_written_before_corrections() {
+        for (source, expected) in [
+            (
+                "Meet Thursday at nine thirty AM.",
+                "Meet Thursday at 9:30 AM.",
+            ),
+            (
+                "Meet Monday at two PM actually make that Thursday at nine thirty five AM.",
+                "Meet Thursday at 9:35 AM.",
+            ),
+            (
+                "Testing took four point five hours, sorry I mean three point seven five hours.",
+                "Testing took 3.75 hours.",
+            ),
+            (
+                "Set drift to zero point oh five percent.",
+                "Set drift to 0.05 percent.",
+            ),
+            ("Keep point seven five hours.", "Keep 0.75 hours."),
+            (
+                "Use version seven point two point four.",
+                "Use version 7.2.4.",
+            ),
+            ("Use version seven point two four.", "Use version 7.24."),
+            (
+                "Discuss point three in the agenda.",
+                "Discuss point three in the agenda.",
+            ),
+            (
+                "Point the camera at four birds.",
+                "Point the camera at four birds.",
+            ),
+        ] {
+            assert_eq!(clean(source, &options()), expected);
+        }
+        let mut o = options();
+        o.spoken_punctuation = false;
+        assert_eq!(
+            clean("Keep three point seven five hours.", &o),
+            "Keep three point seven five hours."
+        );
+    }
+
+    #[test]
+    fn guard_compares_spoken_decimals_and_times_without_inventing_missing_separators() {
+        for (source, expected) in [
+            ("Meet at nine thirty AM.", "Meet at 9:30 AM."),
+            ("Meet at nine thirty five PM.", "Meet at 21:35."),
+            (
+                "Testing took three point seven five hours.",
+                "Testing took 3.75 hours.",
+            ),
+            ("Keep point seven five hours.", "Keep 0.75 hours."),
+            (
+                "Use version seven point two point four.",
+                "Use version 7.2.4.",
+            ),
+            (
+                "Set drift to zero point oh five percent.",
+                "Set drift to 0.05 percent.",
+            ),
+            (
+                "Discuss point three in the agenda.",
+                "Discuss point 3 in the agenda.",
+            ),
+        ] {
+            assert!(
+                accept_rewrite(source, expected),
+                "{:?}",
+                rewrite_rejection(source, expected)
+            );
+        }
+        for (source, wrong) in [
+            ("Meet at nine thirty AM.", "Meet at 9:35 AM."),
+            (
+                "Testing took three point seven five hours.",
+                "Testing took 3.5 hours.",
+            ),
+            ("Keep point seven five hours.", "Keep 3.75 hours."),
+            ("Use version seven point two four.", "Use version 7.2.4."),
+        ] {
+            assert_eq!(
+                rewrite_rejection(source, wrong),
+                Some(RewriteRejection::Quantity)
+            );
+        }
+    }
+
+    #[test]
+    fn final_number_presentation_uses_digits_after_rewrites_or_fallbacks() {
+        for (source, expected) in [
+            ("Send the report to Daniel. We completed two hundred and ten checks.",
+             "Send the report to Daniel. We completed 210 checks."),
+            ("Keep twenty-one checks, twenty two files and six passages.",
+             "Keep 21 checks, 22 files and 6 passages."),
+            ("The original estimate was twenty four thousand five hundred rupees and the revised estimate is twenty two thousand six hundred rupees.",
+             "The original estimate was 24500 rupees and the revised estimate is 22600 rupees."),
+            ("Keep four and six separate.", "Keep 4 and 6 separate."),
+            ("Use version seven point two point four at nine thirty AM.",
+             "Use version 7.2.4 at 9:30 AM."),
+            ("Keep three point seven five hours at minus twenty-five percent.",
+             "Keep 3.75 hours at minus 25 percent."),
+            ("There are zero issues and twelve tests.", "There are 0 issues and 12 tests."),
+        ] {
+            assert_eq!(format_numbers(source), expected);
+            assert!(accept_rewrite(source, expected), "{:?}", rewrite_rejection(source, expected));
+            assert_eq!(format_numbers(expected), expected);
+        }
+        let cleaned = clean("Send the report to Maya, no, I'm sorry, to Daniel. We completed two hundred and fourteen checks, no, I'm sorry, two hundred and ten checks.", &options());
+        assert_eq!(
+            format_numbers(&cleaned),
+            "Send the report to Daniel. We completed 210 checks."
+        );
+    }
+
+    #[test]
+    fn numeric_presentation_preserves_layout_quotes_names_and_pronouns() {
+        for (source, expected) in [
+            (
+                "  - two hundred checks\n\n- six passages\t",
+                "  - 200 checks\n\n- 6 passages\t",
+            ),
+            (
+                "Keep the words \"two hundred\" and count twenty files.",
+                "Keep the words \"two hundred\" and count 20 files.",
+            ),
+            (
+                "Keep 'twenty one' as written.",
+                "Keep 'twenty one' as written.",
+            ),
+            (
+                "The band Twenty One Pilots has three albums.",
+                "The band Twenty One Pilots has 3 albums.",
+            ),
+            (
+                "Use Studio One and OneDrive.",
+                "Use Studio One and OneDrive.",
+            ),
+            (
+                "One of them completed one file.",
+                "One of them completed 1 file.",
+            ),
+            ("No one was there.", "No one was there."),
+            (
+                "Keep reports_Q4_2026.csv and version 7.2.4.",
+                "Keep reports_Q4_2026.csv and version 7.2.4.",
+            ),
+        ] {
+            assert_eq!(format_numbers(source), expected);
+        }
+    }
+
+    #[test]
+    fn spoken_integer_identifiers_do_not_cancel_other_numeric_formatting() {
+        for (source, expected) in [
+            ("Keep twenty six samples and version eight.",
+             "Keep 26 samples and version 8."),
+            ("Keep twenty six samples. Publish version eight. 0.35.",
+             "Keep 26 samples. Publish version 8. 0.35."),
+            ("Use code one and keep forty two files.",
+             "Use code 1 and keep 42 files."),
+            ("Keep build twelve and pin thirty four.",
+             "Keep build 12 and pin 34."),
+        ] {
+            assert_eq!(format_numbers(source), expected);
+            assert!(accept_rewrite(source, expected));
+            assert_eq!(format_numbers(expected), expected);
+        }
+        assert!(!accept_rewrite("Use version eight.", "Use version nine."));
+        assert!(!accept_rewrite("Use version eight. 0.35.", "Use version 8.35."));
+    }
+
+    #[test]
+    fn sentence_punctuation_does_not_block_typed_scoped_corrections() {
+        for (source, expected) in [
+            ("Send the summary before Tuesday at three. Actually at Friday at 10:15 AM. Keep 8 logs.",
+             "Send the summary before Friday at 10:15 AM. Keep 8 logs."),
+            ("Send the summary before Tuesday at 3 PM. Actually on Friday at ten fifteen AM.",
+             "Send the summary on Friday at 10:15 AM."),
+            ("We recorded three hundred and twelve samples. Sorry, three hundred and nine samples. Keep both quotes.",
+             "We recorded 309 samples. Keep both quotes."),
+            ("The visit took 3 hours. Sorry, 4 hours. Keep 8 receipts.",
+             "The visit took 4 hours. Keep 8 receipts."),
+            ("Send the summary before Tuesday at three. Actually at Friday at 10:15 AM we completed twelve samples.",
+             "Send the summary before Friday at 10:15 AM. We completed 12 samples."),
+            ("We recorded three hundred and thir twelve samples. Sorry, three hundred and nine samples. Keep 8 receipts.",
+             "We recorded 309 samples. Keep 8 receipts."),
+        ] {
+            assert_eq!(format_numbers(&clean(source, &options())), expected);
+        }
+    }
+
+    #[test]
+    fn scoped_sentence_corrections_keep_unrelated_or_incomplete_facts() {
+        for source in [
+            "We recorded 312 samples. Sorry, 309 receipts.",
+            "We recorded 312 samples. Sorry, three hundred and nine.",
+            "The visit took 3 hours. Sorry, 4 days.",
+            "Send it before Tuesday at 3 PM. Actually Friday works better.",
+            "Send it before Tuesday at 3 PM. Actually at 10:15 AM we left Friday.",
+            "We recorded \"312 samples\". Sorry, 309 samples.",
+            "We recorded 312 samples. Sorry, I lost 309 samples.",
+            "Meet Tuesday at 3 PM. Actually, Friday at 10:15 AM is unavailable.",
+            "We recorded three hundred and final twelve samples. Sorry, 309 samples.",
+            "We recorded three hundred and thirty twelve samples. Sorry, 309 samples.",
+            "We recorded three hundred and thir twelve samples. Sorry, 309 receipts.",
+            "Are there 5 files? Sorry, 7 files.",
+            "There are 5 files. No, 7 files.",
+        ] {
+            assert_eq!(clean(source, &options()), source);
+        }
+    }
+
+    #[test]
+    fn explicit_denied_count_replaces_only_the_matching_preceding_value() {
+        for (source, expected) in [
+            ("We have completed 214 checks. No, it's not 214, it's 210 checks.",
+             "We have completed 210 checks."),
+            ("We completed two hundred and fourteen checks. No, it is not two hundred and fourteen, it is two hundred and ten checks. Keep six compatibility tests.",
+             "We completed 210 checks. Keep 6 compatibility tests."),
+            ("We completed 214 checks. No, it\u{2019}s not 214 checks, it\u{2019}s 210 checks before Friday.",
+             "We completed 210 checks before Friday."),
+            ("We completed 214 checks. No, not 214 but 210 checks.",
+             "We completed 210 checks."),
+            ("We completed 214 checks. No, it isn't 214, it's 210.",
+             "We completed 210 checks."),
+            ("It took 3 hours. No, it was not 3, it was 4. Keep the logs.",
+             "It took 4 hours. Keep the logs."),
+            ("Use code 214. No, it's not 214, it's 210.", "Use code 210."),
+            ("We completed 214 checks. No, it's not 214, it's 210 checks. No, it's not 210, it's 209 checks.",
+             "We completed 209 checks."),
+        ] {
+            assert_eq!(format_numbers(&clean(source, &options())), expected);
+        }
+        assert_eq!(correction_cue_count("No, it's not 214, it's 210."), 1);
+    }
+
+    #[test]
+    fn quantity_contrasts_preserve_other_facts_negations_and_quoted_values() {
+        for source in [
+            "We completed 214 checks. No, it's not 999, it's 210 checks.",
+            "We completed 214 checks. No, it's not 214, it's 210 files.",
+            "We completed 214 checks. No, it's not ready, it's broken.",
+            "There are 214 files. No, it's not 214 hours, it's 210 hours.",
+            "Do not delete 214 files or overwrite 210 logs.",
+            "We completed 214 checks and the other team completed 210 checks.",
+            "The label is \"214\". No, it's not 214, it's 210.",
+            "The label says \"No, it's not 214, it's 210\".",
+        ] {
+            assert_eq!(clean(source, &options()), source);
+        }
+    }
+
+    #[test]
+    fn recipient_contrasts_and_modifiers_resolve_verified_old_values() {
+        for (source, expected) in [
+            ("Send the report to Daniel. No, not Daniel but Maya. We have completed 214 checks. No, it's not actually 214, it's 210 checks.",
+             "Send the report to Maya. We have completed 210 checks."),
+            ("Email it to Daniel Reed. No, not Daniel Reed but Maya Patel before Friday. Keep 214 logs.",
+             "Email it to Maya Patel before Friday. Keep 214 logs."),
+            ("Send it to Daniel. No, not actually Daniel but really Maya.", "Send it to Maya."),
+            ("Send it to Daniel. No, not to Daniel but to Maya.", "Send it to Maya."),
+            ("Send it to daniel. No, not daniel but maya.", "Send it to Maya."),
+            ("Send it to Daniel. No, not Daniel but Maya de Silva.", "Send it to Maya de Silva."),
+            ("Send it to De Daniel. No, not De Daniel but Maya.", "Send it to Maya."),
+            ("We completed 214 checks. No, it's not really 214, it's actually 210 checks.",
+             "We completed 210 checks."),
+            ("We completed 214 checks. No, not 214 but actually 210 checks.", "We completed 210 checks."),
+        ] {
+            assert_eq!(format_numbers(&clean(source, &options())), expected);
+        }
+    }
+
+    #[test]
+    fn recipient_contrasts_preserve_mismatches_full_names_and_prohibitions() {
+        for source in [
+            "Send it to Daniel. No, not Alex but Maya.",
+            "Send it to Daniel Reed. No, not Daniel but Maya.",
+            "Daniel and Maya are both invited. No, not Daniel but Maya.",
+            "Send it to Daniel and Maya.",
+            "Send it to Daniel. Do not send it to Maya.",
+            "Send it to Daniel. No, not actually ready but Maya can help.",
+            "Send it to \"Daniel\". No, not Daniel but Maya.",
+            "The label says \"No, not Daniel but Maya\".",
+            "We completed 214 checks. No, it's not actually 999, it's 210 checks.",
+            "We completed 214 checks. No, it's not \"actually\" 214, it's 210 checks.",
+        ] {
+            assert_eq!(clean(source, &options()), source);
+        }
+    }
+
+    #[test]
+    fn direct_you_requests_fix_an_asr_period_without_changing_indirect_or_quoted_text() {
+        assert_eq!(
+            clean("Could you review the panel. Keep the backup.", &options()),
+            "Could you review the panel? Keep the backup."
+        );
+        for source in [
+            "I asked could you review the panel.",
+            "Could you believe it!",
+            "The note says \"Could you review the panel.\".",
+        ] {
+            assert_eq!(clean(source, &options()), source);
+        }
+    }
+
+    #[test]
+    fn quoted_content_remains_literal_while_outer_grammar_can_change() {
+        let mut custom = options();
+        custom.dictionary.push(Replacement {
+            from: ":".into(),
+            to: "Marker".into(),
+        });
+        assert_eq!(clean(": and \"comma\"", &custom), "Marker and \"comma\"");
+        assert_eq!(
+            clean(
+                "The label says \"Here are the tasks: First, save. Second, close.\".",
+                &options()
+            ),
+            "The label says \"Here are the tasks: First, save. Second, close.\"."
+        );
+        assert_eq!(
+            clean(
+                "Um she said \"No sorry I mean three point five, new line\" and we we kept it.",
+                &options()
+            ),
+            "She said \"No sorry I mean three point five, new line\" and we kept it."
+        );
+        assert!(!accept_rewrite(
+            "She said \"put it on the shelf\".",
+            "She said \"put it in the shelf\"."
+        ));
+        assert!(!accept_rewrite(
+            "She said \"Keep the logs\".",
+            "She said keep the logs."
+        ));
+        assert!(accept_rewrite(
+            "She dont know who said \"Keep the logs\".",
+            "She does not know who said \"Keep the logs\"."
+        ));
+        assert!(accept_rewrite(
+            "She said \u{201c}Keep the logs\u{201d}.",
+            "She said \"Keep the logs\"."
+        ));
+    }
+
+    #[test]
+    fn reverse_recipient_corrections_verify_the_full_denied_name() {
+        for (source,expected) in [
+            ("Send the checklist to Ingrid Cole. Wait, I meant Karim Shah, not Ingrid Cole. Keep 12 receipts.",
+             "Send the checklist to Karim Shah. Keep 12 receipts."),
+            ("Email it to Ingrid. Sorry I meant Karim, not Ingrid before Thursday.",
+             "Email it to Karim before Thursday."),
+            ("Send it to Ingrid Wait I meant Karim not Ingrid Keep 12 records",
+             "Send it to Karim Keep 12 records"),
+            ("we recorded 72 samples let me correct that we recorded 68 samples the original quote is 720 rupees and the revised quote is 680 rupees",
+             "We recorded 68 samples the original quote is 720 rupees and the revised quote is 680 rupees"),
+        ] { assert_eq!(clean(source,&options()),expected); }
+        for source in [
+            "Send it to Ingrid Cole. Wait, I meant Karim Shah, not Ingrid.",
+            "Send it to Ingrid. Wait, I meant Karim, not Tessa.",
+            "Send it to Ingrid. Wait, I meant Karim, not Ingrid Cole.",
+            "Send it to \"Ingrid\". Wait, I meant Karim, not Ingrid.",
+            "I am sorry I mean we are not ready.",
+        ] {
+            assert_eq!(clean(source, &options()), source);
+        }
+    }
+
+    #[test]
+    fn explicit_start_next_finally_lists_keep_alternatives_and_require_the_request() {
+        assert_eq!(clean("Put these into bullet points, start with checking the sensors or asking Ingrid, next, save 12 receipts, finally, keep the logs.",&options()),
+            "Put these into bullet points:\n- Checking the sensors or asking Ingrid,\n- Save 12 receipts,\n- Keep the logs.");
+        assert_eq!(clean("Put these into bullet points. Start with checking the sensors or asking Ingrid. Next, save 12 receipts. Finally, keep the logs.",&options()),
+            "Put these into bullet points:\n- Checking the sensors or asking Ingrid.\n- Save 12 receipts.\n- Keep the logs.");
+        assert_eq!(clean("put these into bullet points start with checking the sensors or asking Ingrid next save 12 receipts finally keep the logs",&options()),
+            "Put these into bullet points:\n- Checking the sensors or asking Ingrid\n- Save 12 receipts\n- Keep the logs");
+        for source in [
+            "Start with a question. Next, consider it. Finally, decide.",
+            "The label says \"start with red next blue finally green\".",
+        ] {
+            assert_eq!(clean(source, &options()), source);
+        }
+    }
+
+    #[test]
+    fn full_repeated_corrections_change_only_a_verified_value() {
+        for (source, expected) in [
+            ("Please give Ingrid Cole the survey. No, that is wrong, please give Karim Shah the survey.",
+             "Please give Karim Shah the survey."),
+            ("Send it to Ingrid Cole. Let me correct that: send it to Karim Shah. Keep 12 receipts.",
+             "Send it to Karim Shah. Keep 12 receipts."),
+            ("We recorded 321 samples. Let me correct that: we recorded 319 samples. Do not delete 4 logs.",
+             "We recorded 319 samples. Do not delete 4 logs."),
+            ("The visit took 3 hours. Let me correct that: the visit took 4 hours.",
+             "The visit took 4 hours."),
+            ("Keep 2 copies. We counted 72 inspections. No, not 72 inspections, 68 inspections. Preserve archive_v4.csv.",
+             "Keep 2 copies. We counted 68 inspections. Preserve archive_v4.csv."),
+        ] {
+            assert_eq!(clean(source, &options()), expected);
+            assert!(accept_rewrite(expected, expected));
+        }
+    }
+
+    #[test]
+    fn repeated_corrections_require_matching_context_and_preserve_prohibitions() {
+        for source in [
+            "We counted 72 inspections. No, not 71 inspections, 68 inspections.",
+            "We counted 72 inspections. No, not 72 inspections, 68 receipts.",
+            "We counted 72 inspections. No, not 72 inspections, 68.",
+            "Please give Ingrid Cole the survey. No, that is wrong, please give Karim Shah the invoice.",
+            "We counted 72 inspections. Let me correct that: we deleted 68 inspections.",
+            "Do not upload the archive. Let me correct that: upload the archive.",
+            "The label says \"Let me correct that: we counted 68 inspections\".",
+            "Send it to \"Ingrid Cole\". Let me correct that: send it to Karim Shah.",
+            "The visit took 3 hours. Let me correct that: the visit took 4 days.",
+        ] {
+            assert_eq!(clean(source, &options()), source);
+        }
+        let source = clean("We counted 72 inspections. No, not 72 inspections, 68 inspections. Do not upload archive_v4.csv.", &options());
+        assert!(!accept_rewrite(
+            &source,
+            "We counted 69 inspections. Do not upload archive_v4.csv."
+        ));
+        assert!(!accept_rewrite(
+            &source,
+            "We counted 68 inspections. Upload archive_v4.csv."
+        ));
+    }
+
+    #[test]
+    fn ordinary_apologies_actual_facts_and_quoted_cues_are_not_replacements() {
+        let o = options();
+        for source in [
+            "It actually works.",
+            "I am sorry you missed the meeting.",
+            "We sent it to Leonie. Actually it arrived.",
+            "I mean, it works.",
+            "The original amount was 2400 and the new amount is 1800.",
+            "The label says \"no wait\" next to the button.",
+            "He wrote 'I mean' in the notes.",
+        ] {
+            assert_eq!(clean(source, &o), source);
+        }
+    }
+
+    #[test]
+    fn direct_questions_receive_punctuation_before_the_following_instruction() {
+        let o = options();
+        assert_eq!(
+            clean("can you check the invoice", &o),
+            "can you check the invoice?"
+        );
+        assert_eq!(
+            clean("Please check whether the invoice is correct.", &o),
+            "Please check whether the invoice is correct."
+        );
+        assert_eq!(
+            clean("I wonder if you can check the invoice.", &o),
+            "I wonder if you can check the invoice."
+        );
+        assert_eq!(
+            clean(
+                "can you check the invoice and one more thing dont delete the backup",
+                &o
+            ),
+            "can you check the invoice? And one more thing dont delete the backup"
+        );
+    }
+
+    #[test]
+    fn rewrite_guard_preserves_numbers_units_dates_versions_and_signs() {
+        for (source, bad) in [
+            (
+                "Keep the total at 7250 rupees.",
+                "Keep the total at 7520 rupees.",
+            ),
+            ("It took 3.25 hours.", "It took 3.25 days."),
+            ("Set it to -5 percent.", "Set it to 5 percent."),
+            (
+                "Keep version 3.8.2 installed.",
+                "Keep version 3.8.3 installed.",
+            ),
+            (
+                "The deadline is Wednesday at 7:45 pm.",
+                "The deadline is Thursday at 7:45 pm.",
+            ),
+            (
+                "The deadline is Wednesday at 7:45 pm.",
+                "The deadline is Wednesday at 7:45 am.",
+            ),
+            ("Use code 0042.", "Use code 42."),
+            ("Use 1,5 liters.", "Use 15 liters."),
+            ("There are five files.", "There are six files."),
+            ("Use .5 kilograms.", "Use 5 kilograms."),
+            ("The amount is -$25.", "The amount is $25."),
+        ] {
+            assert!(
+                !accept_rewrite(source, bad),
+                "unsafe fact change was accepted"
+            );
+        }
+        for (source, good) in [
+            (
+                "The total is 7,250.50 rupees.",
+                "The total is 7250.50 rupees.",
+            ),
+            ("Use 2.50 kilograms.", "Use 2.5 kg."),
+            ("Use 2.5kg.", "Use 2.5 kg."),
+            ("The fee is USD 25.", "The fee is $25."),
+            ("Meet Friday at 10 30 am.", "Meet Friday at 10:30 am."),
+            ("Meet at three pm.", "Meet at 3 pm."),
+            ("There are five files.", "There are 5 files."),
+            ("Use .50 kilograms.", "Use 0.5 kilograms."),
+        ] {
+            assert!(
+                accept_rewrite(source, good),
+                "equivalent fact formatting was refused"
+            );
+        }
+    }
+
+    #[test]
+    fn rewrite_guard_preserves_named_recipients_and_negation_scope() {
+        for (source, bad) in [
+            ("Send the draft to Leonie.", "Send the draft to Darius."),
+            ("Email the draft to leonie.", "Email the draft to darius."),
+            ("Ask Ingrid Cole to review it.", "Ask Ingrid to review it."),
+            ("Ask ingrid cole to review it.", "Ask ingrid to review it."),
+            (
+                "Give Ingrid Cole the survey.",
+                "Give Karim Shah the survey.",
+            ),
+            ("Omar has the latest draft.", "Neha has the latest draft."),
+            ("Use invoice INV-2048.", "Use invoice INV-2049."),
+            ("Keep Archive_Q4_2026.csv.", "Keep archive_q4_2026.csv."),
+            ("Open Report.csv.", "Open report.csv."),
+            ("Do not delete the backup.", "Delete the backup."),
+            (
+                "Do not send the invoice; delete the draft.",
+                "Send the invoice; do not delete the draft.",
+            ),
+            (
+                "Do not change the amount or delete the backup.",
+                "Do not change the amount. Delete the backup.",
+            ),
+            ("We haven't sent the draft.", "We have sent the draft."),
+            (
+                "Do not cancel the booking.",
+                "We cannot cancel the booking.",
+            ),
+            (
+                "Do not cancel the booking.",
+                "We will not cancel the booking.",
+            ),
+            ("Ship the release in May.", "Ship the release soon."),
+        ] {
+            assert!(
+                !accept_rewrite(source, bad),
+                "unsafe entity or negation change was accepted"
+            );
+        }
+        assert!(accept_rewrite(
+            "Omar dont have the draft and i hasnt received it.",
+            "Omar does not have the draft and I have not received it."
+        ));
+        assert!(accept_rewrite(
+            "Please don't delete the backup.",
+            "Please do not delete the backup."
+        ));
+    }
+
+    #[test]
+    fn rewrite_guard_preserves_action_direction_and_does_not_append_answers() {
+        for (source, bad) in [
+            ("Fix the logout issue.", "Fix the login issue."),
+            ("The user signs out.", "The user logs in."),
+            ("Do not increase the limit.", "Do not decrease the limit."),
+            ("Disable this option.", "Enable this option."),
+            ("Upload the report.", "Download the report."),
+            (
+                "What is the capital of Canada?",
+                "What is the capital of Canada? Ottawa.",
+            ),
+            ("can you check the invoice", "The invoice looks correct."),
+            ("Can you check the invoice?", "Can you check the invoice."),
+        ] {
+            assert!(
+                !accept_rewrite(source, bad),
+                "unsafe action change or answer was accepted"
+            );
+        }
+        assert!(accept_rewrite("The user signs out.", "The user logs out."));
+        assert!(accept_rewrite(
+            "can you check the invoice",
+            "Can you check the invoice?"
+        ));
+        assert!(!accept_rewrite(
+            "Can't we use this option?",
+            "Can we use this option?"
+        ));
+    }
+
+    #[test]
+    fn ordinary_verb_capitalization_does_not_become_a_protected_person() {
+        assert!(accept_rewrite(
+            "send it to Petra before Friday",
+            "Send it to Petra before Friday."
+        ));
+        assert!(accept_rewrite(
+            "keep the pressure at -5 percent",
+            "Keep the pressure at -5 percent."
+        ));
+        assert!(accept_rewrite(
+            "May has the latest draft.",
+            "May has the latest draft."
+        ));
+        assert!(!accept_rewrite(
+            "May has the latest draft.",
+            "She has the latest draft."
+        ));
+        assert!(accept_rewrite(
+            "petra has the latest draft",
+            "Petra has the latest draft."
+        ));
+        assert!(accept_rewrite(
+            "who has the latest draft?",
+            "Who has the latest draft?"
+        ));
+        assert!(accept_rewrite(
+            "the review is in july",
+            "The review is in July."
+        ));
+        assert!(!accept_rewrite(
+            "Send it to Leonie Hart.",
+            "Send it to Leonie Quinn."
+        ));
+    }
+
+    #[test]
+    fn rewrites_do_not_drop_the_auxiliary_from_negative_instructions() {
+        assert!(accept_rewrite(
+            "I havent uploaded the files yet please dont delete the backup or overwrite the logs.",
+            "I have not uploaded the files yet. Please do not delete the backup or overwrite the logs."
+        ));
+        assert!(!accept_rewrite(
+            "Do not cancel the booking.",
+            "Not cancel the booking."
+        ));
+        assert!(!accept_rewrite(
+            "Don't delete the backup.",
+            "Please not delete the backup."
+        ));
+        assert!(accept_rewrite(
+            "Please do not cancel the booking.",
+            "Please don't cancel the booking."
+        ));
+        assert!(accept_rewrite(
+            "The app isn't responding.",
+            "The app is currently not responding."
+        ));
+        assert!(accept_rewrite(
+            "Try not to close it.",
+            "Try not to close it."
+        ));
+        assert!(accept_rewrite(
+            "Not only the first file.",
+            "Not only the first file."
+        ));
+    }
+
+    #[test]
+    fn an_unpunctuated_question_restart_is_not_a_negative_instruction() {
+        assert!(accept_rewrite(
+            "which year no when was it released?",
+            "When was it released?"
+        ));
+        assert!(!accept_rewrite("Are there no errors?", "Are there errors?"));
+        assert!(!accept_rewrite(
+            "No, why should I leave?",
+            "Why should I leave?"
+        ));
+        assert_eq!(
+            clean("Set the limit to 45 no 54 before saving.", &options()),
+            "Set the limit to 54 before saving."
+        );
+        assert_eq!(
+            clean("Are there 5 files? No, 7 files.", &options()),
+            "Are there 5 files? No, 7 files."
+        );
+        assert_eq!(
+            clean("The issue is that the app crashes.", &options()),
+            "The issue is that the app crashes."
+        );
+        assert_eq!(
+            clean("What is important is the result.", &options()),
+            "What is important is the result."
+        );
+        assert!(accept_rewrite(
+            "What is important is the result.",
+            "What is important is the result."
+        ));
     }
 }

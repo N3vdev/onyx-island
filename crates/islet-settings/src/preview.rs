@@ -8,8 +8,9 @@ use std::time::{Duration, Instant};
 use windows::core::{w, BOOL};
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DestroyWindow, FindWindowW, GetPropW, IsWindow, PostMessageW, SetPropW,
-    SetWindowPos, SystemParametersInfoW, SPI_GETCLIENTAREAANIMATION, SWP_NOACTIVATE, SWP_NOZORDER,
+    CreateWindowExW, DestroyWindow, FindWindowW, GetAncestor, GetPropW, IsIconic, IsWindow,
+    IsWindowVisible, PostMessageW, SetPropW, SetWindowPos, SystemParametersInfoW, GA_ROOT,
+    SPI_GETCLIENTAREAANIMATION, SWP_NOACTIVATE, SWP_NOZORDER,
     SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WINDOW_EX_STYLE, WS_CHILD,
 };
 
@@ -104,6 +105,14 @@ impl PreviewLink {
         let Some(anchor) = self.anchor else {
             return;
         };
+        let root = unsafe { GetAncestor(anchor, GA_ROOT) };
+        if unsafe { IsIconic(root) }.as_bool() || !unsafe { IsWindowVisible(root) }.as_bool() {
+            if !unsafe { GetPropW(anchor, w!("IsletPreviewAttached")) }.is_invalid() {
+                self.detach();
+            }
+            self.last_attach = None;
+            return;
+        }
         let mode = customization.map_or([0, 1, 1000], |(top, margin, scale)| {
             [
                 if top { 1 } else { 2 },

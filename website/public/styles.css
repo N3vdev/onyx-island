@@ -60,7 +60,7 @@ a { color: inherit; text-decoration: none; }
 
 /* Film grain: keeps the black from looking flat and digital. */
 .grain {
-  position: fixed; inset: -50%; z-index: 100; pointer-events: none; opacity: 0.05;
+  position: fixed; inset: -50%; z-index: 79; pointer-events: none; opacity: 0.05;
   background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
   animation: grain 1.2s steps(6) infinite;
 }
@@ -70,80 +70,92 @@ a { color: inherit; text-decoration: none; }
 .intro { position: fixed; inset: 0; z-index: 90; background: var(--bg); display: grid; place-items: center; pointer-events: none; }
 .intro__pill { width: 10px; height: 10px; border-radius: 99px; background: #000; box-shadow: 0 0 0 1px rgb(255 255 255 / 0.18), 0 0 60px var(--accent-glow); }
 
-/* ---------- Island ----------
-   Real size: 222 x 38 resting and 498 x 122 open, 7px from the top, the same
-   as the app at 100% display scale. Hover opens it; it only ever plays music. */
+/* ---------- Island: the native app's logical geometry ---------- */
 .island {
   position: fixed; z-index: 80; left: 50%; top: var(--island-top);
-  transform: translateX(-50%);
+  transform: translateX(-50%); transform-origin: 50% 0;
+  font-family: "Inter", "Segoe UI", sans-serif; font-optical-sizing: none;
+  font-synthesis: none; line-height: normal;
 }
 .island__body {
-  position: relative; width: 222px; height: 38px; border-radius: 19px;
-  background: #000;
-  box-shadow: 0 0 0 1px rgb(255 255 255 / 0.14), 0 14px 40px rgb(0 0 0 / 0.55);
-  overflow: hidden; cursor: default;
+  position: relative; isolation: isolate; width: 222px; height: 38px;
+  border-radius: 19px; overflow: hidden; cursor: default; outline: none;
 }
+.island__body:focus-visible .island__outline path { stroke: #b3b9cc; stroke-width: 2; }
+.island__outline { position: absolute; inset: 0; width: 100%; height: 100%; z-index: 0; pointer-events: none; }
+.island__art {
+  position: absolute; left: 5px; top: 5px; z-index: 2; display: block;
+  width: 28px; height: 28px; border-radius: 14px;
+  background: #1a1a1c center / cover no-repeat;
+  transition: opacity .15s;
+}
+.island[data-state="player"] .island__art:hover { opacity: .88; }
 .panel {
-  position: absolute; inset: 0; display: flex; align-items: center;
-  opacity: 0; visibility: hidden; color: #fff; white-space: nowrap;
+  position: absolute; left: 50%; top: 50%; z-index: 1; transform: translate(-50%, -50%);
+  color: #fff; white-space: nowrap; opacity: 0; visibility: hidden;
 }
-.panel.is-on { opacity: 1; visibility: visible; }
-
-.art { flex: none; border-radius: 50%; background: #1a1a1c center / cover no-repeat; }
-.art--sm { width: 26px; height: 26px; }
-.art--lg { width: 112px; height: 112px; border-radius: 24px; }
-
-.panel--music { padding: 0 14px 0 6px; gap: 9px; }
-.music__text { display: flex; flex-direction: column; line-height: 1.15; min-width: 0; flex: 1; }
-.music__text b, .music__text small { overflow: hidden; text-overflow: ellipsis; }
-.music__text b { font-size: 12.5px; font-weight: 600; }
-.music__text small { font-size: 10.5px; color: #a3a3a3; }
-.bars { display: flex; gap: 3px; align-items: center; height: 16px; }
-.bars i { width: 3px; height: 100%; border-radius: 2px; background: var(--bar, #7d8fe8); transition: background .6s; transform-origin: center; animation: bar 0.9s var(--ease-io) infinite alternate; }
+.panel--music { width: 220px; height: 36px; }
+.music__text { position: absolute; top: 0; left: 40px; width: calc(100% - 104px); min-width: 0; }
+.music__text b, .music__text small { display: block; overflow: hidden; text-overflow: ellipsis; }
+.music__text b { position: absolute; top: 3px; width: 100%; height: 15px; line-height: 15px; font-size: 13px; font-weight: 600; color: #f5f5f5; }
+.music__text small { position: absolute; top: 19px; width: 100%; height: 13px; line-height: 13px; font-size: 10px; font-weight: 400; color: #989eaf; }
+.bars { position: absolute; top: 50%; transform: translateY(-50%); display: flex; gap: 5.2px; align-items: center; height: 18px; }
+.bars i { flex: none; width: 2.8px; height: 100%; border-radius: 1.4px; background: var(--bar, #7d8fe8); opacity: .92; transform-origin: center; animation: bar .9s var(--ease-io) infinite alternate; }
 .bars i:nth-child(2){animation-delay:-.3s}.bars i:nth-child(3){animation-delay:-.6s}.bars i:nth-child(4){animation-delay:-.15s}.bars i:nth-child(5){animation-delay:-.45s}
-@keyframes bar { from { transform: scaleY(0.25); } to { transform: scaleY(1); } }
-/* Paused: the bars rest low and still. */
-.island:not(.is-playing) .bars i { animation: none; transform: scaleY(0.3); }
-
-.panel--player { padding: 5px 14px 5px 5px; gap: 16px; align-items: stretch; }
-.player__main { display: flex; flex-direction: column; flex: 1; min-width: 0; padding-top: 12px; }
-.player__song { display: flex; flex-direction: column; min-width: 0; }
-.player__song b, .player__song small { overflow: hidden; text-overflow: ellipsis; }
-.player__song b { font-size: 14px; font-weight: 600; }
-.player__song small { font-size: 12px; color: #9a9a9a; }
-.player__controls { display: flex; gap: 14px; margin: 4px 0 6px -6px; }
+@keyframes bar { from { transform: scaleY(.17); } to { transform: scaleY(1); } }
+.island:not(.is-playing) .bars i { animation: none; transform: scaleY(.17); opacity: .5; }
+.panel--player { width: 496px; height: 120px; }
+.player__main { position: absolute; left: 132px; top: 0; width: 164px; height: 120px; }
+.player__song { position: absolute; left: 0; top: 20px; width: 164px; height: 37px; }
+.player__song b, .player__song small { display: block; overflow: hidden; text-overflow: ellipsis; transition: color .15s; }
+.player__song b { height: 19px; line-height: 19px; font-size: 13px; font-weight: 600; color: #f5f5f7; }
+.player__song small { margin-top: 2px; height: 16px; line-height: 16px; font-size: 12px; font-weight: 400; color: #a5a5ad; }
+.player__song:hover b { color: #c9c9cf; }
+.player__song:focus-visible { outline: 1px solid #b3b9cc; outline-offset: 3px; border-radius: 3px; }
+.player__controls { position: absolute; left: 0; top: 58px; display: flex; gap: 12px; }
 .ctl {
-  display: grid; place-items: center; width: 30px; height: 30px; padding: 0; border: 0; border-radius: 50%;
-  background: transparent; color: #fff; cursor: pointer; transition: background .2s, transform .2s var(--ease-spring);
+  display: grid; place-items: center; flex: none; width: 32px; height: 32px; padding: 0; border: 0; border-radius: 50%;
+  background: transparent; color: #f0f0f2; cursor: pointer; transition: background .15s, transform .15s;
 }
-.ctl:hover { background: rgb(255 255 255 / 0.1); }
-.ctl:active { transform: scale(0.9); }
-.ctl svg { width: 15px; height: 15px; fill: #fff; stroke: #fff; stroke-width: 2.2; stroke-linecap: round; stroke-linejoin: round; }
+.ctl:hover { background: rgb(255 255 255 / .14); }
+.ctl:active { transform: scale(.92); }
+.ctl:focus-visible, .volume__mute:focus-visible { outline: 1px solid #b3b9cc; outline-offset: 2px; }
+.ctl svg { width: 14px; height: 14px; fill: currentColor; stroke: currentColor; stroke-width: 2.2; stroke-linecap: round; stroke-linejoin: round; }
 .ctl .i-pause { display: none; }
 .island.is-playing .ctl .i-play { display: none; }
 .island.is-playing .ctl .i-pause { display: block; }
 .island.is-loading .ctl--main { animation: pulse 1s ease-in-out infinite; }
-.player__track { position: relative; height: 3px; background: #333; border-radius: 3px; cursor: pointer; }
-.player__track::before { content: ""; position: absolute; inset: -8px 0; }
-.player__fill { display: block; height: 100%; width: 0; background: #fff; border-radius: 3px; }
-.player__times { display: flex; justify-content: space-between; font-size: 10px; color: #888; margin-top: 5px; font-variant-numeric: tabular-nums; }
-.player__side { width: 156px; display: flex; flex-direction: column; justify-content: center; gap: 8px; border-left: 1px solid #222; padding-left: 12px; }
-.chip { display: flex; align-items: center; justify-content: space-between; height: 38px; border-radius: 19px; background: #1c1c1e; padding: 0 14px; font-size: 12px; }
-.chip em { font-style: normal; }
-.chip--link { color: #fff; transition: background .25s; }
-.chip--link:hover { background: #2a2a2d; }
-.chip--vol { gap: 10px; justify-content: flex-start; }
-.chip--vol svg { width: 16px; height: 16px; fill: none; stroke: #ddd; stroke-width: 2; }
-.vol { flex: 1; height: 3px; background: #444; border-radius: 3px; }
-.vol span { display: block; width: 62%; height: 100%; background: #fff; border-radius: 3px; }
-
-/* Spotify's player: loaded on demand and kept out of sight. It must stay inside
-   the viewport (Spotify won't play from an off-screen frame), so it sits
-   invisible behind the page instead. */
-.spotify-host {
-  position: fixed; left: 0; bottom: 0; z-index: -1; width: 300px; height: 80px;
-  overflow: hidden; opacity: 0; pointer-events: none;
-}
+.player__track { position: absolute; left: 0; top: 88px; width: 164px; height: 18px; border-radius: 7px; cursor: pointer; touch-action: none; }
+.player__rail { position: absolute; left: 0; right: 0; top: 8px; height: 2px; border-radius: 1px; background: rgb(255 255 255 / .16); overflow: hidden; }
+.player__fill { display: block; height: 100%; width: 100%; transform: scaleX(0); transform-origin: 0 50%; background: rgb(255 255 255 / .78); }
+.player__track::after { content: ""; position: absolute; left: calc(var(--progress, 0) * 100%); top: 9px; width: 11px; height: 11px; transform: translate(-50%, -50%); border-radius: 50%; background: #fff; opacity: 0; }
+.player__track:hover, .player__track:focus-visible { background: rgb(255 255 255 / .14); outline: none; }
+.player__track:hover::after, .player__track:focus-visible::after, .player__track:active::after { opacity: 1; }
+.player__times { position: absolute; left: 0; top: 102px; width: 164px; height: 12px; line-height: 12px; display: flex; justify-content: space-between; font-size: 9px; font-weight: 400; color: #919196; font-variant-numeric: tabular-nums; pointer-events: none; }
+.player__side { position: absolute; inset: 0; pointer-events: none; }
+.player__side::before { content: ""; position: absolute; left: 312px; top: 20px; width: 1px; height: 80px; background: rgb(255 255 255 / .12); }
+.chip { position: absolute; left: 326px; width: 156px; height: 38px; border-radius: 19px; background: rgb(255 255 255 / .115); font-size: 11px; font-weight: 400; color: #f0f0f2; pointer-events: auto; }
+.chip--link { top: 18px; display: flex; align-items: center; justify-content: space-between; padding: 0 16px; font-weight: 500; transition: background .15s; }
+.chip--link:hover, .chip--link:focus-visible { background: rgb(255 255 255 / .22); }
+.chip--link:focus-visible { outline: 1px solid #b3b9cc; outline-offset: 2px; }
+.chip--link svg { width: 12px; height: 12px; fill: none; stroke: currentColor; stroke-width: 1.5; }
+.chip--vol { top: 64px; transition: background .15s; }
+.chip--vol:hover { background: rgb(255 255 255 / .18); }
+.volume__mute { position: absolute; left: 16px; top: 3px; width: 32px; height: 32px; display: grid; place-items: center; padding: 0; border: 0; border-radius: 16px; background: transparent; color: #c7c7cb; cursor: pointer; }
+.volume__mute svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+.volume__slash { display: none; }
+.island.is-muted .volume__waves { display: none; }
+.island.is-muted .volume__slash { display: block; }
+.volume__range { --volume: .3; appearance: none; -webkit-appearance: none; position: absolute; left: 52px; top: 8px; width: 86px; height: 22px; padding: 0; margin: 0; background: transparent; cursor: pointer; accent-color: #fff; }
+.volume__range::-webkit-slider-runnable-track { height: 3px; border-radius: 2px; background: linear-gradient(to right, #ddd calc(var(--volume) * 100%), #49494b 0); }
+.volume__range::-moz-range-track { height: 3px; border-radius: 2px; background: #49494b; }
+.volume__range::-moz-range-progress { height: 3px; border-radius: 2px; background: #ddd; }
+.volume__range::-webkit-slider-thumb { appearance: none; -webkit-appearance: none; width: 8px; height: 8px; margin-top: -2.5px; border: 0; border-radius: 50%; background: #fff; }
+.volume__range::-moz-range-thumb { width: 8px; height: 8px; border: 0; border-radius: 50%; background: #fff; }
+.volume__range:focus-visible { outline: 1px solid #b3b9cc; outline-offset: 2px; border-radius: 4px; }
+.island__status { position: absolute; left: 50%; top: 100%; transform: translateX(-50%); width: max-content; max-width: 330px; padding: 7px 10px; margin-top: 8px; border-radius: 8px; background: #242427; color: #f0f0f2; font-size: 11px; line-height: 1.4; text-align: center; }
+.preview-note { margin-top: 18px; font-size: 11px; color: var(--t2); letter-spacing: normal; }
+.preview-note a { text-decoration: underline; text-underline-offset: 3px; }
 
 /* ---------- Specimens: other features, beside their chapter, at real size ---------- */
 .specimen {

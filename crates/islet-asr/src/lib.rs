@@ -6,6 +6,7 @@
 //! stays small, "unloading" the model is ending the process, and an ASR crash
 //! cannot take the island down with it.
 
+mod chunks;
 pub mod client;
 pub mod manager;
 pub mod polish;

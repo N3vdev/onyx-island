@@ -8,8 +8,8 @@ pub mod inject;
 
 pub use hook::{HookEvent, KeyboardHook};
 pub use inject::{
-    foreground_exe, foreground_is_blocked_by_elevation, insert_text, suppress_start_menu,
-    InjectError, InsertReport, Method,
+    foreground_exe, foreground_is_blocked_by_elevation, insert_text, insert_text_with_clipboard,
+    suppress_start_menu, InjectError, InsertReport, Method,
 };
 
 /// Marks every key event Islet injects (`dwExtraInfo`), so the hook ignores

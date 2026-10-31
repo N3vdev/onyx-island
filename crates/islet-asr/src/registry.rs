@@ -183,15 +183,14 @@ impl AddOn {
     }
 }
 
-/// On-device AI cleanup: Qwen2.5 1.5B Instruct (4-bit) run by llama.cpp's CPU
-/// server. Both pinned by SHA-256: the runtime is the official llama.cpp
-/// release asset, the model the official Qwen GGUF.
+/// On-device Onyx fine-tuned Gemma model, supplied locally with this build.
+/// The local model and CPU runtime are checksum-pinned.
 pub const AI_CLEANUP: AddOn = AddOn {
     id: "ai-cleanup",
-    name: "Qwen2.5 1.5B Instruct",
-    summary: "Rewrites each dictation: drops what you corrected, fixes grammar, makes lists.",
-    maker: "Qwen \u{b7} llama.cpp",
-    license: "Apache-2.0 \u{b7} MIT",
+    name: "Onyx Cleanup - Gemma 3 270M (Round 5)",
+    summary: "Local dictation cleanup with bounded chunks and checked fallbacks. Experimental.",
+    maker: "Onyx / Google Gemma",
+    license: "Gemma terms / MIT runtime",
     dir: "ai-cleanup",
     files: &[
         ModelFile {
@@ -201,14 +200,14 @@ pub const AI_CLEANUP: AddOn = AddOn {
             sha256: "f70b7fe800e683f58fed3199fcf9c961932307f30916498a7758dce5f1d76ce9",
         },
         ModelFile {
-            name: "qwen2.5-1.5b-instruct-q4_k_m.gguf",
-            url: "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q4_k_m.gguf",
-            size: 1_117_320_736,
-            sha256: "6a1a2eb6d15622bf3c96857206351ba97e1af16c30d7a74ee38970e434e9407e",
+            name: "onyx-cleanup-270m-r5-selected-q8_0.gguf",
+            url: "bundled:onyx-cleanup-270m-r5-selected-q8_0.gguf",
+            size: 291_545_536,
+            sha256: "760e148a14c0057a086f47efbec76f738ce817901141e45a58d9566dee67cf8f",
         },
     ],
     archive: Some("llama-b11927-bin-win-cpu-x64.zip"),
-    model: "qwen2.5-1.5b-instruct-q4_k_m.gguf",
+    model: "onyx-cleanup-270m-r5-selected-q8_0.gguf",
     program: "llama-server.exe",
 };
 
@@ -258,14 +257,20 @@ mod tests {
         }
         assert_eq!(PARAKEET_V3.total_size(), 670_478_772);
         for file in AI_CLEANUP.files {
-            assert!(file.url.ends_with(file.name) && file.url.starts_with("https://"));
+            assert!(
+                file.url.ends_with(file.name)
+                    && (file.url.starts_with("https://") || file.url.starts_with("bundled:"))
+            );
             assert_eq!(file.sha256.len(), 64);
         }
         assert!(AI_CLEANUP
             .files
             .iter()
             .any(|file| Some(file.name) == AI_CLEANUP.archive));
-        assert!(AI_CLEANUP.files.iter().any(|file| file.name == AI_CLEANUP.model));
+        assert!(AI_CLEANUP
+            .files
+            .iter()
+            .any(|file| file.name == AI_CLEANUP.model));
     }
 
     #[test]

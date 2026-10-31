@@ -74,12 +74,19 @@ pub struct Progress {
 
 pub struct ModelManager {
     root: PathBuf,
+    bundled: PathBuf,
 }
 
 impl ModelManager {
     #[must_use]
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            bundled: std::env::current_exe()
+                .ok()
+                .and_then(|exe| exe.parent().map(|parent| parent.join("models")))
+                .unwrap_or_else(|| PathBuf::from("models")),
+        }
     }
 
     #[must_use]
@@ -132,6 +139,14 @@ impl ModelManager {
     /// The program to run for `addon`, inside its unpacked runtime.
     #[must_use]
     pub fn addon_program(&self, addon: &AddOn) -> PathBuf {
+        let bundled = self
+            .bundled
+            .join(addon.dir)
+            .join(AddOn::RUNTIME_DIR)
+            .join(addon.program);
+        if bundled.is_file() {
+            return bundled;
+        }
         self.addon_dir(addon)
             .join(AddOn::RUNTIME_DIR)
             .join(addon.program)
@@ -192,7 +207,7 @@ impl ModelManager {
         for file in addon.files {
             let is_archive = Some(file.name) == addon.archive;
             if !(is_archive && self.runtime_unpacked(addon)) {
-                download_file(file, &dir, done, total, progress, cancel)?;
+                download_file_from(file, &dir, &self.bundled, done, total, progress, cancel)?;
                 if is_archive {
                     unpack(&dir.join(file.name), &dir.join(AddOn::RUNTIME_DIR))?;
                     let _ = fs::remove_file(dir.join(file.name));
@@ -290,9 +305,8 @@ fn unpack(archive: &Path, target: &Path) -> Result<(), ManagerError> {
             continue;
         };
         let lower = name.to_string_lossy().to_lowercase();
-        let wanted = lower.ends_with(".dll")
-            || lower == "llama-server.exe"
-            || lower.starts_with("license");
+        let wanted =
+            lower.ends_with(".dll") || lower == "llama-server.exe" || lower.starts_with("license");
         if !entry.is_file() || !wanted {
             continue;
         }
@@ -357,11 +371,47 @@ fn download_file(
     progress: &mut dyn FnMut(Progress),
     cancel: &AtomicBool,
 ) -> Result<(), ManagerError> {
+    let exe = std::env::current_exe()?;
+    let bundled = exe
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("models");
+    download_file_from(
+        file, directory, &bundled, base_done, total, progress, cancel,
+    )
+}
+
+fn download_file_from(
+    file: &ModelFile,
+    directory: &Path,
+    bundled: &Path,
+    base_done: u64,
+    total: u64,
+    progress: &mut dyn FnMut(Progress),
+    cancel: &AtomicBool,
+) -> Result<(), ManagerError> {
     let target = directory.join(file.name);
     if file_size(&target) == Some(file.size) {
         return Ok(());
     }
     let part = directory.join(part_name(file));
+    let source = bundled.join(file.url.strip_prefix("bundled:").unwrap_or(file.name));
+    // Packaged builds carry the pinned runtime archive locally. Prefer it
+    // over the network URL, with the same hash/size checks as a download.
+    if file.url.starts_with("bundled:") || source.is_file() {
+        return copy_local_model(
+            &source,
+            file,
+            &target,
+            &part,
+            Progress {
+                done: base_done,
+                total,
+            },
+            progress,
+            cancel,
+        );
+    }
 
     let mut last_error = None;
     for attempt in 1..=ATTEMPTS {
@@ -392,6 +442,44 @@ fn download_file(
         }
     }
     Err(last_error.unwrap_or_else(|| ManagerError::Http("unknown error".to_owned())))
+}
+
+fn copy_local_model(
+    source: &Path,
+    file: &ModelFile,
+    target: &Path,
+    part: &Path,
+    initial: Progress,
+    progress: &mut dyn FnMut(Progress),
+    cancel: &AtomicBool,
+) -> Result<(), ManagerError> {
+    let mut input = File::open(source)?;
+    let mut output = File::create(part)?;
+    let mut buffer = vec![0u8; CHUNK];
+    let mut copied = 0;
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(ManagerError::Cancelled);
+        }
+        let count = input.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        output.write_all(&buffer[..count])?;
+        copied += count as u64;
+        progress(Progress {
+            done: initial.done + copied,
+            total: initial.total,
+        });
+    }
+    output.sync_all()?;
+    drop(output);
+    verify_file(part, file)?;
+    if target.exists() {
+        fs::remove_file(target)?;
+    }
+    fs::rename(part, target)?;
+    Ok(())
 }
 
 /// One HTTP attempt, appending to `part`.
@@ -661,5 +749,154 @@ mod tests {
     #[test]
     fn hex_is_lowercase_and_padded() {
         assert_eq!(hex(&[0, 15, 255]), "000fff");
+    }
+
+    #[test]
+    fn local_model_copy_checks_hash_and_honours_cancellation() {
+        let dir = temp_dir("local-model");
+        fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("source.bin");
+        let target = dir.join("installed.bin");
+        let part = dir.join("installed.part");
+        let body = payload(1000);
+        fs::write(&source, &body).unwrap();
+        let file = file_for(&body, "bundled:file.bin".into(), None);
+        copy_local_model(
+            &source,
+            &file,
+            &target,
+            &part,
+            Progress {
+                done: 0,
+                total: file.size,
+            },
+            &mut |_| {},
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(fs::read(&target).unwrap(), body);
+        fs::remove_file(&target).unwrap();
+        assert!(matches!(
+            copy_local_model(
+                &source,
+                &file,
+                &target,
+                &part,
+                Progress {
+                    done: 0,
+                    total: file.size
+                },
+                &mut |_| {},
+                &AtomicBool::new(true)
+            ),
+            Err(ManagerError::Cancelled)
+        ));
+        assert!(!target.exists());
+        fs::write(&source, vec![0; body.len()]).unwrap();
+        assert!(matches!(
+            copy_local_model(
+                &source,
+                &file,
+                &target,
+                &part,
+                Progress {
+                    done: 0,
+                    total: file.size
+                },
+                &mut |_| {},
+                &AtomicBool::new(false)
+            ),
+            Err(ManagerError::HashMismatch { .. })
+        ));
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn packaged_runtime_uses_verified_bundle_without_network_fallback() {
+        let dir = temp_dir("packaged-runtime");
+        let bundle = dir.join("bundle");
+        let installed = dir.join("installed");
+        fs::create_dir_all(&bundle).unwrap();
+        fs::create_dir_all(&installed).unwrap();
+        let body = payload(1000);
+        let file = file_for(&body, "http://127.0.0.1:1/unreachable".into(), None);
+        fs::write(bundle.join(file.name), &body).unwrap();
+        download_file_from(
+            &file,
+            &installed,
+            &bundle,
+            0,
+            file.size,
+            &mut |_| {},
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(fs::read(installed.join(file.name)).unwrap(), body);
+
+        fs::remove_file(installed.join(file.name)).unwrap();
+        fs::write(bundle.join(file.name), vec![0; body.len()]).unwrap();
+        assert!(matches!(
+            download_file_from(
+                &file,
+                &installed,
+                &bundle,
+                0,
+                file.size,
+                &mut |_| {},
+                &AtomicBool::new(false)
+            ),
+            Err(ManagerError::HashMismatch { .. })
+        ));
+        assert!(!installed.join(file.name).exists());
+    }
+
+    #[test]
+    fn packaged_runtime_executes_from_bundle_instead_of_download_directory() {
+        let dir = temp_dir("packaged-program");
+        let mut manager = ModelManager::new(dir.join("installed"));
+        manager.bundled = dir.join("bundle");
+        let addon = crate::registry::AI_CLEANUP;
+        let local_program = manager
+            .addon_dir(&addon)
+            .join(AddOn::RUNTIME_DIR)
+            .join(addon.program);
+        assert_eq!(manager.addon_program(&addon), local_program);
+        let bundled_program = manager
+            .bundled
+            .join(addon.dir)
+            .join(AddOn::RUNTIME_DIR)
+            .join(addon.program);
+        fs::create_dir_all(bundled_program.parent().unwrap()).unwrap();
+        fs::write(&bundled_program, b"owned-runtime-fixture").unwrap();
+        assert_eq!(manager.addon_program(&addon), bundled_program);
+        assert!(manager.runtime_unpacked(&addon));
+        assert!(!local_program.exists());
+        let body = payload(1000);
+        fs::write(manager.bundled.join("file.bin"), &body).unwrap();
+        let files = Box::leak(
+            vec![
+                ModelFile {
+                    name: "runtime.zip",
+                    url: "http://127.0.0.1:1/unreachable",
+                    size: 20,
+                    sha256: "unused-because-runtime-is-bundled",
+                },
+                file_for(&body, "bundled:file.bin".into(), None),
+            ]
+            .into_boxed_slice(),
+        );
+        let addon = AddOn {
+            files,
+            model: "file.bin",
+            archive: Some("runtime.zip"),
+            ..addon
+        };
+        manager
+            .download_addon(&addon, &mut |_| {}, &AtomicBool::new(false))
+            .unwrap();
+        assert_eq!(manager.addon_status(&addon), ModelStatus::Installed);
+        assert_eq!(fs::read(manager.addon_model(&addon)).unwrap(), body);
+        assert!(!manager.addon_dir(&addon).join("runtime.zip").exists());
+        assert!(!local_program.exists());
     }
 }

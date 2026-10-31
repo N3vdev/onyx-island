@@ -1,0 +1,243 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-10-28T11:32:49.758887+00:00",
+  "title": "Design System: Onyx website music island",
+  "extensions": {
+    "shadows": [],
+    "motion": [
+      {
+        "name": "geometry-morph",
+        "value": "0.55s back.out(1.15)",
+        "purpose": "Native geometry transition; immediate when reduced motion is enabled."
+      },
+      {
+        "name": "viewport-scale",
+        "value": "0.55s expo.out",
+        "purpose": "Uniform scale transition with native geometry."
+      },
+      {
+        "name": "control-feedback",
+        "value": "0.15s",
+        "purpose": "Control fill, text color, artwork opacity, and press feedback."
+      },
+      {
+        "name": "hover-open",
+        "value": "250ms",
+        "purpose": "Mouse dwell before expansion."
+      },
+      {
+        "name": "leave-close",
+        "value": "400ms",
+        "purpose": "Mouse leave delay before closing."
+      },
+      {
+        "name": "playback-condense",
+        "value": "5000ms",
+        "purpose": "Keep compact metadata visible before condensing."
+      }
+    ],
+    "breakpoints": [],
+    "colorMeta": {
+      "island-ground": {
+        "role": "neutral",
+        "displayName": "Island Ground",
+        "tonalRamp": [
+          "oklch(15% 0 0)",
+          "oklch(26% 0 0)",
+          "oklch(38% 0 0)",
+          "oklch(49% 0 0)",
+          "oklch(61% 0 0)",
+          "oklch(72% 0 0)",
+          "oklch(84% 0 0)",
+          "oklch(95% 0 0)"
+        ]
+      },
+      "control-ink": {
+        "role": "neutral",
+        "displayName": "Control Ink",
+        "tonalRamp": [
+          "oklch(15% 0.003 285)",
+          "oklch(26% 0.003 285)",
+          "oklch(38% 0.003 285)",
+          "oklch(49% 0.003 285)",
+          "oklch(61% 0.003 285)",
+          "oklch(72% 0.003 285)",
+          "oklch(84% 0.003 285)",
+          "oklch(95% 0.003 285)"
+        ]
+      },
+      "focus": {
+        "role": "neutral",
+        "displayName": "Focus",
+        "tonalRamp": [
+          "oklch(15% 0.03 270)",
+          "oklch(26% 0.03 270)",
+          "oklch(38% 0.03 270)",
+          "oklch(49% 0.03 270)",
+          "oklch(61% 0.03 270)",
+          "oklch(72% 0.03 270)",
+          "oklch(84% 0.03 270)",
+          "oklch(95% 0.03 270)"
+        ]
+      },
+      "chip-ground": {
+        "role": "neutral",
+        "displayName": "Chip Ground",
+        "tonalRamp": [
+          "oklch(15% 0 0)",
+          "oklch(26% 0 0)",
+          "oklch(38% 0 0)",
+          "oklch(49% 0 0)",
+          "oklch(61% 0 0)",
+          "oklch(72% 0 0)",
+          "oklch(84% 0 0)",
+          "oklch(95% 0 0)"
+        ]
+      },
+      "control-hover": {
+        "role": "neutral",
+        "displayName": "Control Hover",
+        "tonalRamp": [
+          "oklch(15% 0 0)",
+          "oklch(26% 0 0)",
+          "oklch(38% 0 0)",
+          "oklch(49% 0 0)",
+          "oklch(61% 0 0)",
+          "oklch(72% 0 0)",
+          "oklch(84% 0 0)",
+          "oklch(95% 0 0)"
+        ]
+      },
+      "source-hover": {
+        "role": "neutral",
+        "displayName": "Source Hover",
+        "tonalRamp": [
+          "oklch(15% 0 0)",
+          "oklch(26% 0 0)",
+          "oklch(38% 0 0)",
+          "oklch(49% 0 0)",
+          "oklch(61% 0 0)",
+          "oklch(72% 0 0)",
+          "oklch(84% 0 0)",
+          "oklch(95% 0 0)"
+        ]
+      },
+      "rail": {
+        "role": "neutral",
+        "displayName": "Rail",
+        "tonalRamp": [
+          "oklch(15% 0 0)",
+          "oklch(26% 0 0)",
+          "oklch(38% 0 0)",
+          "oklch(49% 0 0)",
+          "oklch(61% 0 0)",
+          "oklch(72% 0 0)",
+          "oklch(84% 0 0)",
+          "oklch(95% 0 0)"
+        ]
+      },
+      "progress": {
+        "role": "neutral",
+        "displayName": "Progress",
+        "tonalRamp": [
+          "oklch(15% 0 0)",
+          "oklch(26% 0 0)",
+          "oklch(38% 0 0)",
+          "oklch(49% 0 0)",
+          "oklch(61% 0 0)",
+          "oklch(72% 0 0)",
+          "oklch(84% 0 0)",
+          "oklch(95% 0 0)"
+        ]
+      }
+    }
+  },
+  "components": [
+    {
+      "name": "Play transport",
+      "kind": "button",
+      "refersTo": "transport",
+      "description": "Circular native transport control; media state swaps the icon.",
+      "html": "<button class=\"ds-control\" aria-label=\"Play preview\"><svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M8 5l11 7-11 7z\"/></svg></button>",
+      "css": ".ds-control{display:grid;place-items:center;width:32px;height:32px;padding:0;border:0;border-radius:50%;background:transparent;color:#f0f0f2;cursor:pointer;transition:background .15s,transform .15s}.ds-control:hover{background:rgb(255 255 255 / .14)}.ds-control:active{transform:scale(.92)}.ds-control:focus-visible{outline:1px solid #b3b9cc;outline-offset:2px;}.ds-control svg{width:14px;height:14px;fill:currentColor;stroke:currentColor;stroke-width:2.2;stroke-linecap:round;stroke-linejoin:round}"
+    },
+    {
+      "name": "Source capsule",
+      "kind": "chip",
+      "refersTo": "source-chip",
+      "description": "Truthful preview provider link.",
+      "html": "<a class=\"ds-source\" href=\"https://music.apple.com/\">Apple Music<svg viewBox=\"0 0 16 16\" aria-hidden=\"true\"><path d=\"m5 11 6-6M6 5h5v5\"/></svg></a>",
+      "css": ".ds-source{display:flex;align-items:center;justify-content:space-between;width:156px;height:38px;padding:0 16px;border-radius:19px;background:rgb(255 255 255 / .115);color:#f0f0f2;font:500 11px Inter,\"Segoe UI\",sans-serif;text-decoration:none;transition:background .15s}.ds-source:hover,.ds-source:focus-visible{background:rgb(255 255 255 / .22)}.ds-source:focus-visible{outline:1px solid #b3b9cc;outline-offset:2px;}.ds-source svg{width:12px;height:12px;fill:none;stroke:currentColor;stroke-width:1.5}"
+    },
+    {
+      "name": "Volume range",
+      "kind": "input",
+      "description": "Native range input within the volume capsule.",
+      "html": "<input class=\"ds-volume\" type=\"range\" min=\"0\" max=\"1\" step=\"0.01\" value=\"0.3\" aria-label=\"Preview volume\">",
+      "css": ".ds-volume{--volume:.3;appearance:none;-webkit-appearance:none;width:86px;height:22px;padding:0;margin:0;background:transparent;cursor:pointer;accent-color:#fff}.ds-volume::-webkit-slider-runnable-track{height:3px;border-radius:2px;background:linear-gradient(to right,#ddd calc(var(--volume)*100%),#49494b 0)}.ds-volume::-moz-range-track{height:3px;border-radius:2px;background:#49494b}.ds-volume::-moz-range-progress{height:3px;border-radius:2px;background:#ddd}.ds-volume::-webkit-slider-thumb{appearance:none;-webkit-appearance:none;width:8px;height:8px;margin-top:-2.5px;border:0;border-radius:50%;background:#fff}.ds-volume::-moz-range-thumb{width:8px;height:8px;border:0;border-radius:50%;background:#fff}.ds-volume:focus-visible{outline:1px solid #b3b9cc;outline-offset:2px;border-radius:4px}"
+    },
+    {
+      "name": "Volume capsule",
+      "kind": "custom",
+      "refersTo": "volume-chip",
+      "description": "Mute and volume share the native capsule geometry.",
+      "html": "<div class=\"ds-vol-chip\"><button class=\"ds-mute\" aria-label=\"Mute preview\"><svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M4 9h4l5-4v14l-5-4H4zM16 9a4 4 0 0 1 0 6M19 6a8 8 0 0 1 0 12\"/></svg></button><input class=\"ds-volume\" type=\"range\" min=\"0\" max=\"1\" step=\"0.01\" value=\"0.3\" aria-label=\"Preview volume\"></div>",
+      "css": ".ds-volume{--volume:.3;appearance:none;-webkit-appearance:none;width:86px;height:22px;padding:0;margin:0;background:transparent;cursor:pointer;accent-color:#fff}.ds-volume::-webkit-slider-runnable-track{height:3px;border-radius:2px;background:linear-gradient(to right,#ddd calc(var(--volume)*100%),#49494b 0)}.ds-volume::-moz-range-track{height:3px;border-radius:2px;background:#49494b}.ds-volume::-moz-range-progress{height:3px;border-radius:2px;background:#ddd}.ds-volume::-webkit-slider-thumb{appearance:none;-webkit-appearance:none;width:8px;height:8px;margin-top:-2.5px;border:0;border-radius:50%;background:#fff}.ds-volume::-moz-range-thumb{width:8px;height:8px;border:0;border-radius:50%;background:#fff}.ds-volume:focus-visible{outline:1px solid #b3b9cc;outline-offset:2px;border-radius:4px}.ds-vol-chip{position:relative;width:156px;height:38px;border-radius:19px;background:rgb(255 255 255 / .115);transition:background .15s}.ds-vol-chip:hover{background:rgb(255 255 255 / .18)}.ds-mute{position:absolute;left:16px;top:3px;width:32px;height:32px;display:grid;place-items:center;padding:0;border:0;border-radius:16px;background:transparent;color:#c7c7cb;cursor:pointer}.ds-mute svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}.ds-mute:focus-visible{outline:1px solid #b3b9cc;outline-offset:2px;}.ds-vol-chip .ds-volume{position:absolute;left:52px;top:8px}"
+    },
+    {
+      "name": "Seek rail",
+      "kind": "custom",
+      "description": "Native rail with hover and keyboard handle; static panel specimen at 35 percent.",
+      "html": "<div class=\"ds-seek\" role=\"slider\" tabindex=\"0\" aria-label=\"Preview position\" aria-valuemin=\"0\" aria-valuemax=\"30\" aria-valuenow=\"10.5\"><span class=\"ds-rail\"><span class=\"ds-fill\"></span></span></div>",
+      "css": ".ds-seek{position:relative;width:164px;height:18px;border-radius:7px;cursor:pointer;touch-action:none}.ds-rail{position:absolute;left:0;right:0;top:8px;height:2px;border-radius:1px;background:rgb(255 255 255 / .16);overflow:hidden}.ds-fill{display:block;height:100%;width:35%;background:rgb(255 255 255 / .78)}.ds-seek::after{content:\"\";position:absolute;left:35%;top:9px;width:11px;height:11px;transform:translate(-50%,-50%);border-radius:50%;background:#fff;opacity:0}.ds-seek:hover,.ds-seek:focus-visible{background:rgb(255 255 255 / .14);outline:none}.ds-seek:hover::after,.ds-seek:focus-visible::after,.ds-seek:active::after{opacity:1}"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Native Music Island",
+    "overview": "This record governs the live music component, not the surrounding landing page\nor the native settings application. The incumbent website retains its near-black\nground and Geist page typography. The component uses the native player's compact,\nprecise visual language and Inter typography.\n\nThe native authority is `../crates/islet-core/src/media.rs`, `island.rs`, and\n`../crates/islet-render/src/lib.rs`, together with the shipped player captures in\n`public/assets/shots/`. The built web implementation is recorded here; the\nwebsite's native app design records remain separate.",
+    "keyCharacteristics": [
+      "Solid black island with translucent neutral controls.",
+      "Fixed native coordinates with uniform viewport scaling.",
+      "Shared sharp artwork through a finite geometry morph.",
+      "Actual media state, explicit source identity, and visible keyboard focus."
+    ],
+    "rules": [
+      {
+        "name": "The Clean Ground Rule",
+        "body": "Keep the island solid black. The page grain sits below it (grain layer 79, island layer 80); page texture is not a player material.",
+        "section": "colors"
+      },
+      {
+        "name": "The Native Type Rule",
+        "body": "Preserve the native component's small, clear type ramp and real font weights. Scale the complete player to fit rather than independently resizing its labels.",
+        "section": "typography"
+      },
+      {
+        "name": "The Native Fidelity Rule",
+        "body": "Preserve the native geometry and scale the complete player uniformly on narrow viewports. The scale is min(1, max(0.1, (viewport width - 24) / outer player width)); no separate mobile composition is introduced. These coordinates are component measurements, not website-wide tokens.",
+        "section": "layout"
+      },
+      {
+        "name": "The Truthful Playback Rule",
+        "body": "Use actual audio time and events. Official catalog excerpts are accepted by the user; do not promise full-song openings. One active audio element and a lazy silent next-clip preloader serve the playlist. Playback is capped at 30 seconds; skips preserve pause intent and the latest selection. A bounded loading state leads to an explicit retry message on failure.",
+        "section": "components"
+      },
+      {
+        "name": "The Finite Motion Rule",
+        "body": "Mouse hover opens after 250ms; leaving closes after 400ms. Title and artist remain visible for five seconds of playback before condensing. Keyboard focus and touch can open the player. The geometry morph lasts 0.55s; reduced motion applies final geometry immediately. Paused or hidden pages do not paint the audio clock. Preserve the incumbent page outside this component correction.",
+        "section": "components"
+      }
+    ],
+    "dos": [
+      "- **Do** preserve native coordinates, artwork shape, and uniform scaling.",
+      "- **Do** use Inter with real weights and preserve visible keyboard focus.",
+      "- **Do** reflect actual media time, volume, mute, and recoverable failure state.",
+      "- **Do** identify the preview provider separately from Spotify track identity."
+    ],
+    "donts": [
+      "- **Don't** apply the page grain or glow treatments to the player ground.",
+      "- **Don't** replace shared artwork with blurred duplicate artwork planes.",
+      "- **Don't** invent a mobile arrangement or promise full-song opening clips."
+    ]
+  }
+}

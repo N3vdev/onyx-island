@@ -1,9 +1,9 @@
 //! Putting dictated text into the focused application.
 //!
-//! Default method: save the clipboard, put the text on it, send Ctrl+V, then
-//! put the user's clipboard back. The inserted text is flagged so Windows
-//! keeps it out of clipboard history and cloud sync. Fallback: type the text
-//! as Unicode key events, which needs no clipboard at all.
+//! Paste can retain the dictated text or restore the previous clipboard.
+//! Temporary paste text is excluded from history; retained text can appear in
+//! local Windows clipboard history. Cloud sync remains disabled. Fallback: type the text
+//! as Unicode key events, with the optional clipboard copy made after typing.
 //!
 //! Neither the text nor the clipboard contents are ever logged.
 
@@ -76,17 +76,29 @@ impl std::error::Error for InjectError {}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InsertReport {
     pub method: Method,
-    /// The user's clipboard was put back (false when it was left alone
-    /// because they copied something else meanwhile).
+    /// The prior clipboard was restored or left unchanged by typing. False
+    /// when dictation was retained or a newer user copy prevented restoration.
     pub clipboard_restored: bool,
+    /// The final text was copied and retained for another paste.
+    pub clipboard_saved: bool,
 }
 
 /// Inserts `text` into the focused window.
 pub fn insert_text(text: &str, method: Method) -> Result<InsertReport, InjectError> {
+    insert_text_with_clipboard(text, method, false)
+}
+
+/// Inserts text and optionally keeps it on the clipboard for both methods.
+pub fn insert_text_with_clipboard(
+    text: &str,
+    method: Method,
+    keep: bool,
+) -> Result<InsertReport, InjectError> {
     if text.is_empty() {
         return Ok(InsertReport {
             method,
             clipboard_restored: true,
+            clipboard_saved: false,
         });
     }
     // Ctrl+V while the hotkey's Ctrl/Win is still down would become a
@@ -94,11 +106,23 @@ pub fn insert_text(text: &str, method: Method) -> Result<InsertReport, InjectErr
     let released = wait_for_modifiers_released(MODIFIER_WAIT);
     let method = if released { method } else { Method::Unicode };
     match method {
-        Method::Clipboard => paste_via_clipboard(text),
-        Method::Unicode => type_unicode(text).map(|()| InsertReport {
-            method: Method::Unicode,
-            clipboard_restored: true,
-        }),
+        Method::Clipboard => paste_via_clipboard(text, keep),
+        Method::Unicode => {
+            type_unicode(text)?;
+            let clipboard_saved = keep
+                && match copy_to_clipboard(text) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        tracing::warn!(%error, "Text inserted, but clipboard copy failed");
+                        false
+                    }
+                };
+            Ok(InsertReport {
+                method: Method::Unicode,
+                clipboard_restored: !clipboard_saved,
+                clipboard_saved,
+            })
+        }
     }
 }
 
@@ -314,23 +338,36 @@ fn utf16_bytes(text: &str) -> Vec<u8> {
         .collect()
 }
 
-fn paste_via_clipboard(text: &str) -> Result<InsertReport, InjectError> {
+/// Clipboard must be open. Retained copies follow local history preferences;
+/// temporary paste data is excluded from monitoring entirely.
+unsafe fn write_dictation_clipboard(text: &str, keep: bool) -> Result<(), InjectError> {
+    EmptyClipboard().map_err(|error| InjectError::Clipboard(error.message()))?;
+    put(u32::from(CF_UNICODETEXT.0), &utf16_bytes(text))?;
+    if !keep {
+        let exclude = RegisterClipboardFormatW(w!("ExcludeClipboardContentFromMonitorProcessing"));
+        let _ = put(exclude, &1u32.to_le_bytes());
+    }
+    let history = RegisterClipboardFormatW(w!("CanIncludeInClipboardHistory"));
+    let cloud = RegisterClipboardFormatW(w!("CanUploadToCloudClipboard"));
+    let _ = put(history, &u32::from(keep).to_le_bytes());
+    let _ = put(cloud, &0u32.to_le_bytes());
+    Ok(())
+}
+
+fn copy_to_clipboard(text: &str) -> Result<(), InjectError> {
+    let _clipboard = Clipboard::open()?;
+    // SAFETY: the clipboard guard holds it open for all writes.
+    unsafe { write_dictation_clipboard(text, true) }
+}
+
+fn paste_via_clipboard(text: &str, keep: bool) -> Result<InsertReport, InjectError> {
     // SAFETY: every clipboard call below happens while the guard holds the
     // clipboard open; memory handed to the clipboard is not touched again.
     unsafe {
         let saved = {
             let _clipboard = Clipboard::open()?;
-            let saved = snapshot();
-            EmptyClipboard().map_err(|error| InjectError::Clipboard(error.message()))?;
-            put(u32::from(CF_UNICODETEXT.0), &utf16_bytes(text))?;
-            // Keep the text out of clipboard history and cloud sync.
-            let exclude =
-                RegisterClipboardFormatW(w!("ExcludeClipboardContentFromMonitorProcessing"));
-            let history = RegisterClipboardFormatW(w!("CanIncludeInClipboardHistory"));
-            let cloud = RegisterClipboardFormatW(w!("CanUploadToCloudClipboard"));
-            let _ = put(exclude, &1u32.to_le_bytes());
-            let _ = put(history, &0u32.to_le_bytes());
-            let _ = put(cloud, &0u32.to_le_bytes());
+            let saved = if keep { Vec::new() } else { snapshot() };
+            write_dictation_clipboard(text, keep)?;
             saved
         };
         let ours = GetClipboardSequenceNumber();
@@ -341,6 +378,13 @@ fn paste_via_clipboard(text: &str) -> Result<InsertReport, InjectError> {
             key_event(VK_V, true),
             key_event(VK_CONTROL.0, true),
         ])?;
+        if keep {
+            return Ok(InsertReport {
+                method: Method::Clipboard,
+                clipboard_restored: false,
+                clipboard_saved: true,
+            });
+        }
         std::thread::sleep(RESTORE_DELAY);
 
         // If the user copied something in the meantime, leave it alone.
@@ -348,6 +392,7 @@ fn paste_via_clipboard(text: &str) -> Result<InsertReport, InjectError> {
             return Ok(InsertReport {
                 method: Method::Clipboard,
                 clipboard_restored: false,
+                clipboard_saved: false,
             });
         }
         let _clipboard = Clipboard::open()?;
@@ -359,6 +404,7 @@ fn paste_via_clipboard(text: &str) -> Result<InsertReport, InjectError> {
         Ok(InsertReport {
             method: Method::Clipboard,
             clipboard_restored: true,
+            clipboard_saved: false,
         })
     }
 }

@@ -10,7 +10,8 @@ param(
     [string]$IdentityName = "Nevdev.OnyxIsland",
     [string]$Publisher = "CN=7BE60B1B-C205-4C0E-AB26-9C89190ED9A1",
     [string]$PublisherDisplayName = "Nevdev",
-    [switch]$SkipBuild
+    [switch]$SkipBuild,
+    [switch]$MsixOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -47,7 +48,7 @@ $makepri = Join-Path $kit.FullName "x64\makepri.exe"
 
 $makensis = @("${env:ProgramFiles(x86)}\NSIS\makensis.exe", "$env:ProgramFiles\NSIS\makensis.exe") |
     Where-Object { Test-Path $_ } | Select-Object -First 1
-if (-not $makensis) { throw "NSIS (makensis.exe) not found" }
+if (-not $MsixOnly -and -not $makensis) { throw "NSIS (makensis.exe) not found" }
 
 # The Visual C++ runtime DLLs, shipped next to the exes (app-local).
 $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -58,7 +59,28 @@ $crt = Get-ChildItem (Join-Path $vs "VC\Redist\MSVC") -Recurse -Directory -Filte
 if (-not $crt) { throw "Visual C++ redistributable DLLs not found" }
 
 # --- Stage ---------------------------------------------------------------
-Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
+# Verify the local cleanup payload before replacing any packaging workspace.
+$cleanupFiles = @(
+    @{ Name = 'onyx-cleanup-270m-r5-selected-q8_0.gguf'; Hash = '760e148a14c0057a086f47efbec76f738ce817901141e45a58d9566dee67cf8f' },
+    @{ Name = 'llama-b11927-bin-win-cpu-x64.zip'; Hash = 'f70b7fe800e683f58fed3199fcf9c961932307f30916498a7758dce5f1d76ce9' }
+)
+foreach ($file in $cleanupFiles) {
+    $source = Join-Path (Join-Path $release 'models') $file.Name
+    if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Missing cleanup payload: $source" }
+    if ((Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash -ne $file.Hash) {
+        throw "Cleanup payload checksum mismatch: $($file.Name)"
+    }
+}
+$resolvedWork = [IO.Path]::GetFullPath($work)
+$targetRoot = [IO.Path]::GetFullPath((Join-Path $root 'target')) + [IO.Path]::DirectorySeparatorChar
+if (-not $resolvedWork.StartsWith($targetRoot, [StringComparison]::OrdinalIgnoreCase)) {
+    throw "Packaging workspace is outside target: $resolvedWork"
+}
+if ((Test-Path -LiteralPath $resolvedWork) -and
+    ((Get-Item -LiteralPath $resolvedWork -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+    throw "Packaging workspace must not be a link: $resolvedWork"
+}
+Remove-Item -LiteralPath $resolvedWork -Recurse -Force -ErrorAction SilentlyContinue
 $stage = Join-Path $work "stage"
 New-Item -ItemType Directory -Force $stage, $dist | Out-Null
 foreach ($exe in "islet.exe", "islet-settings.exe", "islet-asr-worker.exe") {
@@ -67,11 +89,33 @@ foreach ($exe in "islet.exe", "islet-settings.exe", "islet-asr-worker.exe") {
 foreach ($dll in "vcruntime140.dll", "vcruntime140_1.dll") {
     Copy-Item (Join-Path $crt.FullName $dll) $stage
 }
+$models = Join-Path $stage 'models'
+$runtime = Join-Path $models 'ai-cleanup\runtime'
+New-Item -ItemType Directory -Force $runtime | Out-Null
+Copy-Item -LiteralPath (Join-Path (Join-Path $release 'models') $cleanupFiles[0].Name) -Destination $models
+# Runtime code stays inside the package. The app runs this bundled server
+# directly; only the model is copied to writable per-user storage.
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+$runtimeZip = [IO.Compression.ZipFile]::OpenRead((Join-Path (Join-Path $release 'models') $cleanupFiles[1].Name))
+try {
+    foreach ($entry in $runtimeZip.Entries) {
+        $name = [IO.Path]::GetFileName($entry.FullName)
+        if ($name -and ($name.EndsWith('.dll') -or $name -eq 'llama-server.exe' -or $name.StartsWith('LICENSE'))) {
+            [IO.Compression.ZipFileExtensions]::ExtractToFile($entry, (Join-Path $runtime $name), $true)
+        }
+    }
+} finally { $runtimeZip.Dispose() }
+if (-not (Test-Path -LiteralPath (Join-Path $runtime 'llama-server.exe') -PathType Leaf)) {
+    throw 'Pinned runtime archive did not contain llama-server.exe.'
+}
+foreach ($dll in 'vcruntime140.dll', 'vcruntime140_1.dll') {
+    Copy-Item -LiteralPath (Join-Path $crt.FullName $dll) -Destination $runtime
+}
 
 # --- MSIX ----------------------------------------------------------------
 $layout = Join-Path $work "msix"
 New-Item -ItemType Directory -Force $layout | Out-Null
-Copy-Item "$stage\*" $layout
+Copy-Item "$stage\*" $layout -Recurse
 python -I (Join-Path $here "make_assets.py") (Join-Path $root "assets") (Join-Path $layout "Assets")
 if ($LASTEXITCODE -ne 0) { throw "logo generation failed" }
 
@@ -93,9 +137,13 @@ $msix = Join-Path $dist "Onyx_${msixVersion}_x64.msix"
 if ($LASTEXITCODE -ne 0) { throw "makeappx failed" }
 
 # --- Setup .exe ----------------------------------------------------------
+if (-not $MsixOnly) {
 $setup = Join-Path $dist "Onyx-Setup-$version.exe"
 & $makensis /V2 "/DVERSION=$version" "/DPUBLISHER=$PublisherDisplayName" "/DSTAGE=$stage" "/DICON=$(Join-Path $root 'assets\onyx.ico')" "/DOUTFILE=$setup" (Join-Path $here "onyx.nsi")
 if ($LASTEXITCODE -ne 0) { throw "makensis failed" }
+}
 
 Write-Host ""
-Get-Item $msix, $setup | ForEach-Object { "{0,-32} {1,6:N1} MB" -f $_.Name, ($_.Length / 1MB) }
+$outputs = @($msix)
+if (-not $MsixOnly) { $outputs += $setup }
+Get-Item $outputs | ForEach-Object { "{0,-32} {1,6:N1} MB" -f $_.Name, ($_.Length / 1MB) }

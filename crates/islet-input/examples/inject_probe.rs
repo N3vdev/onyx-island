@@ -7,9 +7,15 @@
 
 use std::time::{Duration, Instant};
 
-use islet_input::{insert_text, Method};
+use islet_input::{insert_text_with_clipboard, Method};
 use windows::core::w;
+use windows::Win32::Foundation::HGLOBAL;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows::Win32::System::DataExchange::{
+    CloseClipboard, GetClipboardData, OpenClipboard, RegisterClipboardFormatW,
+};
+use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
+use windows::Win32::System::Ole::CF_UNICODETEXT;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     keybd_event, SetFocus, KEYEVENTF_KEYUP, VK_MENU,
 };
@@ -33,6 +39,12 @@ fn read_text(hwnd: HWND) -> String {
 }
 
 fn main() {
+    let keep_clipboard = std::env::args().any(|arg| arg == "--keep-clipboard");
+    let text_b = std::env::args()
+        .skip_while(|arg| arg != "--history-marker")
+        .nth(1)
+        .map_or_else(|| TEXT_B.to_owned(), |marker| format!("{TEXT_B} {marker}"));
+    let expected = format!("{TEXT_A}{text_b}");
     // SAFETY: creates and drives a window on this thread.
     let hwnd = unsafe {
         CreateWindowExW(
@@ -74,13 +86,26 @@ fn main() {
     let notify = hwnd.0 as isize;
     let worker = std::thread::spawn(move || {
         // Only send while our window is still the foreground one.
-        let first = insert_text(TEXT_A, Method::Clipboard);
-        let second = insert_text(TEXT_B, Method::Unicode);
+        let first = if unsafe { GetForegroundWindow() } == HWND(notify as *mut _) {
+            insert_text_with_clipboard(TEXT_A, Method::Clipboard, keep_clipboard)
+        } else {
+            Err(islet_input::InjectError::Input("Probe lost focus".into()))
+        };
+        let copied_first = !keep_clipboard || clipboard_matches(TEXT_A);
+        // Let the edit control consume the paste before a second dictation
+        // intentionally replaces the retained clipboard contents.
+        std::thread::sleep(Duration::from_millis(250));
+        let second = if unsafe { GetForegroundWindow() } == HWND(notify as *mut _) {
+            insert_text_with_clipboard(&text_b, Method::Unicode, keep_clipboard)
+        } else {
+            Err(islet_input::InjectError::Input("Probe lost focus".into()))
+        };
+        let copied_second = !keep_clipboard || clipboard_matches(&text_b);
         // SAFETY: posts to our own window.
         unsafe {
             let _ = PostMessageW(Some(HWND(notify as *mut _)), WM_APP, WPARAM(0), LPARAM(0));
         }
-        (first, second)
+        (first, second, copied_first, copied_second)
     });
 
     let mut message = MSG::default();
@@ -107,14 +132,74 @@ fn main() {
             std::thread::sleep(Duration::from_millis(5));
         }
     }
-    let (first, second) = worker.join().expect("worker");
+    let (first, second, copied_first, copied_second) = worker.join().expect("worker");
     println!("clipboard method: {first:?}");
     println!("unicode method:   {second:?}");
 
     let got = read_text(hwnd).replace("\r\n", "\n");
-    let expected = format!("{TEXT_A}{TEXT_B}");
     println!("text in box matches: {}", got == expected);
-    if got != expected {
-        println!("expected: {expected:?}\n     got: {got:?}");
+    assert!(first.is_ok() && second.is_ok());
+    assert_eq!(first.unwrap().clipboard_saved, keep_clipboard);
+    assert_eq!(second.unwrap().clipboard_saved, keep_clipboard);
+    assert!(copied_first && copied_second);
+    assert!(got == expected);
+    println!("clipboard retention checks passed: keep={keep_clipboard}");
+}
+
+fn clipboard_matches(expected: &str) -> bool {
+    // Read only for the synthetic retention probe; never print clipboard text.
+    unsafe {
+        let mut opened = false;
+        for _ in 0..20 {
+            if OpenClipboard(None).is_ok() {
+                opened = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if !opened {
+            return false;
+        }
+        let result = (|| {
+            let handle = GetClipboardData(u32::from(CF_UNICODETEXT.0)).ok()?;
+            let global = HGLOBAL(handle.0);
+            let size = GlobalSize(global) / 2;
+            let pointer = GlobalLock(global).cast::<u16>();
+            if pointer.is_null() {
+                return None;
+            }
+            let units = std::slice::from_raw_parts(pointer, size);
+            let end = units.iter().position(|u| *u == 0).unwrap_or(size);
+            let matches = String::from_utf16_lossy(&units[..end]) == expected;
+            let _ = GlobalUnlock(global);
+            let exclude =
+                RegisterClipboardFormatW(w!("ExcludeClipboardContentFromMonitorProcessing"));
+            let history = RegisterClipboardFormatW(w!("CanIncludeInClipboardHistory"));
+            let cloud = RegisterClipboardFormatW(w!("CanUploadToCloudClipboard"));
+            Some(
+                matches
+                    && GetClipboardData(exclude).is_err()
+                    && clipboard_flag(history) == Some(1)
+                    && clipboard_flag(cloud) == Some(0),
+            )
+        })()
+        .unwrap_or(false);
+        let _ = CloseClipboard();
+        result
     }
+}
+
+unsafe fn clipboard_flag(format: u32) -> Option<u32> {
+    let handle = unsafe { GetClipboardData(format) }.ok()?;
+    let global = HGLOBAL(handle.0);
+    if unsafe { GlobalSize(global) } < 4 {
+        return None;
+    }
+    let pointer = unsafe { GlobalLock(global) }.cast::<u32>();
+    if pointer.is_null() {
+        return None;
+    }
+    let value = unsafe { pointer.read_unaligned() };
+    let _ = unsafe { GlobalUnlock(global) };
+    Some(value)
 }
