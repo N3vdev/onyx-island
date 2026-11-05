@@ -23,14 +23,21 @@ $release = Join-Path $root "target\release"
 
 $version = ([regex]'(?m)^version = "([^"]+)"').Match((Get-Content (Join-Path $root "Cargo.toml") -Raw)).Groups[1].Value
 $msixVersion = "$version.0"
+$plannedMsix = Join-Path $dist "Onyx_${msixVersion}_x64.msix"
+if (Test-Path -LiteralPath $plannedMsix) {
+    throw "Package version $msixVersion already exists. Increment the workspace version in Cargo.toml before creating another package; uploaded versions must not be reused for changed contents."
+}
 Write-Host "Onyx $version"
 
 # --- Build ---------------------------------------------------------------
 if (-not $SkipBuild) {
-    Get-Process islet, islet-settings, islet-asr-worker -ErrorAction SilentlyContinue | Stop-Process -Force
+    $workspaceExecutables = @('islet.exe','islet-settings.exe','islet-asr-worker.exe') | ForEach-Object { Join-Path $release $_ }
+    Get-Process islet, islet-settings, islet-asr-worker -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path -in $workspaceExecutables } | Stop-Process -Force
     Start-Sleep -Seconds 1
     Push-Location $root
     try {
+        & (Join-Path $root 'tools\build-converter.ps1')
         # Through cmd: Windows PowerShell turns cargo's progress on stderr into
         # errors whenever the output is redirected.
         cmd /c "cargo build --release -p islet-app -p islet-settings -p islet-asr-worker 2>&1"
@@ -61,7 +68,6 @@ if (-not $crt) { throw "Visual C++ redistributable DLLs not found" }
 # --- Stage ---------------------------------------------------------------
 # Verify the local cleanup payload before replacing any packaging workspace.
 $cleanupFiles = @(
-    @{ Name = 'onyx-cleanup-270m-r5-selected-q8_0.gguf'; Hash = '760e148a14c0057a086f47efbec76f738ce817901141e45a58d9566dee67cf8f' },
     @{ Name = 'llama-b11927-bin-win-cpu-x64.zip'; Hash = 'f70b7fe800e683f58fed3199fcf9c961932307f30916498a7758dce5f1d76ce9' }
 )
 foreach ($file in $cleanupFiles) {
@@ -86,17 +92,20 @@ New-Item -ItemType Directory -Force $stage, $dist | Out-Null
 foreach ($exe in "islet.exe", "islet-settings.exe", "islet-asr-worker.exe") {
     Copy-Item (Join-Path $release $exe) $stage
 }
+if (-not (Test-Path -LiteralPath (Join-Path $release 'converter\Onyx.Converter.exe') -PathType Leaf)) {
+    throw 'Converter is missing. Run tools/build-converter.ps1 before packaging.'
+}
+Copy-Item -LiteralPath (Join-Path $release 'converter') -Destination (Join-Path $stage 'converter') -Recurse
 foreach ($dll in "vcruntime140.dll", "vcruntime140_1.dll") {
     Copy-Item (Join-Path $crt.FullName $dll) $stage
 }
 $models = Join-Path $stage 'models'
 $runtime = Join-Path $models 'ai-cleanup\runtime'
 New-Item -ItemType Directory -Force $runtime | Out-Null
-Copy-Item -LiteralPath (Join-Path (Join-Path $release 'models') $cleanupFiles[0].Name) -Destination $models
 # Runtime code stays inside the package. The app runs this bundled server
-# directly; only the model is copied to writable per-user storage.
+# directly; model weights download separately to writable per-user storage.
 Add-Type -AssemblyName System.IO.Compression.FileSystem
-$runtimeZip = [IO.Compression.ZipFile]::OpenRead((Join-Path (Join-Path $release 'models') $cleanupFiles[1].Name))
+$runtimeZip = [IO.Compression.ZipFile]::OpenRead((Join-Path (Join-Path $release 'models') $cleanupFiles[0].Name))
 try {
     foreach ($entry in $runtimeZip.Entries) {
         $name = [IO.Path]::GetFileName($entry.FullName)

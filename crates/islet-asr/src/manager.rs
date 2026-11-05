@@ -170,7 +170,6 @@ impl ModelManager {
         let mut complete = true;
         for file in addon.files {
             if Some(file.name) == addon.archive && self.runtime_unpacked(addon) {
-                present += file.size;
                 continue;
             }
             match file_size(&dir.join(file.name)) {
@@ -191,8 +190,15 @@ impl ModelManager {
         }
     }
 
-    /// Downloads an add-on and unpacks its runtime. Resumes like
-    /// [`Self::download`].
+    /// Bytes transferred when installing, excluding an already bundled runtime.
+    #[must_use]
+    pub fn addon_download_size(&self, addon: &AddOn) -> u64 {
+        addon.files.iter().filter(|file| {
+            Some(file.name) != addon.archive || !self.runtime_unpacked(addon)
+        }).map(|file| file.size).sum()
+    }
+
+    /// Downloads and verifies an add-on, resuming interrupted transfers.
     pub fn download_addon(
         &self,
         addon: &AddOn,
@@ -201,17 +207,18 @@ impl ModelManager {
     ) -> Result<(), ManagerError> {
         let dir = self.addon_dir(addon);
         fs::create_dir_all(&dir)?;
-        let total = addon.total_size();
+        let total = self.addon_download_size(addon);
         let mut done = 0u64;
         progress(Progress { done, total });
         for file in addon.files {
             let is_archive = Some(file.name) == addon.archive;
-            if !(is_archive && self.runtime_unpacked(addon)) {
-                download_file_from(file, &dir, &self.bundled, done, total, progress, cancel)?;
-                if is_archive {
-                    unpack(&dir.join(file.name), &dir.join(AddOn::RUNTIME_DIR))?;
-                    let _ = fs::remove_file(dir.join(file.name));
-                }
+            if is_archive && self.runtime_unpacked(addon) {
+                continue;
+            }
+            download_file_from(file, &dir, &self.bundled, done, total, progress, cancel)?;
+            if is_archive {
+                unpack(&dir.join(file.name), &dir.join(AddOn::RUNTIME_DIR))?;
+                let _ = fs::remove_file(dir.join(file.name));
             }
             done += file.size;
             progress(Progress { done, total });
@@ -501,6 +508,7 @@ fn fetch_into(
     }
 
     let agent = ureq::AgentBuilder::new()
+        .user_agent("Onyx/1.0")
         .timeout_connect(Duration::from_secs(15))
         .timeout_read(Duration::from_secs(30))
         .build();
@@ -891,6 +899,8 @@ mod tests {
             archive: Some("runtime.zip"),
             ..addon
         };
+        assert_eq!(manager.addon_download_size(&addon), 1000);
+        assert_eq!(manager.addon_status(&addon), ModelStatus::Missing);
         manager
             .download_addon(&addon, &mut |_| {}, &AtomicBool::new(false))
             .unwrap();

@@ -11,13 +11,40 @@ use islet_core::config::{ExpandTrigger, IdleGlance, IdleStyle, MonitorChoice, Sc
 use crate::{Page, SettingsApp};
 
 const BG: Color32 = Color32::from_rgb(16, 17, 19);
-const SIDEBAR: Color32 = Color32::from_rgb(21, 22, 24);
-const CARD: Color32 = Color32::from_rgb(26, 27, 30);
+const SIDEBAR: Color32 = BG;
+const CARD: Color32 = Color32::from_rgb(23, 24, 27);
 const CARD_LINE: Color32 = Color32::from_rgb(47, 49, 53);
 const TEXT: Color32 = Color32::from_rgb(236, 237, 242);
 const MUTED: Color32 = Color32::from_rgb(166, 170, 178);
 const ACCENT: Color32 = Color32::from_rgb(164, 204, 180);
 const DANGER: Color32 = Color32::from_rgb(255, 110, 110);
+
+/// Mouse-wheel scrolling at the speed of other Windows apps. egui moves 40
+/// points per wheel notch; Windows apps move the user's "lines to scroll at a
+/// time" (3 by default), about 100 points a notch.
+pub fn install_scrolling(ctx: &egui::Context) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SystemParametersInfoW, SPI_GETWHEELSCROLLLINES, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+    };
+    /// Points per line of text, as Windows apps scroll it.
+    const LINE: f32 = 33.0;
+    let mut lines: u32 = 3;
+    // SAFETY: SPI_GETWHEELSCROLLLINES writes one u32 to the pointer.
+    let read = unsafe {
+        SystemParametersInfoW(
+            SPI_GETWHEELSCROLLLINES,
+            0,
+            Some((&raw mut lines).cast()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    };
+    // 0 turns wheel scrolling off and u32::MAX means "a page at a time";
+    // neither maps to a line count, so keep the Windows default there.
+    if read.is_err() || lines == 0 || lines > 20 {
+        lines = 3;
+    }
+    ctx.options_mut(|options| options.input_options.line_scroll_speed = lines as f32 * LINE);
+}
 
 pub fn install_theme(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
@@ -144,7 +171,7 @@ pub fn draw(app: &mut SettingsApp, ctx: &egui::Context) {
     }
     let previous_page = app.page;
     egui::SidePanel::left("nav")
-        .exact_width(164.0)
+        .exact_width(150.0)
         .resizable(false)
         .frame(
             egui::Frame::new()
@@ -159,7 +186,7 @@ pub fn draw(app: &mut SettingsApp, ctx: &egui::Context) {
         .frame(
             egui::Frame::new()
                 .fill(BG)
-                .inner_margin(Margin::symmetric(28, 20)),
+                .inner_margin(Margin::symmetric(32, 20)),
         )
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -180,61 +207,19 @@ pub fn draw(app: &mut SettingsApp, ctx: &egui::Context) {
                     );
                 });
             });
-            ui.add_space(18.0);
-            let (stage, _) = ui.allocate_exact_size(
-                egui::vec2(
-                    ui.available_width(),
-                    if app.config.widgets.calculator {
-                        264.0
-                    } else {
-                        216.0
-                    },
-                ),
+            // Reserve only the resting pill's space. The native transparent
+            // window extends over the page so expansion never reflows controls.
+            ui.add_space(12.0);
+            let (dock, _) = ui.allocate_exact_size(
+                egui::vec2(ui.available_width(), 64.0),
                 egui::Sense::hover(),
             );
-            ui.painter().rect(
-                stage,
-                CornerRadius::same(12),
-                Color32::from_rgb(19, 20, 22),
-                Stroke::new(1.0, CARD_LINE),
-                egui::StrokeKind::Inside,
-            );
-            dot_grid(ui, stage.shrink(1.0));
-            ui.painter().text(
-                stage.left_top() + egui::vec2(16.0, 16.0),
-                egui::Align2::LEFT_TOP,
-                "Your island",
-                bold_font(12.0),
-                TEXT,
-            );
-            let caption = if app.preview.connected() {
-                match app.config.general.expand_on {
-                    ExpandTrigger::Hover => "Hover to expand",
-                    ExpandTrigger::Click => "Click to expand",
-                }
-            } else {
-                "Connecting to island..."
-            };
-            ui.painter().text(
-                stage.right_bottom() - egui::vec2(16.0, 12.0),
-                egui::Align2::RIGHT_BOTTOM,
-                caption,
-                FontId::proportional(11.0),
-                MUTED,
-            );
-            let slot = egui::Rect::from_center_size(
-                stage.center() + egui::vec2(0.0, 9.0),
-                egui::vec2(
-                    stage.width().min(720.0),
-                    if app.config.widgets.calculator {
-                        232.0
-                    } else {
-                        168.0
-                    },
-                ),
+            let slot = egui::Rect::from_min_size(
+                egui::pos2(dock.center().x - dock.width().min(720.0) / 2.0, dock.top()),
+                egui::vec2(dock.width().min(720.0), 280.0),
             );
             app.preview.update(ctx, slot, None);
-            ui.add_space(24.0);
+            ui.add_space(20.0);
             let mut scroll = egui::ScrollArea::vertical()
                 .id_salt(("settings-page", app.page as usize))
                 .auto_shrink([false, false]);
@@ -280,7 +265,7 @@ fn sidebar(app: &mut SettingsApp, ui: &mut egui::Ui) {
         );
         ui.label(RichText::new("Onyx").font(bold_font(19.0)));
     });
-    ui.add_space(25.0);
+    ui.add_space(38.0);
     let pages = [
         (Page::General, "General"),
         (Page::NowPlaying, "Now Playing"),
@@ -289,7 +274,7 @@ fn sidebar(app: &mut SettingsApp, ui: &mut egui::Ui) {
     ];
     for (page, label) in pages {
         let (rect, response) =
-            ui.allocate_exact_size(egui::vec2(ui.available_width(), 36.0), egui::Sense::click());
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 40.0), egui::Sense::click());
         if response.clicked() {
             app.page = page;
         }
@@ -298,7 +283,7 @@ fn sidebar(app: &mut SettingsApp, ui: &mut egui::Ui) {
     ui.add_space((ui.available_height() - 102.0).max(12.0));
     divider(ui);
     let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), 36.0), egui::Sense::click());
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 40.0), egui::Sense::click());
     if response.clicked() {
         app.page = Page::About;
     }
@@ -460,12 +445,11 @@ pub(crate) fn header(ui: &mut egui::Ui, title: &str, subtitle: &str) {
 }
 
 pub(crate) fn card(ui: &mut egui::Ui, title: &str, contents: impl FnOnce(&mut egui::Ui)) {
-    ui.label(RichText::new(title).font(bold_font(12.0)).color(MUTED));
+    ui.label(RichText::new(title).font(bold_font(14.0)).color(TEXT));
     egui::Frame::new()
         .fill(CARD)
-        .stroke(Stroke::new(1.0, CARD_LINE))
-        .corner_radius(CornerRadius::same(10))
-        .inner_margin(Margin::symmetric(18, 16))
+        .corner_radius(CornerRadius::same(14))
+        .inner_margin(Margin::symmetric(20, 18))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             contents(ui);
@@ -827,6 +811,10 @@ fn now_playing(app: &mut SettingsApp, ui: &mut egui::Ui) {
 fn widgets(app: &mut SettingsApp, ui: &mut egui::Ui) {
     header(ui, "Widgets", "Small tools, right inside your island.");
     card(ui, "Available widgets", |ui| {
+        row(ui,"File converter","Drag files onto the island, then drop on a format or choose one. Results are saved beside the originals.",|ui| {
+            toggle(ui,&mut app.config.widgets.file_converter,"File converter");
+        });
+        divider(ui);
         row(
             ui,
             "Calculator",

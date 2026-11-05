@@ -1,4 +1,6 @@
 //! The island window, its UI-thread state machine, and the render thread.
+mod file_converter;
+mod gestures;
 
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::thread::JoinHandle;
@@ -81,6 +83,7 @@ const TIMER_MEDIA_CONDENSE: usize = 10;
 const TIMER_STATS: usize = 11;
 const TIMER_CLOCK: usize = 12;
 const TIMER_RESUME: usize = 13;
+const TIMER_GESTURE: usize = 14;
 /// After this long without a media session, play is sent to the relaunched
 /// player's window directly (Spotify reports no session until it plays).
 const RESUME_NUDGE_AFTER: std::time::Duration = std::time::Duration::from_secs(4);
@@ -180,6 +183,7 @@ enum WindowRegion {
 }
 
 enum RenderCommand {
+    Pull(f32, f32, bool),
     Depart,
     Arrive,
     MediaHover(Option<MediaHover>),
@@ -206,6 +210,14 @@ struct Demo {
 }
 
 pub struct IslandHost {
+    gesture: Option<gestures::Drag>,
+    file_drop: Option<crate::file_drop::Registration>,
+    converter_job: Option<crate::converter::Worker>,
+    converter_tx: Sender<crate::converter::Update>,
+    converter_rx: Receiver<crate::converter::Update>,
+    converter_generation: u64,
+    converter_paths: Vec<std::path::PathBuf>,
+    converter_outputs: Vec<std::path::PathBuf>,
     preview: Option<HWND>,
     preview_pending: Option<Option<HWND>>,
     appearance: [f32; 4],
@@ -310,6 +322,9 @@ impl IslandHost {
         let config = read_config(&shared);
         let layout = compute_window_layout(&config, config.general.position.home_is_top())?;
         apply_window_layout(hwnd, layout)?;
+        let file_drop = crate::file_drop::Registration::new(hwnd)?;
+        file_drop.set_enabled(config.widgets.file_converter);
+        let (converter_tx,converter_rx)=crate::converter::channel();
 
         let hit = Arc::new(Mutex::new(HitRegion::default()));
         let (tx, rx) = unbounded();
@@ -340,6 +355,9 @@ impl IslandHost {
         };
 
         let mut host = Box::new(Self {
+            gesture: None,
+            file_drop: Some(file_drop), converter_job: None, converter_tx, converter_rx,
+            converter_generation: 0, converter_paths: Vec::new(), converter_outputs: Vec::new(),
             preview: None,
             preview_pending: None,
             appearance: [
@@ -459,6 +477,8 @@ impl IslandHost {
     }
 
     pub fn shutdown(&mut self) {
+        self.file_drop = None;
+        self.converter_job = None;
         self.release_calculator_focus();
         unsafe {
             let _ = KillTimer(Some(self.hwnd), TIMER_HOVER_EXPAND);
@@ -491,6 +511,9 @@ impl IslandHost {
 
     pub fn apply_config(&mut self) {
         let config = read_config(&self.shared);
+        if let Some(drop)=&self.file_drop {
+            drop.set_enabled(config.widgets.file_converter && !self.state.converter.as_ref().is_some_and(|c|c.stage==islet_core::converter::ConversionStage::Running));
+        }
         self.appearance = [
             config.general.top_margin_percent,
             config.general.bottom_margin_percent,
@@ -673,6 +696,12 @@ impl IslandHost {
                 Some(LRESULT(0))
             }
             WM_NCHITTEST => Some(self.hit_test(lparam)),
+            crate::file_drop::MESSAGE => { self.on_file_drop(); Some(LRESULT(0)) }
+            crate::converter::MESSAGE => { self.on_converter_update(); Some(LRESULT(0)) }
+            WM_MOUSEMOVE if self.gesture.is_some() => {
+                self.move_gesture();
+                Some(LRESULT(0))
+            }
             WM_MOUSEMOVE if self.scrubbing => {
                 if let Some((x, y, width)) = self.media_point(lparam) {
                     self.set_scrub(scrub_fraction(x, y, width, true));
@@ -714,7 +743,7 @@ impl IslandHost {
             }
             WM_MOUSELEAVE => {
                 self.tracking_mouse = false;
-                if !self.scrubbing && !self.volume_dragging {
+                if self.gesture.is_none() && !self.scrubbing && !self.volume_dragging {
                     self.set_media_hover(None);
                     self.set_widget_hover(None);
                     self.dispatch_hover(false);
@@ -722,6 +751,7 @@ impl IslandHost {
                 Some(LRESULT(0))
             }
             WM_LBUTTONDOWN => {
+                if self.begin_gesture() { return Some(LRESULT(0)); }
                 // While the island is still growing or shrinking, what is under
                 // the pointer on screen is not the layout the controls use.
                 // Ignore the whole press rather than guess.
@@ -757,6 +787,10 @@ impl IslandHost {
                 Some(LRESULT(0))
             }
             WM_LBUTTONUP => {
+                if self.gesture.is_some() {
+                    self.finish_gesture(true);
+                    return Some(LRESULT(0));
+                }
                 let armed = std::mem::take(&mut self.press_armed);
                 if self.scrubbing {
                     self.finish_scrub(true);
@@ -764,7 +798,7 @@ impl IslandHost {
                     self.finish_volume();
                 } else if !armed || !self.shape_settled() {
                     // Pressed or released mid-animation: not a click.
-                } else if self.handle_widget_click(lparam) {
+                } else if self.handle_converter_click(lparam) || self.handle_widget_click(lparam) {
                     // Widget controls never toggle or operate the music player.
                 } else if self.media_bubble_hit(lparam) {
                     self.switch_player();
@@ -779,6 +813,10 @@ impl IslandHost {
                 }
                 self.focus_calculator();
                 Some(LRESULT(0))
+            }
+            WM_CHAR if self.converter_visible() && self.calculator_keyboard_active() => Some(LRESULT(0)),
+            WM_KEYDOWN if self.converter_visible() && self.calculator_keyboard_active() => {
+                self.handle_converter_key(wparam.0 as u16).then_some(LRESULT(0))
             }
             WM_CHAR if self.calculator_keyboard_active() => {
                 if !calculator_shortcut_held() {
@@ -813,6 +851,7 @@ impl IslandHost {
                 None
             }
             WM_CAPTURECHANGED => {
+                if self.gesture.is_some() { self.finish_gesture(false); }
                 if self.scrubbing {
                     self.finish_scrub(false);
                 } else if self.volume_dragging {
@@ -904,7 +943,7 @@ impl IslandHost {
                 Some(LRESULT(0))
             }
             WM_APP_SETTLED => {
-                if wparam.0 == self.generation {
+                if wparam.0 == self.generation && self.gesture.is_none() {
                     self.morph_box = None;
                     if self.traveling {
                         self.traveling = false;
@@ -991,7 +1030,7 @@ impl IslandHost {
             let reading = sampler.full();
             let hot = sampler.hot();
             self.dispatch_all([IslandEvent::SetStats(reading), IslandEvent::SetCpuHot(hot)]);
-        } else if self.state.glance == Some(IdleGlance::Stats) {
+        } else if self.state.glance == Some(IdleGlance::Stats) || self.state.compact_widget == Some(IdleGlance::Stats) {
             let (cpu, memory) = sampler.light();
             let hot = sampler.hot();
             self.dispatch_all([
@@ -1009,7 +1048,7 @@ impl IslandHost {
     /// minute, and none when the clock is not in use.
     fn update_clock(&mut self) {
         let wanted = matches!(
-            self.state.glance,
+            self.state.compact_widget.or(self.state.glance),
             Some(IdleGlance::Clock)
         );
         unsafe {
@@ -1068,6 +1107,7 @@ impl IslandHost {
     /// The window already spans the work area, so the renderer simply springs
     /// the same pill to the other edge.
     fn update_tucked(&mut self) {
+        if self.gesture.is_some() { return; }
         if self.preview.is_some() || self.preview_pending.is_some() {
             return;
         }
@@ -1425,6 +1465,7 @@ impl IslandHost {
     /// Hover in or out of the island. The second player's bubble is a
     /// button: resting on it keeps the island as it is instead of expanding.
     fn dispatch_hover(&mut self, inside: bool) {
+        if self.gesture.is_some() { return; }
         if inside {
             let on_switcher = self.cursor_on_media_bubble();
             self.dispatch_all([
@@ -1469,7 +1510,7 @@ impl IslandHost {
             && self.state.dictation.is_none()
             && !matches!(
                 self.state.primary_card(),
-                Some(islet_core::ContentCard::Calculator(_))
+                Some(islet_core::ContentCard::Calculator(_) | islet_core::ContentCard::Converter(_))
             )
             && self.state.media.as_ref().is_some_and(|media| media.playing);
         match (wanted, self.loopback.is_some()) {
@@ -1544,7 +1585,7 @@ impl IslandHost {
             && self.preview_pending.is_none()
             && matches!(
                 self.state.primary_card(),
-                Some(islet_core::ContentCard::Calculator(_))
+                Some(islet_core::ContentCard::Calculator(_) | islet_core::ContentCard::Converter(_))
             )
     }
 
@@ -1608,6 +1649,7 @@ impl IslandHost {
     }
 
     fn update_widget_hover(&mut self) {
+        self.update_converter_hover();
         let mut point = POINT::default();
         let hover = if unsafe { GetCursorPos(&mut point) }.is_ok()
             && unsafe { ScreenToClient(self.hwnd, &mut point) }.as_bool()
@@ -1934,6 +1976,13 @@ impl IslandHost {
     }
 
     fn send_snapshot(&mut self) {
+        if self.gesture.is_some() && (self.state.expanded || self.state.dictation.is_some()
+            || self.state.needs_input.is_some() || self.state.done.is_some() || self.state.converter.is_some()) {
+            self.gesture = None;
+            unsafe { let _ = KillTimer(Some(self.hwnd), TIMER_GESTURE); let _ = ReleaseCapture(); }
+            let _ = self.tx.send(RenderCommand::Pull(0.0, 0.0, false));
+        }
+
         self.update_calculator_activation();
         if !self.calculator_keyboard_available() {
             self.release_calculator_focus();
@@ -2154,11 +2203,21 @@ impl IslandHost {
 
     fn on_timer(&mut self, id: usize) {
         match id {
+            TIMER_GESTURE => {
+                if self.gesture.is_some() {
+                    self.move_gesture();
+                    if unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(1) } >= 0 {
+                        self.finish_gesture(true);
+                    }
+                } else {
+                    unsafe { let _ = KillTimer(Some(self.hwnd), TIMER_GESTURE); }
+                }
+            }
             TIMER_HOVER_EXPAND => {
                 unsafe {
                     let _ = KillTimer(Some(self.hwnd), TIMER_HOVER_EXPAND);
                 }
-                self.dispatch(IslandEvent::HoverExpandElapsed);
+                if self.gesture.is_none() { self.dispatch(IslandEvent::HoverExpandElapsed); }
             }
             TIMER_HOVER_COLLAPSE => {
                 unsafe {
@@ -2791,6 +2850,11 @@ fn apply_command(
     generation: &mut usize,
 ) -> bool {
     match command {
+        RenderCommand::Pull(x, y, held) => {
+            renderer.set_pull(x, y, held, clock_now());
+            *dirty = true;
+            false
+        }
         RenderCommand::Depart => {
             renderer.depart_surface(clock_now(), surface_animations_enabled());
             *dirty = true;
@@ -2947,11 +3011,12 @@ fn compute_window_layout(config: &Config, anchor_top: bool) -> WinResult<WindowL
         let height = (work.bottom - work.top).max(1);
         (height, work.top, height as f32 * 96.0 / dpi as f32)
     } else {
-        let logical_height = if config.widgets.calculator {
-            240.0
-        } else {
-            WINDOW_LOGICAL_HEIGHT
-        };
+        // Drag conversion can open a taller card without changing settings.
+        // Include the supported expanded scale and the configured edge margin.
+        let work_height=(work.bottom-work.top) as f32*96.0/dpi as f32;
+        let logical_height=(islet_core::converter::HEIGHT*1.25+24.0
+            +work_height*config.general.bottom_margin_percent.clamp(0.0,5.0)/100.0)
+            .max(WINDOW_LOGICAL_HEIGHT).min(work_height);
         let height = (logical_height * dpi as f32 / 96.0).round() as i32;
         (height.max(1), work.bottom - height, logical_height)
     };

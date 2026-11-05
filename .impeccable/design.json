@@ -1,6 +1,6 @@
 {
   "schemaVersion": 2,
-  "generatedAt": "2026-10-27T12:28:39.1766314Z",
+  "generatedAt": "2026-11-01T10:29:59.704818+00:00",
   "title": "Design System: Islet Settings",
   "extensions": {
     "colorMeta": {
@@ -216,6 +216,11 @@
         "name": "settled-widget",
         "value": "event-driven; existing finite morph and cross-fade",
         "purpose": "Unchanged settled snapshots skip redraw; calculator input adds no polling worker. Existing media and dictation motion remains independent."
+      },
+      {
+        "name": "finite-conversion",
+        "value": "event-driven; existing finite island morph",
+        "purpose": "Native drag, input and posted worker updates drive converter changes; no continuous animation or polling loop for settled cards."
       }
     ],
     "typographyMeta": {
@@ -227,7 +232,8 @@
     "notes": [
       "Tonal ramps are synthesized OKLCH panel aids, not additional shipped palette tokens.",
       "Native egui components are represented by portable HTML/CSS visual translations; snippet focus states approximate toolkit behavior. No runtime performance claims are made.",
-      "Widget dimensions are native logical units, uniformly scaled by the existing expanded-size preference. Native calculator key labels use the incumbent renderer typography; they do not introduce a shared display-font token."
+      "Widget dimensions are native logical units, uniformly scaled by the existing expanded-size preference. Native calculator key labels use the incumbent renderer typography; they do not introduce a shared display-font token.",
+      "Converter retains the media composition in a roomier 496 x 160 shell: 112-square preview centered at (4,24), 34-unit preview corners, right column x132 width340. On-demand Shell thumbnail is a 128-square premultiplied BGRA image returned through catalog.preview; missing thumbnails use native file geometry and extension. Title/subtitle y16/y42; formats are 32 high at y72/y112 with 8-unit gaps. Outcome heading y70, message y96 height24, progress y122; close y16. Footer actions are 340 x 26 at (132,126), radius10; Complete green fill18%/27%, others white8%/16%. Full/partial completion use distinct text without a success-check badge. Settings preview dimensions are unchanged by this layout revision."
     ]
   },
   "components": [
@@ -295,17 +301,24 @@
       "description": "Portable appearance translation of numeric, operator, and Equals keys in the native calculator. Native input uses click and hover; browser focus is illustrative.",
       "html": "<div class=\"ds-calc-keys\"><button>7</button><button class=\"ds-op\">+</button><button class=\"ds-equals\">=</button></div>",
       "css": ".ds-calc-keys{display:flex;gap:6px;background:#101113;padding:12px}.ds-calc-keys button{width:52px;height:24px;border:0;border-radius:8px;background:rgba(255,255,255,.085);color:#ecedf2;font:500 12px sans-serif}.ds-calc-keys .ds-op{background:rgba(164,204,180,.13)}.ds-calc-keys .ds-equals{background:#a4ccb4;color:#101412}.ds-calc-keys button:hover{background:rgba(255,255,255,.2)}.ds-calc-keys .ds-op:hover{background:rgba(164,204,180,.2)}.ds-calc-keys .ds-equals:hover{background:rgba(164,204,180,.8)}.ds-calc-keys button:focus-visible{outline:1px solid #a4ccb4;outline-offset:2px}"
+    },
+    {
+      "name": "Converter format",
+      "kind": "button",
+      "description": "Portable translation of the native roomier-layout format controls: 324-unit right column, 36-unit targets, up to four columns and two rows. Native keyboard focus shares hover fill.",
+      "html": "<div class=\"ds-converter-formats\"><button>PNG</button><button>JPG</button></div>",
+      "css": ".ds-converter-formats{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;width:324px;padding:12px;background:#000;border-radius:38px}.ds-converter-formats button{height:36px;border:0;border-radius:10px;background:rgba(255,255,255,.11);color:#f0f1f4;font:500 12px \"Nunito\",sans-serif}.ds-converter-formats button:hover,.ds-converter-formats button:focus-visible{background:rgba(255,255,255,.20)}.ds-converter-formats button:focus-visible{outline:none}"
     }
   ],
   "narrative": {
     "northStar": "A compact desktop control workspace with the real island",
-    "overview": "Near-black canvas, charcoal navigation, softly outlined graphite groups, and rounded Nunito text make a restrained native control workspace. Fine static dots identify the island preview and full-screen sizing canvas. The actual island supplies the live content; settings supplies clear controls and feedback.\n\nThis refresh supersedes the former purple atmosphere and wide navigation rail. It preserves the bundled regular and bold Nunito faces, matching native Windows titlebar, right-aligned controls, visible focus, and real island preview. Source authority is `crates/islet-settings/src/ui.rs`, `customize.rs`, `preview.rs`, and `main.rs`, with sizing behavior in core configuration, island layout, app window integration, and renderer. Measurements are egui logical points, expressed as px in portable tokens; they are not physical screenshot pixels. This record governs settings and the shipped widget extension; the island retains its independent visual language. Widget source authority is `crates/islet-render/src/widgets.rs`, `crates/islet-core/src/widgets.rs`, `crates/islet-core/src/island.rs`, and `crates/islet-app/src/island_window.rs`.",
+    "overview": "Near-black canvas, charcoal navigation, softly outlined graphite groups, and rounded Nunito text make a restrained native control workspace. Fine static dots identify the island preview and full-screen sizing canvas. The actual island supplies the live content; settings supplies clear controls and feedback.\n\nThis refresh supersedes the former purple atmosphere and wide navigation rail. It preserves the bundled regular and bold Nunito faces, matching native Windows titlebar, right-aligned controls, visible focus, and real island preview. Source authority is `crates/islet-settings/src/ui.rs`, `customize.rs`, `preview.rs`, and `main.rs`, with sizing behavior in core configuration, island layout, app window integration, and renderer. Measurements are egui logical points, expressed as px in portable tokens; they are not physical screenshot pixels. This record governs settings and the shipped widget and converter extensions; the island retains its independent visual language. Widget source authority is `crates/islet-render/src/widgets.rs`, `crates/islet-core/src/widgets.rs`, `crates/islet-core/src/island.rs`, and `crates/islet-app/src/island_window.rs`. Converter source authority is `crates/islet-render/src/converter.rs`, `crates/islet-core/src/converter.rs`, and `crates/islet-app/src/island_window/file_converter.rs`.",
     "keyCharacteristics": [
       "Narrow navigation with authored line icons and restrained active rows.",
       "Graphite groups, fine outlines, and a static dotted canvas.",
       "Compact Nunito hierarchy with dedicated bold headings.",
       "A native island preview and draft-only full-screen sizing.",
-      "Opt-in native tools with scroll-only page navigation and finite state changes."
+      "Native tools with scroll-only widget navigation, expanded-only drag conversion, and finite state changes."
     ],
     "rules": [
       {
@@ -341,6 +354,16 @@
       {
         "name": "Settled Widget",
         "body": "Reuse the existing finite island morph and cross-fade for page changes; unchanged settled content snapshots must not trigger redraw. Calculator input and hover are event-driven and add no polling worker or background animation loop.",
+        "section": "components"
+      },
+      {
+        "name": "Expanded Converter",
+        "body": "Present conversion only in the expanded island; preserve compact activity and idle appearance. Dictation and urgent notices retain priority. Suppress widget page dots and wheel page switching while the converter is present.",
+        "section": "components"
+      },
+      {
+        "name": "Finite Conversion",
+        "body": "Drive conversion presentation from native drag events, input and posted worker updates. Reuse the island's finite morph; settled Loading, Ready and outcome cards add no continuous animation or polling loop.",
         "section": "components"
       }
     ],

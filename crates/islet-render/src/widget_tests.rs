@@ -128,13 +128,67 @@ fn capture_widget_previews() {
     }
 }
 
+#[test]
+#[ignore = "requires Windows GPU; writes authored converter render evidence"]
+fn capture_converter_previews() {
+    use islet_core::converter::{ConversionOption,ConversionStage,ConverterCard};
+    use windows::Win32::UI::WindowsAndMessaging::{CreateWindowExW,DestroyWindow,WINDOW_EX_STYLE,WS_POPUP};
+    let directory=std::path::PathBuf::from(std::env::var_os("ISLET_WIDGET_CAPTURE_DIR").expect("set capture directory"));
+    std::fs::create_dir_all(&directory).unwrap();
+    unsafe {
+        let hwnd=CreateWindowExW(WINDOW_EX_STYLE(0),w!("STATIC"),w!("Onyx converter capture"),WS_POPUP,0,0,720,320,None,None,None,None).unwrap();
+        for scale in [0.8,1.0,1.25] {
+            for stage in [ConversionStage::Loading,ConversionStage::Ready,ConversionStage::Running,ConversionStage::Complete,ConversionStage::Error] {
+                let mut card=ConverterCard::new("Authored sample.pdf".into(),"PDF · Choose a conversion format".into());
+                card.stage=stage;card.progress=54;card.dragging=false;card.fully_succeeded=stage==ConversionStage::Complete;
+                card.message=match stage {
+                    ConversionStage::Loading=>"Finding available formats…",
+                    ConversionStage::Ready=>"",
+                    ConversionStage::Running=>"Converting to PNG · Original files stay unchanged",
+                    ConversionStage::Complete=>"1 result saved beside the original",
+                    ConversionStage::Error=>"Windows couldn’t open this PDF. Try another file.",
+                }.into();
+                if stage == ConversionStage::Complete && std::env::var_os("ISLET_CAPTURE_PARTIAL").is_some() {
+                    card.fully_succeeded = false;
+                    card.message = "Canceled · 1 completed · Original files unchanged".into();
+                }
+                card.options=if stage == ConversionStage::Ready { ["PNG","JPG","WEBP","BMP","TIFF","GIF","JFIF","PDF"].as_slice() } else { ["PNG","JPG"].as_slice() }.iter().map(|label|ConversionOption{id:label.to_string(),label:label.to_string()}).collect();
+                if stage == ConversionStage::Ready {
+                    if let Some(path) = std::env::var_os("ISLET_CONVERTER_CAPTURE_PREVIEW") {
+                        let pixels = std::fs::read(path).unwrap();
+                        assert_eq!(pixels.len(), 256 * 256 * 4);
+                        card.preview = Some(ArtImage { id: 99, width: 256, height: 256, pixels: pixels.into() });
+                    }
+                }
+                let state=IslandState{converter:Some(card),expanded:true,..Default::default()};
+                let target=state.layout().customized(scale,0.0,320.0);
+                let content=state.content();
+                let mut renderer=Renderer::new(RendererConfig{hwnd,pixel_width:720,pixel_height:320,dpi:96.0,logical_width:720.0,logical_height:320.0,anchor_top:true},Arc::new(Mutex::new(HitRegion::default())),Arc::new(BarLevels::default()),0.0).unwrap();
+                renderer.set_snapshot(target,content.clone(),0.0);
+                renderer.render(5.0,true).unwrap();
+                renderer.animator.jump_to(target,8.0);
+                let sample=renderer.animator.sample(8.0);
+                let geometry=renderer.frame_geometry(&sample);
+                let gfx=renderer.gfx.as_mut().unwrap();
+                gfx.main_spring_height=sample.main_height;gfx.content_scale=scale;
+                gfx.draw(8.0,&geometry,&geometry,target,&content,None,1.0).unwrap();
+                save_buffer(gfx,&directory.join(format!("converter-{stage:?}-{}.tga",(scale*100.0)as u32))).unwrap();
+            }
+        }
+        DestroyWindow(hwnd).unwrap();
+    }
+}
+
 unsafe fn save_buffer(gfx: &Gfx, path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     use std::io::Write;
     use windows::Win32::Graphics::Direct3D11::{
         ID3D11Texture2D, D3D11_CPU_ACCESS_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ,
         D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
     };
-    let source: ID3D11Texture2D = gfx.swap_chain.GetBuffer(0)?;
+    // Read the actual D2D target, not whichever swap-chain buffer is next
+    // after a flip. EndDraw has submitted D2D; flush before D3D readback.
+    gfx._device_context.Flush();
+    let source: ID3D11Texture2D = gfx._bitmap.as_ref().ok_or(RenderError::InvalidSize)?.GetSurface()?.cast()?;
     let mut desc = D3D11_TEXTURE2D_DESC::default();
     source.GetDesc(&mut desc);
     desc.Usage = D3D11_USAGE_STAGING;
@@ -169,4 +223,34 @@ unsafe fn save_buffer(gfx: &Gfx, path: &std::path::Path) -> Result<(), Box<dyn s
     gfx._device_context.Unmap(&staging, 0);
     result?;
     Ok(())
+}
+
+#[test]
+#[ignore = "requires Windows GPU; writes authored pull render evidence"]
+fn capture_pull_previews() {
+    use windows::Win32::UI::WindowsAndMessaging::{CreateWindowExW,DestroyWindow,WINDOW_EX_STYLE,WS_POPUP};
+    let directory = std::path::PathBuf::from(std::env::var_os("ISLET_WIDGET_CAPTURE_DIR").unwrap());
+    std::fs::create_dir_all(&directory).unwrap();
+    unsafe {
+        let hwnd = CreateWindowExW(WINDOW_EX_STYLE(0),w!("STATIC"),w!("Pull capture"),WS_POPUP,0,0,720,248,None,None,None,None).unwrap();
+        let mut renderer = calculator_renderer(hwnd, 1.0);
+        let state = IslandState { media: Some(MediaCard {
+            title: "Sample track".into(), artist: "Sample artist".into(), source: "".into(),
+            playing: false, timeline: None, art: None, accent: None, scrub: None, volume: None,
+        }), ..Default::default() };
+        let target = state.layout(); let content = state.content();
+        renderer.set_snapshot(target, content.clone(), 0.0);
+        renderer.render(5.0, true).unwrap();
+        renderer.animator.jump_to(target, 8.0);
+        let sample = renderer.animator.sample(8.0);
+        let base = renderer.frame_geometry(&sample);
+        let gfx = renderer.gfx.as_mut().unwrap();
+        gfx.main_spring_height = sample.main_height;
+        for (name, x, y) in [("rest",0.0,0.0),("horizontal",60.0,0.0),("vertical",0.0,70.0)] {
+            let (shell, content_geometry) = pull_frames(base,x,y);
+            gfx.draw(8.0,&shell,&content_geometry,target,&content,None,1.0).unwrap();
+            save_buffer(gfx,&directory.join(format!("pull-{name}.tga"))).unwrap();
+        }
+        DestroyWindow(hwnd).unwrap();
+    }
 }

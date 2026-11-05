@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <SupportedOSPlatformVersion>10.0.19041.0</SupportedOSPlatformVersion>
+    <UseWPF>true</UseWPF>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>Onyx.Converter</AssemblyName>
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+    <!-- Onyx currently ships English UI; retain neutral runtime resources. -->
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- Reuse the supplied MIT providers and atomic-output logic unchanged. -->
+    <Compile Include="../../OrbitDrop-main/src/OrbitDrop.Core/*.cs" Link="OrbitDrop/Core/%(Filename)%(Extension)" />
+    <Compile Include="../../OrbitDrop-main/src/OrbitDrop.Conversion/**/*.cs" Exclude="../../OrbitDrop-main/src/OrbitDrop.Conversion/obj/**;../../OrbitDrop-main/src/OrbitDrop.Conversion/bin/**" Link="OrbitDrop/Conversion/%(RecursiveDir)%(Filename)%(Extension)" />
+    <PackageReference Include="PDFsharp" Version="6.2.4" />
+    <PackageReference Include="SkiaSharp" Version="3.119.2" />
+    <PackageReference Include="Svg.Skia" Version="4.9.1" />
+    <None Include="../../OrbitDrop-main/LICENSE" Link="LICENSE-OrbitDrop.txt" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../../OrbitDrop-main/THIRD-PARTY-NOTICES.md" Link="THIRD-PARTY-NOTICES-OrbitDrop.md" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+  <Target Name="ExcludeNativeDebugSymbols" AfterTargets="ComputeFilesToPublish">
+    <ItemGroup>
+      <ResolvedFileToPublish Remove="@(ResolvedFileToPublish)" Condition="'%(ResolvedFileToPublish.Extension)' == '.pdb'" />
+    </ItemGroup>
+  </Target>
+</Project>

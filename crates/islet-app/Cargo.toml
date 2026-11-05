@@ -20,6 +20,8 @@ crossbeam-channel.workspace = true
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
+serde_json = "1"
+windows-core = "0.62"
 notify = "8"
 windows = { version = "0.62", features = [
     "Win32_Foundation",
@@ -34,6 +36,10 @@ windows = { version = "0.62", features = [
     "Win32_System_SystemInformation",
     "Win32_Security",
     "Win32_System_LibraryLoader",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Ole",
+    "Win32_System_SystemServices",
     "Win32_System_Threading",
     "Win32_UI_HiDpi",
     "Win32_UI_Input_KeyboardAndMouse",

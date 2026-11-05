@@ -1396,3 +1396,108 @@ real microphone, nor in Notepad/VS Code/Chrome/Windows Terminal (see
 - Packaging workspace deletion is guarded within target and refuses a linked workspace. Added -MsixOnly and recursive payload staging. NSIS source now includes/removes its owned model/runtime payload, but the setup EXE was not regenerated or install-tested in this MSIX-only run.
 - 272 core/ASR/input/app/settings tests pass (including two new packaged-runtime tests); ASR all-target Clippy passes. SDK packaging/unpacking succeeded. All 39 staged files matched package hashes; model and root/runtime CRT DLL presence verified. Fresh isolated install from the unpacked package passed all eight real cleanup checks. No runtime was copied into the isolated model directory or downloaded. This validates unpacked payload behavior, not signed MSIX installation/container behavior or Store certification.
 - MSIX is unsigned, not installed and not submitted. Dataset provenance/license review remains open before public distribution. Verification report: target/release/onyx-cleanup-msix-verification.json. Rebuilt release app relaunched; PC stays on.
+# OrbitDrop drag-to-convert integration - 1 November 2026
+
+- Committed the pre-integration workspace as `553bcb7` (Checkpoint Onyx before OrbitDrop converter integration). Preserved prior dictation/model work and supplied OrbitDrop sources.
+- Added native OLE file-drop support on the island. Dragging opens an expanded-only conversion card; drop on a format to convert, or drop on the card and choose with mouse or Tab/Enter. Compact island behavior and scroll widgets remain separate. Settings > Widgets has an enabled-by-default File converter toggle and reserves sufficient embedded-preview space at supported scales.
+- Reuses OrbitDrop's unmodified ImageConversion, PDF, MediaFoundation and MediaEditing providers through a self-contained .NET 8 helper. PDF to PNG/JPG, image formats/PDF, audio and supported video formats come from the actual provider catalog. Office-backed conversions are excluded because the authored Word-automation probe stalled; they are not advertised as working.
+- Outputs use the original collision-safe write logic beside source files. Multi-page PDFs create a new page-image folder. Added progress, cancel, unsupported/error recovery and show-in-folder. No idle converter process, polling timer or perpetual animation was introduced. Helper teardown does not wait on the UI thread; cancellation retains partial completion counts.
+- Verification: 298 normal Rust tests passed across core/ASR/input/render/app/settings; final app/settings rerun passed 24 tests. Final all-target core/render/app/settings Clippy passed with warnings denied. A real-helper lifecycle test passed three conversions with the cancellation pipe open, verifying nonblocking UI teardown. All 23 authored helper checks passed, covering PDF pages, image/audio/video conversions, rejection, cancellation, collision safety and unchanged originals.
+- Initial cross-process native OLE direct-drop and drop-then-keyboard flows passed with authored fixtures and actual converted files. Later desktop automation reruns were unreliable at the source-drag step and are not counted as new passes. Actual native GPU state captures cover five states at 80/100/125%; independent finish review returned SHIP with no material fixes. Installed MSIX validation is separate.
+- Built and launched the optimized release app. Rebuilt unsigned `dist/Onyx_1.0.0.0_x64.msix` (420,104,248 bytes, 400.6 MiB); SHA256 `ffd86191273a45717d5608a5dc1b74aeaa4e4f6b8b69bf5eef0c9a5e44a933c7`. Windows SDK unpack passed; all 530 staged files matched package/extracted hashes. The extracted helper passed the same 23 fresh conversion checks, and the selected cleanup model hash remained unchanged. No signed installation or Store submission was performed. Verification: `target/release/converter-msix-verification.json`. No converter helper remains running at idle.
+
+## Converter selection and result refinement - 1 November 2026
+
+- Refined format choices with stronger contrast and taller single-row controls. Result states now have stage-aware subtitles, a drawn success check only on complete success, aligned status text and centered full-width recovery/reveal buttons. Partial and canceled outcomes retain accurate messaging and access to saved results.
+- Native GPU state captures and core converter tests passed; app/render compile checks passed. Updated release app; the earlier MSIX still represents the previous converter appearance.
+
+## Media-shaped converter layout - 1 November 2026
+
+- Converter now matches the expanded media shell at496x120 logical units. A112square preview at4,4 uses the media cover corner radius34; filename, status, format controls and actions occupy the right column. Non-previewable files use a native file/extension icon in the same tile.
+- On-demand converter catalog obtains a128square Windows Shell thumbnail for single files, passes premultiplied BGRA over private IPC, and reuses the bounded album-art GPU cache. Multi-file selection retains the icon. No idle service or animation was added; thumbnail failure falls back to the icon.
+- Four core converter tests, five-state native GPU captures at three scales, all23 conversion checks, and a real128square image-thumbnail check passed. The prior MSIX retains the earlier layout. Release app rebuilt for local testing.
+
+## Roomier converter - 1 November 2026
+
+- Increased converter height from120 to160 logical units at user request, retained496width and112square preview centered vertically. Added vertical spacing between filename, subtitle, formats/status and actions; format targets now32high and outcome actions26high. Updated native hit geometry to match.
+- Four core converter tests and native five-state GPU captures at80/100/125percent passed. Release app rebuilt for local use; prior MSIX is unchanged.
+
+## Converter proportions and thumbnail correction - 1 November 2026
+
+- Rebalanced the converter to544x184 logical units. Content preview now144square inset16 horizontally and20 vertically, with20-unit corners instead of the strongly rounded media cover. Right column starts at180;36-high format targets have10-unit row gaps. Action geometry remains synchronized.
+- Raised on-demand Shell thumbnails to256square. Verified actual authored image thumbnail extraction and rendering, fallback state captures at three scales, and four core converter tests. Added optional authored-preview input to the GPU capture fixture and an eight-format fixture to cover the reported crowded state. No idle work was added. The previous MSIX remains unchanged.
+
+## Converter media spacing restored - 1 November 2026
+
+- Kept requested544x184 outer dimensions. Applied the actual media spacing:4-unit cover inset,176square cover,34-unit radius,16-unit content gap, titley20 and subtitley41. Right-column controls and hitboxes moved together.
+- PNG/JPEG/BMP/GIF/TIFF previews now try a bounded direct image decode before Shell thumbnails, avoiding dependence on Explorer thumbnail cache. Authored PNG preview extraction passed; four core converter tests and native five-state captures at three scales passed. The MSIX remains the previous build.
+
+## Latest MSIX packaged - 1 November 2026
+
+- Packaged current media-spacing app and direct-image-preview helper into unsigned Onyx_1.0.0.0_x64.msix (420,106,103 bytes). SHA256 1c9fa42191ab8dfb32c212a9d9eda2e2807b2633566c20f7bfb240c268e6a808. Windows SDK unpack passed; all 530 staged files matched archive/extracted hashes. The packaged helper passed23 conversion checks and the256-square PNG preview check. Selected cleanup model hash unchanged. No signed install or Store submission performed.
+
+## Converter package size reduction - 1 November 2026
+
+- Excluded native debug PDBs and unused non-English satellite resource assemblies in the helper publish. Added cleanup of only those stale artifact files within the verified converter output, since dotnet publish does not remove obsolete files. Kept self-contained .NET runtime and licenses. No optional download or separate runtime installation was added.
+- Rebuilt MSIX from420,106,103 to386,067,365 bytes, saving34,038,738 bytes. SHA256 8aa2351550626bd2c196cd4a8a5c3e9c2ee261097503d4311dce08c66358c6d6. SDK unpack, hashes of all307 staged files,23 packaged converter checks and PNG preview passed. Cleanup model hash preserved. Package remains unsigned; no signed installation or Store submission performed.
+
+## R2 optional cleanup model - 1 November 2026
+
+- Connected the selected Round 5 model to the supplied R2 HTTPS object URL. Downloaded and verified all291,545,536 bytes against the existing SHA256 pin. The endpoint supports HTTP Range requests; downloader uses an Onyx User-Agent, existing retries, partial-file resume, cancellation and final hash validation. R2 development URL is for testing; a production custom domain remains recommended.
+- MSIX and NSIS staging now include only the pinned CPU runtime, excluding the GGUF. Existing installed models remain recognized. Settings describes the one-time offline model download; size/progress and initial Missing status exclude an already bundled runtime. Rule-based cleanup and safety checks remain bundled. All23 ASR and10 settings tests and Clippy passed.
+- Rebuilt unsigned MSIX: 113,872,116 bytes (108.6 MiB), SHA256 907adf6b023bc71d185d12e1c8c36e68a9838e6e1b1dd43208f1a6b7bafb600e. SDK unpack and all306 staged-file hashes passed; archive contains no GGUF. Actual Rust ModelManager installed from R2 into a fresh isolated model root, verified checksum, and ran three authored native cleanup checks successfully using the packaged runtime without copying/downloading executable code. No signed installation or Store submission performed. Verification: target/release/r2-msix-verification.json.
+
+## GitHub cleanup download host - 1 November 2026
+
+- Replaced R2 development URL with the cleanup-r5 GitHub release asset in N3vdev/onyx-cleanup. Public asset size and GitHub SHA256 match the pinned selected weights. HTTP Range request verified. Only the model is hosted; runtime and rule-based checks stay packaged.
+- All23 ASR tests passed. A fresh isolated native ModelManager install downloaded the full model from GitHub, verified SHA256, and passed three authored cleanup cases using the bundled runtime without copying/downloading executable code.
+- Updated unsigned MSIX: 113,871,989 bytes (108.6 MiB), SHA256 cae3a1b19189e431657bbb5bbe346d33e622b6f0d493a7e4ebde9f87b7e3369e. SDK unpack and all306 staged-file hashes passed; no GGUF in package. No signed install or Store submission performed. Verification: target/release/github-msix-verification.json.
+
+## Store duplicate package version repair - 1 November 2026
+
+- Incremented workspace/app version to1.0.1 and MSIX identity to1.0.1.0, retaining the existing Store Name, Publisher and x64 architecture. Rebuilt app, settings and speech worker; app/settings PE versions verified as1.0.1. Added a packaging guard against overwriting an existing package version and verified that guard rejects reuse before mutating staging.
+- Created Onyx_1.0.1.0_x64.msix: 113,872,173 bytes, SHA256 a4993cba1c9b651f85cbebfe8eda07243121cfcd2ab135b822f126c11ce3b57c. SDK unpack, manifest version/identity and all306 staged-file hashes passed. Model remains an optional GitHub download; no GGUF is included. No signed installation or Store submission performed. The rejected1.0.0.0 draft upload should be replaced with this new package.
+
+## PDF tools in the island (converter)
+
+- Dropping PDFs on the island now offers PDF tools before format conversions (max 8 buttons, `PdfMenu.cs`): Merge (several PDFs), Compress, Split, Rotate (90° right), Page numbers, Watermark, Protect, then PNG/JPG. Images offer "One PDF". A password-locked PDF offers only Unlock.
+- Merge/Compress/Split/Rotate are OrbitDrop's existing `PdfToolsProvider` (now registered; Tools mode queried). OrbitDrop sources stay unchanged.
+- New `OnyxPdfTools.cs`: page numbers ("3 / 12", bottom centre, upright on 0/90/180/270 rotated pages), diagonal text watermark sized to 70% of the page diagonal, Protect (AES-256, PDFsharp `SetEncryptionToV5`), Unlock (opens with the password, saves without encryption). Segoe UI is supplied through a small `IFontResolver` (PDFsharp's default finds no Windows fonts).
+- `InputWindow.cs`: the one question a tool needs (watermark text, password typed twice, unlock password) in a small dark WPF window; Enter/Esc; nothing typed is logged.
+- Outputs are new files beside the original ("x (numbered).pdf", "x (protected).pdf" ...); originals untouched.
+- Converter now strips a leading UTF-8 BOM from the request line, and reports Skipped outcomes' messages (e.g. Compress "already as small as it can get").
+- Verified through the JSON IPC: catalog for one/two/locked PDFs, Merge, Split, Rotate, Compress skip message, Page numbers on all rotations (rendered and checked), Watermark (rendered), Protect -> locked -> wrong password refused -> right password unlocks. Not yet tried by dropping files on the live island.
+- Page numbers removed at the user's request (menu entry, operation and drawing code). One PDF now offers: Compress, Split, Rotate, Watermark, Protect, PNG, JPG.
+- Fixed: the converter card's open-folder button opened Documents instead of the output. Command::arg quoted the whole `/select,<path>` argument, which Explorer can't parse for paths with spaces (every output name has one, e.g. "(watermarked)"). Now passes `/select,"<path>"` via raw_arg (file_converter.rs, with a test); checked that Explorer opens the output's folder with the file selected.
+
+## Settings compact island dock (2026-11-05)
+Removed the dedicated preview card/grid/captions. Settings reserve 64 logical pixels for the native pill and retain a 280-pixel transparent native expansion surface over the controls, with no reflow. Sidebar reduced to 150 pixels; unified caption/background, rounded quieter groups, stronger group headings. Existing native preview ownership/minimize handling and all settings behavior retained. cargo check and all 10 settings tests pass. Live hover/minimize visual verification pending.
+
+
+## Collapsed island drag gestures (2026-11-05)
+Added captured screen-coordinate drag handling with 8-DIP slop, directional axis lock, 48-DIP horizontal and 64-DIP vertical commit thresholds. Carousel cycles normal content, clock, and CPU/RAM; urgent content retains priority and expanded widgets are unchanged. Vertical gestures persist Top/Bottom only when direction changes the edge. Analytic render springs return pointer-following offsets/stretch to rest; updates use the existing compositor-paced loop. No idle gesture timer. Mouse capture loss cancels; media bubble clicks remain intact. Preview and auto-tucked states currently exclude gesture initiation. Automated app/core/render tests pass (17/226/21, three ignored platform/helper captures). Physical touchscreen and live 180-Hz feel/performance are not verified.
+
+
+### Mouse gesture follow-up
+Removed gesture eligibility exclusions for auto-tucked pills and settings previews (preview vertical gestures do not change desktop position). Start capture can now tolerate compact morphs. Added 8-ms mouse-button fallback sampling only while held for non-activating window capture; unchanged coordinates produce no render commands. Cancel/release kills this timer. Vertical direction uses actual visible edge. Empty normal page is skipped so idle carousel cannot disappear. cargo check and gesture tests passed. Native mouse smoke check pending.
+
+
+Native mouse smoke verification: real mouse down/move/up against demo fixture successfully enlarged the drag region and cycled stats -> media (222-pixel region) -> clock (110-pixel region), including bottom-docked placement. Restarted normal app after test. Pointer automation helper is in target only.
+
+
+### Directional pull refinement
+Visual feedback begins before the 8-DIP gesture classification threshold. Pointer targets use a 90-ms critically damped tracking spring; release uses a 320-ms spring with 0.82 damping. Pill width/height increase toward the dragged edge with smooth near-zero magnitude and bounded growth (76/44 DIPs). Existing rubber resistance, navigation thresholds and capture behavior retained. No new timers/workers; stationary holds do not submit new render commands. Focused renderer geometry and gesture tests passed.
+
+
+### Pull content separation and fade
+Shell uses elastic bounds; content retains unstretched dimensions centered inside it. Prevents vertical pull accidentally invoking expanded media layout above 60 DIPs and keeps cover/text/bars proportional. Content opacity fades smoothly from full toward 18% with increasing pull, returning with the existing spring. 23 renderer tests passed; native GPU rest/horizontal/vertical captures generated and visually checked in target/pull-content-captures/comparison.png. No additional layers or background work.
+
+
+## Dictation: English v2 by default, uninstalled models greyed out
+
+- Default speech model is now Parakeet TDT 0.6B v2 (English) everywhere: `DEFAULT_MODEL_ID`, the config default, and `find_or_default` (which was hard-coded to v3; now follows the default). v2 is listed first; summaries read "Recommended for English" / "For other languages". Existing configs keep their chosen model.
+- Why: the same 7 dictated sentences scored 4/7 on v3 and 6/7 on v2 (v3 misheard "Xcode" as "X Code", dropped "check the", and heard "old one" as "old enough").
+- Settings > Dictation: a model that isn't downloaded is drawn at 40% opacity and its selector is disabled (hover: "Download this model to use it."); the Download/Resume button stays at full strength.
+- "Rewrite with AI" (dictation.ai_cleanup) is now on by default. It only runs once the AI cleanup model is installed (`ai_ready` checks both); until then the rule-based cleanup is used. Deleting the model no longer switches it off.
+- Settings scrolling: egui scrolls 40 points per wheel notch, about 2.5x slower than native Windows apps. `ui::install_scrolling` now sets `line_scroll_speed` to the user's Windows 'lines to scroll' (SPI_GETWHEELSCROLLLINES, default 3) x 33 points, about 100 points a notch.
+- Default dictation hotkey is now Right Ctrl (was Ctrl+Win); hands-free stays Ctrl+Win+Space and off. Existing configs keep their hotkey.

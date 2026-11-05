@@ -112,7 +112,7 @@ dependencies = [
 
 [[package]]
 name = "asr-bench-ort"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "hound",
  "ort",
@@ -124,7 +124,7 @@ dependencies = [
 
 [[package]]
 name = "asr-bench-sherpa"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "hound",
  "serde",
@@ -1252,7 +1252,7 @@ dependencies = [
 
 [[package]]
 name = "islet-app"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "crossbeam-channel",
  "embed-resource",
@@ -1263,15 +1263,17 @@ dependencies = [
  "islet-media",
  "islet-render",
  "notify",
+ "serde_json",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
  "windows",
+ "windows-core",
 ]
 
 [[package]]
 name = "islet-asr"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "crossbeam-channel",
  "hound",
@@ -1286,7 +1288,7 @@ dependencies = [
 
 [[package]]
 name = "islet-asr-worker"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "islet-asr",
  "sherpa-onnx",
@@ -1294,7 +1296,7 @@ dependencies = [
 
 [[package]]
 name = "islet-audio"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "crossbeam-channel",
  "islet-core",
@@ -1304,7 +1306,7 @@ dependencies = [
 
 [[package]]
 name = "islet-core"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "serde",
  "toml 0.8.23",
@@ -1312,7 +1314,7 @@ dependencies = [
 
 [[package]]
 name = "islet-input"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "crossbeam-channel",
  "islet-core",
@@ -1322,7 +1324,7 @@ dependencies = [
 
 [[package]]
 name = "islet-media"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "crossbeam-channel",
  "islet-core",
@@ -1332,7 +1334,7 @@ dependencies = [
 
 [[package]]
 name = "islet-render"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "islet-core",
  "windows",
@@ -1341,7 +1343,7 @@ dependencies = [
 
 [[package]]
 name = "islet-settings"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "eframe",
  "embed-resource",

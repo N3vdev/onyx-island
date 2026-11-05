@@ -65,12 +65,14 @@ impl ModelSpec {
     }
 }
 
-pub const DEFAULT_MODEL_ID: &str = "parakeet-tdt-0.6b-v3-int8";
+/// English-only v2: clearly fewer misheard words in English than v3 (for
+/// example "Xcode", "old one") in side-by-side dictation tests.
+pub const DEFAULT_MODEL_ID: &str = "parakeet-tdt-0.6b-v2-int8";
 
 pub const PARAKEET_V3: ModelSpec = ModelSpec {
     id: "parakeet-tdt-0.6b-v3-int8",
     name: "Parakeet TDT 0.6B v3",
-    summary: "Fast, accurate, and multilingual with punctuation and capitalization.",
+    summary: "For other languages. Multilingual, with punctuation and capitalization.",
     maker: "NVIDIA",
     languages: "25 European languages",
     license: "CC-BY-4.0",
@@ -107,7 +109,7 @@ pub const PARAKEET_V3: ModelSpec = ModelSpec {
 pub const PARAKEET_V2: ModelSpec = ModelSpec {
     id: "parakeet-tdt-0.6b-v2-int8",
     name: "Parakeet TDT 0.6B v2",
-    summary: "English only; a little more accurate on English than v3.",
+    summary: "Recommended for English. The most accurate for English speech.",
     maker: "NVIDIA",
     languages: "English",
     license: "CC-BY-4.0",
@@ -142,7 +144,7 @@ pub const PARAKEET_V2: ModelSpec = ModelSpec {
 };
 
 /// Every model offered in the app, in display order.
-pub const MODELS: &[ModelSpec] = &[PARAKEET_V3, PARAKEET_V2];
+pub const MODELS: &[ModelSpec] = &[PARAKEET_V2, PARAKEET_V3];
 
 /// Silero voice-activity detection, shared by every model. Hash pinned from
 /// the official sherpa-onnx release asset.
@@ -183,7 +185,7 @@ impl AddOn {
     }
 }
 
-/// On-device Onyx fine-tuned Gemma model, supplied locally with this build.
+/// On-device Onyx fine-tuned Gemma model, downloaded on demand.
 /// The local model and CPU runtime are checksum-pinned.
 pub const AI_CLEANUP: AddOn = AddOn {
     id: "ai-cleanup",
@@ -201,7 +203,7 @@ pub const AI_CLEANUP: AddOn = AddOn {
         },
         ModelFile {
             name: "onyx-cleanup-270m-r5-selected-q8_0.gguf",
-            url: "bundled:onyx-cleanup-270m-r5-selected-q8_0.gguf",
+            url: "https://github.com/N3vdev/onyx-cleanup/releases/download/cleanup-r5/onyx-cleanup-270m-r5-selected-q8_0.gguf",
             size: 291_545_536,
             sha256: "760e148a14c0057a086f47efbec76f738ce817901141e45a58d9566dee67cf8f",
         },
@@ -223,7 +225,9 @@ pub fn find(id: &str) -> Option<&'static ModelSpec> {
 /// config written by a newer build).
 #[must_use]
 pub fn find_or_default(id: &str) -> &'static ModelSpec {
-    find(id).unwrap_or(&PARAKEET_V3)
+    find(id)
+        .or_else(|| find(DEFAULT_MODEL_ID))
+        .unwrap_or(&MODELS[0])
 }
 
 #[cfg(test)]
@@ -270,7 +274,7 @@ mod tests {
         assert!(AI_CLEANUP
             .files
             .iter()
-            .any(|file| file.name == AI_CLEANUP.model));
+            .any(|file| file.name == AI_CLEANUP.model && file.url.starts_with("https://")));
     }
 
     #[test]

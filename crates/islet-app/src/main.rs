@@ -4,6 +4,8 @@ mod clock;
 mod config_watch;
 mod context_menu;
 mod dictation;
+mod converter;
+mod file_drop;
 mod icon;
 mod last_music;
 mod island_window;

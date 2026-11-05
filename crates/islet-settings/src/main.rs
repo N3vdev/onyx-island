@@ -125,6 +125,7 @@ impl SettingsApp {
         page: Page,
     ) -> Self {
         ui::install_theme(&cc.egui_ctx);
+        ui::install_scrolling(&cc.egui_ctx);
         ui::install_titlebar_theme();
         Self {
             customization: None,

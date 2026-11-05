@@ -212,8 +212,11 @@ pub type RenderResult<T> = Result<T, RenderError>;
 #[cfg(test)]
 mod widget_tests;
 mod widgets;
+mod converter;
 
 pub struct Renderer {
+    pull_x: Spring,
+    pull_y: Spring,
     widget_hover: Option<islet_core::widgets::WidgetHover>,
     handoff: Option<(Handoff, Sample)>,
     departure_reported: bool,
@@ -259,6 +262,8 @@ impl Renderer {
         let anchor = if config.anchor_top { 0.0 } else { 1.0 };
         let animator = Animator::new(LayoutTarget::HIDDEN, anchor, now);
         Ok(Self {
+            pull_x: Spring::new(0.0, 0.0, SpringParams::COLLAPSE, now),
+            pull_y: Spring::new(0.0, 0.0, SpringParams::COLLAPSE, now),
             handoff: None,
             widget_hover: None,
             departure_reported: false,
@@ -369,6 +374,19 @@ impl Renderer {
         }
     }
 
+    /// A fast tracking spring smooths pointer samples; release softly settles home.
+    pub fn set_pull(&mut self, x: f32, y: f32, held: bool, now: f64) {
+        for (spring, value) in [(&mut self.pull_x, x), (&mut self.pull_y, y)] {
+            let params = if held {
+                SpringParams::new(0.09, 1.0)
+            } else {
+                SpringParams::new(0.32, 0.82)
+            };
+            spring.set_params(params, now);
+            spring.retarget(if held { value as f64 } else { 0.0 }, now);
+        }
+    }
+
     pub fn set_anchor(&mut self, anchor_top: bool, now: f64) {
         if self.anchor_top == anchor_top {
             return;
@@ -450,7 +468,7 @@ impl Renderer {
                 return true;
             }
         }
-        !self.animator.is_settled(now)
+        !self.pull_x.is_settled(now) || !self.pull_y.is_settled(now) || !self.animator.is_settled(now)
             || self.transition_progress(now).is_some()
             || self.content.animates()
             || self
@@ -465,6 +483,8 @@ impl Renderer {
     pub fn is_morphing(&self, now: f64) -> bool {
         self.handoff
             .is_some_and(|(transfer, _)| !transfer.settled(now))
+            || !self.pull_x.is_settled(now)
+            || !self.pull_y.is_settled(now)
             || !self.animator.is_settled(now)
             || self.transition_progress(now).is_some()
     }
@@ -545,7 +565,11 @@ impl Renderer {
             None
         };
 
-        let geometry = self.frame_geometry(&sample);
+        let base_geometry = self.frame_geometry(&sample);
+        let x = self.pull_x.sample(now).0 as f32;
+        let y = self.pull_y.sample(now).0 as f32;
+        let (geometry, content_geometry) = pull_frames(base_geometry, x, y);
+
         let levels = self.bar_smoother.sample(
             self.bars
                 .load_fresh((now * 1000.0) as u64, BAR_LEVELS_MAX_AGE_MS),
@@ -576,6 +600,7 @@ impl Renderer {
             gfx.draw(
                 now,
                 &geometry,
+                &content_geometry,
                 self.target,
                 &self.content,
                 previous,
@@ -627,6 +652,11 @@ impl Renderer {
             };
             match card {
                 ContentCard::Notification(_) | ContentCard::Calculator(_) => {}
+                ContentCard::Converter(card) => {
+                    (&card.title, &card.subtitle, &card.message, card.progress, card.fully_succeeded, card.dragging).hash(&mut hasher);
+                    format!("{:?}{:?}{:?}{:?}", card.stage, card.options, card.hover, card.keyboard_focus).hash(&mut hasher);
+                    card.preview.as_ref().map(|art| art.id).hash(&mut hasher);
+                },
                 ContentCard::Stats(stats) => format!("{stats:?}").hash(&mut hasher),
                 ContentCard::Glance(glance) => format!("{glance:?}").hash(&mut hasher),
                 ContentCard::Agent(_) | ContentCard::Dictation(_) => return None,
@@ -1051,6 +1081,7 @@ fn morph_of(
     // height in that same space so a smaller expanded card can fully open.
     let height = height / content_scale;
     let (small, big) = match card {
+        ContentCard::Converter(_) => (COMPACT, PillSize::new(islet_core::converter::WIDTH, islet_core::converter::HEIGHT, 38.0)),
         ContentCard::Calculator(_) => (COMPACT, islet_core::island::CALCULATOR),
         ContentCard::Stats(_) => (COMPACT, islet_core::island::STATS),
         ContentCard::Media(_) => (media_rest, islet_core::island::MEDIA),
@@ -1083,6 +1114,78 @@ fn compact_art(pill: PillSize) -> (Rect, f32) {
     let inset = expanded::ART_INSET;
     let art = (pill.height - inset * 2.0).max(0.0);
     (Rect::new(inset, inset, art, art), art * 0.5)
+}
+
+/// Shell elasticity and content layout are independent: artwork, text and bars
+/// translate as one intact group, fading gently as the shell stretches around them.
+fn pull_frames(base: FrameGeometry, x: f32, y: f32) -> (FrameGeometry, FrameGeometry) {
+    let mut shell = base;
+    shell.main = pulled_rect(base.main, x, y);
+    let mut content = base;
+    content.main.x += shell.main.x + shell.main.width * 0.5
+        - (base.main.x + base.main.width * 0.5);
+    content.main.y += shell.main.y + shell.main.height * 0.5
+        - (base.main.y + base.main.height * 0.5);
+    content.content_alpha *= 1.0 - 0.82 * smoothstep(3.0, 90.0, x.hypot(y));
+    if let Some(bubble) = &mut shell.bubble {
+        bubble.x += x * 0.55;
+        bubble.y += y * 0.55;
+    }
+    content.bubble = shell.bubble;
+    (shell, content)
+}
+
+/// The far edge follows the hand more than the trailing edge. Rounded magnitude
+/// avoids a cusp when crossing the origin; bounded growth keeps compact content usable.
+fn pulled_rect(mut rect: Rect, x: f32, y: f32) -> Rect {
+    let width = ((x * x + 4.0).sqrt() - 2.0) * 0.65;
+    let height = ((y * y + 4.0).sqrt() - 2.0) * 0.40;
+    let width = width.min(76.0);
+    let height = height.min(44.0);
+    rect.x += x * 0.55 - if x < 0.0 { width } else { 0.0 };
+    rect.y += y * 0.55 - if y < 0.0 { height } else { 0.0 };
+    rect.width += width;
+    rect.height += height;
+    rect
+}
+
+#[cfg(test)]
+mod pull_tests {
+    use super::*;
+    #[test]
+    fn pull_never_resizes_content_or_switches_a_compact_card_to_expanded() {
+        let base = droplet_geometry(&Sample {
+            main_width: 220.0, main_height: 36.0, main_corner: 18.0,
+            inset: 8.0, content_scale: 1.0, presence: 1.0, ..Sample::default()
+        }, 720.0, 1080.0);
+        for (x, y) in [(60.0, 0.0), (-60.0, 0.0), (0.0, 100.0), (0.0, -100.0)] {
+            let (shell, content) = pull_frames(base, x, y);
+            assert_eq!(content.main.width, base.main.width);
+            assert_eq!(content.main.height, base.main.height);
+            assert!(content.content_alpha < base.content_alpha);
+            assert!(content.content_alpha > 0.0);
+            assert!(shell.main.width >= content.main.width);
+            assert!(shell.main.height >= content.main.height);
+        }
+        let (_, rest) = pull_frames(base, 0.0, 0.0);
+        assert_eq!(rest.main, base.main);
+        assert_eq!(rest.content_alpha, base.content_alpha);
+    }
+    #[test]
+    fn stretching_starts_immediately_and_tracks_the_pulled_axis() {
+        let rest = Rect::new(100.0, 100.0, 108.0, 32.0);
+        assert_eq!(pulled_rect(rest, 0.0, 0.0), rest);
+        assert!(pulled_rect(rest, 1.0, 0.0).width > rest.width);
+        let right = pulled_rect(rest, 60.0, 0.0);
+        let left = pulled_rect(rest, -60.0, 0.0);
+        assert_eq!(right.width, left.width);
+        assert_eq!(right.height, rest.height);
+        assert!((right.x - rest.x - (rest.x + rest.width - left.x - left.width)).abs() < 0.001);
+        let down = pulled_rect(rest, 0.0, 60.0);
+        assert!(down.height > rest.height + 20.0);
+        assert_eq!(down.width, rest.width);
+        assert!(pulled_rect(rest, 1000.0, 1000.0).height <= rest.height + 44.0);
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1479,6 +1582,7 @@ impl Gfx {
         &mut self,
         now: f64,
         geometry: &FrameGeometry,
+        content_geometry: &FrameGeometry,
         target: LayoutTarget,
         content: &ContentSnapshot,
         previous: Option<&ContentSnapshot>,
@@ -1531,6 +1635,9 @@ impl Gfx {
                 }
             }
 
+            // The elastic shell never drives content layout. In particular a
+            // vertical pull must not cross the compact/expanded height boundary.
+            let geometry = content_geometry;
             if morph.is_some() {
                 if let (Some(bubble), Some(card)) = (geometry.bubble, &content.secondary) {
                     self.draw_card_in_slot(
@@ -1553,9 +1660,9 @@ impl Gfx {
         self.dc.EndDraw(None, None)?;
 
         if transitioning {
-            self.draw_transition(now, geometry, previous, content, progress)?;
+            self.draw_transition(now, content_geometry, previous, content, progress)?;
         } else if let (Some(morph), Some(card)) = (morph, content.primary.as_ref()) {
-            self.draw_morph(now, geometry, card, content.accent, morph)?;
+            self.draw_morph(now, content_geometry, card, content.accent, morph)?;
         }
         Ok(())
     }
@@ -2026,6 +2133,7 @@ impl Gfx {
             return self.draw_tucked(now, width, height, card, accent, alpha);
         }
         let drawn = match card {
+            ContentCard::Converter(card) => self.draw_converter(width, height, card, alpha),
             ContentCard::Calculator(calculator) => {
                 self.draw_calculator(width, height, calculator, alpha)
             }
@@ -2138,6 +2246,7 @@ impl Gfx {
         self.skip_art = true;
         let (w, h) = (look.width, look.height);
         let drawn = match (card, part) {
+            (ContentCard::Converter(card), _) => self.draw_converter(w, h, card, alpha),
             (ContentCard::Media(media), MorphPart::Small) => {
                 self.draw_media_compact(now, w, h, media, accent, alpha)
             }
@@ -2278,7 +2387,7 @@ impl Gfx {
                 )
             }
             ContentCard::Glance(glance) => (glance_line(glance), None),
-            ContentCard::Calculator(_) | ContentCard::Stats(_) => return Ok(()),
+            ContentCard::Converter(_) | ContentCard::Calculator(_) | ContentCard::Stats(_) => return Ok(()),
             ContentCard::Dictation(_) => return Ok(()),
         };
 
@@ -3187,7 +3296,7 @@ impl Gfx {
             ContentCard::Dictation(_) => {
                 self.fill_circle(center_x, center_y, 5.0, color(accent, alpha))?;
             }
-            ContentCard::Calculator(_) | ContentCard::Stats(_) | ContentCard::Glance(_) => {
+            ContentCard::Converter(_) | ContentCard::Calculator(_) | ContentCard::Stats(_) | ContentCard::Glance(_) => {
                 return Ok(())
             }
         }

@@ -366,6 +366,7 @@ pub struct GlanceCard {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ContentCard {
+    Converter(crate::converter::ConverterCard),
     Glance(GlanceCard),
     Calculator(crate::widgets::Calculator),
     Stats(crate::widgets::SystemStats),
@@ -377,6 +378,7 @@ pub enum ContentCard {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CardKind {
+    Converter,
     Glance,
     Calculator,
     Stats,
@@ -390,6 +392,7 @@ impl ContentCard {
     #[must_use]
     pub fn kind(&self) -> CardKind {
         match self {
+            Self::Converter(_) => CardKind::Converter,
             Self::Glance(_) => CardKind::Glance,
             Self::Calculator(_) => CardKind::Calculator,
             Self::Stats(_) => CardKind::Stats,
@@ -405,6 +408,7 @@ impl ContentCard {
     #[must_use]
     pub fn updates_in_place(&self, next: &Self) -> bool {
         match (self, next) {
+            (Self::Converter(_), Self::Converter(_)) => true,
             (Self::Calculator(_), Self::Calculator(_)) => true,
             (Self::Glance(a), Self::Glance(b)) => a.kind == b.kind,
             (Self::Stats(_), Self::Stats(_)) => true,
@@ -420,6 +424,7 @@ impl ContentCard {
             Self::Media(media) => media.playing,
             Self::Dictation(_) => true,
             Self::Notification(_)
+            | Self::Converter(_)
             | Self::Agent(_)
             | Self::Calculator(_)
             | Self::Stats(_)
@@ -492,6 +497,7 @@ fn idle_player() -> MediaCard {
 
 #[derive(Clone, Debug)]
 pub struct IslandState {
+    pub converter: Option<crate::converter::ConverterCard>,
     pub calculator: Option<crate::widgets::Calculator>,
     /// Live system readings while the stats widget is enabled.
     pub stats: Option<crate::widgets::SystemStats>,
@@ -504,6 +510,8 @@ pub struct IslandState {
     pub remembered: Option<MediaCard>,
     /// The island never hides: this is shown when nothing else is.
     pub glance: Option<IdleGlance>,
+    /// User-selected collapsed carousel page; never replaces urgent content.
+    pub compact_widget: Option<IdleGlance>,
     /// The time and readings the glance shows (`kind` is set when drawn).
     pub glance_info: GlanceCard,
     pub dictation: Option<DictationCard>,
@@ -541,12 +549,14 @@ pub struct IslandState {
 impl Default for IslandState {
     fn default() -> Self {
         Self {
+            converter: None,
             calculator: None,
             stats: None,
             widget: None,
             cpu_hot: false,
             remembered: None,
             glance: None,
+            compact_widget: None,
             glance_info: GlanceCard::default(),
             dictation: None,
             needs_input: None,
@@ -573,6 +583,7 @@ impl IslandState {
     /// Urgent notices and dictation keep priority over optional widgets.
     pub fn widget_navigation_available(&self) -> bool {
         self.expanded
+            && self.converter.is_none()
             && self.dictation.is_none()
             && self.needs_input.is_none()
             && self.done.is_none()
@@ -631,7 +642,7 @@ impl IslandState {
 
     #[must_use]
     pub fn has_activity(&self) -> bool {
-        self.dictation.is_some()
+        self.converter.is_some() || self.dictation.is_some()
             || self.needs_input.is_some()
             || self.done.is_some()
             || self.running.is_some()
@@ -640,6 +651,7 @@ impl IslandState {
             || self.calculator.is_some()
             || self.stats.is_some()
             || self.glance.is_some()
+            || self.compact_widget.is_some()
     }
 
     fn glance_card(&self) -> Option<ContentCard> {
@@ -672,6 +684,11 @@ impl IslandState {
         if let Some(notification) = &self.needs_input {
             return Some(ContentCard::Notification(notification.clone()));
         }
+        if self.expanded {
+            if let Some(converter) = &self.converter {
+                return Some(ContentCard::Converter(converter.clone()));
+            }
+        }
         if let Some(notification) = &self.done {
             return Some(ContentCard::Notification(notification.clone()));
         }
@@ -681,6 +698,9 @@ impl IslandState {
                 Some(kind) => self.widget_card(kind),
                 None => Some(ContentCard::Media(self.player_card())),
             };
+        }
+        if let Some(kind) = self.compact_widget {
+            return Some(ContentCard::Glance(GlanceCard { kind, ..self.glance_info.clone() }));
         }
         if let Some(agent) = &self.running {
             return Some(ContentCard::Agent(agent.clone()));
@@ -764,7 +784,7 @@ impl IslandState {
     /// "Stopped" or "Claude finished"), so it takes over the pill for its few
     /// seconds instead.
     fn splits(&self) -> bool {
-        self.persistent_count() >= 2 && self.done.is_none()
+        self.persistent_count() >= 2 && self.done.is_none() && (self.expanded || self.compact_widget.is_none())
     }
 
     #[must_use]
@@ -788,6 +808,7 @@ impl IslandState {
         if self.expanded {
             return match self.primary_kind() {
                 Some(CardKind::Calculator) => LayoutTarget::single(CALCULATOR),
+                Some(CardKind::Converter) => LayoutTarget::single(PillSize::new(crate::converter::WIDTH,crate::converter::HEIGHT,38.0)),
                 Some(CardKind::Stats) => LayoutTarget::single(STATS),
                 Some(CardKind::Media) if self.expanded_switcher() => {
                     LayoutTarget::split(MEDIA, SWITCH_BUBBLE)
@@ -820,7 +841,7 @@ impl IslandState {
             || (self.expanded
                 && matches!(
                     self.primary_kind(),
-                    Some(CardKind::Calculator | CardKind::Stats)
+                    Some(CardKind::Calculator | CardKind::Stats | CardKind::Converter)
                 ))
         {
             (self.primary_card(), None)
@@ -894,6 +915,7 @@ impl Effect {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum IslandEvent {
+    SetConverter(Option<crate::converter::ConverterCard>),
     SetCalculatorEnabled(bool),
     SetStatsEnabled(bool),
     /// A new reading (ignored unless the stats widget is enabled).
@@ -943,6 +965,15 @@ pub enum IslandEvent {
 /// Pure reducer. `now` is monotonic seconds.
 pub fn reduce(state: &mut IslandState, event: IslandEvent, now: f64) -> Vec<Effect> {
     match event {
+        IslandEvent::SetConverter(card) => {
+            if state.converter == card { return Vec::new(); }
+            state.expanded = card.is_some();
+            state.converter = card;
+            let mut effects=Effect::changed();
+            effects.push(Effect::CancelTimer(TimerKind::HoverExpand));
+            effects.push(Effect::CancelTimer(TimerKind::HoverCollapse));
+            effects
+        }
         IslandEvent::SetCalculatorEnabled(enabled) => {
             if enabled == state.calculator.is_some() {
                 return Vec::new();
@@ -1068,7 +1099,7 @@ pub fn reduce(state: &mut IslandState, event: IslandEvent, now: f64) -> Vec<Effe
             }
             state.pointer_inside = false;
             let mut effects = vec![Effect::CancelTimer(TimerKind::HoverExpand)];
-            if state.expanded {
+            if state.expanded && state.converter.is_none() {
                 effects.push(Effect::ArmTimer {
                     kind: TimerKind::HoverCollapse,
                     after_ms: HOVER_COLLAPSE_MS,
@@ -1110,6 +1141,7 @@ pub fn reduce(state: &mut IslandState, event: IslandEvent, now: f64) -> Vec<Effe
             }
         }
         IslandEvent::HoverCollapseElapsed => {
+            if state.converter.is_some() { return Vec::new(); }
             if !state.pointer_inside && state.expanded {
                 state.expanded = false;
                 vec![Effect::LayoutChanged]
@@ -1325,6 +1357,7 @@ pub fn reduce(state: &mut IslandState, event: IslandEvent, now: f64) -> Vec<Effe
         }
         IslandEvent::ClearAll => {
             let had_activity = state.has_activity();
+            state.converter = None;
             state.dictation = None;
             state.needs_input = None;
             state.done = None;
@@ -1355,6 +1388,7 @@ fn glance_repaint(state: &IslandState) -> Vec<Effect> {
 
 fn accent_for_card(card: &ContentCard) -> [u8; 3] {
     match card {
+        ContentCard::Converter(_) => [164, 204, 180],
         ContentCard::Glance(_) => [214, 218, 228],
         ContentCard::Calculator(_) => [164, 204, 180],
         ContentCard::Stats(_) => [110, 190, 255],
@@ -1378,6 +1412,26 @@ fn accent_for_card(card: &ContentCard) -> [u8; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn converter_pins_only_the_expanded_surface_and_priority_activity_still_wins() {
+        let mut state=IslandState{calculator:Some(crate::widgets::Calculator::default()),..Default::default()};
+        let card=crate::converter::ConverterCard::new("Authored sample.pdf".into(),"PDF".into());
+        reduce(&mut state,IslandEvent::SetConverter(Some(card)),0.0);
+        assert_eq!(state.primary_kind(),Some(CardKind::Converter));
+        assert_eq!(state.layout().main.height,crate::converter::HEIGHT);
+        assert!(!state.content().animates());assert!(!state.widget_navigation_available());
+        reduce(&mut state,IslandEvent::HoverLeave,0.1);
+        reduce(&mut state,IslandEvent::HoverCollapseElapsed,2.0);
+        assert!(state.expanded);
+        reduce(&mut state,IslandEvent::SetDictation(Some(DictationCard::default())),3.0);
+        assert_eq!(state.primary_kind(),Some(CardKind::Dictation));
+        reduce(&mut state,IslandEvent::SetDictation(None),4.0);
+        assert_eq!(state.primary_kind(),Some(CardKind::Converter));
+        reduce(&mut state,IslandEvent::SetConverter(None),5.0);
+        assert!(!state.expanded);assert_eq!(state.layout(),LayoutTarget::HIDDEN);
+        assert!(state.content().is_empty());assert!(state.calculator.is_some());
+    }
 
     #[test]
     fn widgets_work_without_media_and_keep_urgent_activity_in_front() {
@@ -2467,5 +2521,20 @@ mod tests {
         reduce(&mut state, IslandEvent::SetExpanded(false), 0.5);
         reduce(&mut state, IslandEvent::SetMedia(Some(stale)), 0.6);
         assert!(state.media.is_none());
+    }
+}
+
+#[cfg(test)]
+mod compact_gesture_tests {
+    use super::*;
+    #[test]
+    fn selected_glance_has_content_and_size_without_media() {
+        let mut state = IslandState::default();
+        state.compact_widget = Some(IdleGlance::Clock);
+        assert!(state.has_activity());
+        assert_eq!(state.layout().main, GLANCE_CLOCK);
+        assert!(matches!(state.content().primary, Some(ContentCard::Glance(_))));
+        state.compact_widget = Some(IdleGlance::Stats);
+        assert_eq!(state.layout().main, GLANCE_STATS);
     }
 }

@@ -4,6 +4,7 @@
 //! renderer, input hooks, and other platform layers are consumers of these types.
 
 pub mod config;
+pub mod converter;
 pub mod geometry;
 pub mod handoff;
 pub mod hotkey;

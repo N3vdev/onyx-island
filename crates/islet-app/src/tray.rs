@@ -160,6 +160,11 @@ pub fn run(
     demo: bool,
     demo_state: Option<usize>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // OLE file drag/drop requires the UI thread's STA, balanced on exit.
+    unsafe { windows::Win32::System::Ole::OleInitialize(None)?; }
+    struct OleGuard;
+    impl Drop for OleGuard { fn drop(&mut self) { unsafe { windows::Win32::System::Ole::OleUninitialize(); } } }
+    let _ole = OleGuard;
     let hinstance = unsafe { GetModuleHandleW(None)? };
     let icon = icon::load_app(HINSTANCE(hinstance.0))
         .or_else(|error| {

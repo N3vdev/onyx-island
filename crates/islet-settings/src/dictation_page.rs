@@ -472,22 +472,34 @@ fn model_card(app: &mut SettingsApp, ui: &mut egui::Ui, spec: &'static ModelSpec
     let mut delete = false;
     let mut verify = false;
 
+    // A model that isn't downloaded is drawn faded and can't be chosen; its
+    // Download button (on the right) stays at full strength.
+    let installed = matches!(status, ModelStatus::Installed);
     ui.horizontal(|ui| {
-        ui.radio_value(&mut app.config.dictation.model, spec.id.to_owned(), "");
-        ui.vertical(|ui| {
-            ui.label(RichText::new(spec.name).strong());
-            ui.label(
-                RichText::new(format!(
-                    "{} \u{b7} {} \u{b7} {} \u{b7} {} MB",
-                    spec.maker,
-                    spec.languages,
-                    spec.license,
-                    spec.total_size() / 1_000_000
-                ))
-                .small()
-                .color(MUTED),
-            );
-            ui.label(RichText::new(spec.summary).small().color(MUTED));
+        ui.scope(|ui| {
+            if !installed {
+                ui.multiply_opacity(0.4);
+            }
+            ui.add_enabled_ui(installed, |ui| {
+                ui.radio_value(&mut app.config.dictation.model, spec.id.to_owned(), "")
+            })
+            .inner
+            .on_disabled_hover_text("Download this model to use it.");
+            ui.vertical(|ui| {
+                ui.label(RichText::new(spec.name).strong());
+                ui.label(
+                    RichText::new(format!(
+                        "{} \u{b7} {} \u{b7} {} \u{b7} {} MB",
+                        spec.maker,
+                        spec.languages,
+                        spec.license,
+                        spec.total_size() / 1_000_000
+                    ))
+                    .small()
+                    .color(MUTED),
+                );
+                ui.label(RichText::new(spec.summary).small().color(MUTED));
+            });
         });
         ui.with_layout(
             egui::Layout::right_to_left(egui::Align::Center),
@@ -581,13 +593,14 @@ fn ai_cleanup_card(app: &mut SettingsApp, ui: &mut egui::Ui) {
         .iter()
         .find(|(id, _, _)| *id == addon.id)
         .map(|(_, text, good)| (text.clone(), *good));
-    let size_mb = addon.total_size() / 1_000_000;
+    let download_size = app.dictation_ui.manager.addon_download_size(addon);
+    let size_mb = download_size / 1_000_000;
 
     ui.label(
         RichText::new(
             "Onyx Cleanup runs Gemma 3 270M locally on your CPU. Long dictation is processed in short chunks, \
              with correction rules and fact checks before insertion. Rejected chunks keep the rule-cleaned text. \
-             This experimental model is 278 MiB; cleanup quality and time vary with the passage."
+             Download the 278 MiB model once to use AI cleanup offline. Cleanup quality and time vary with the passage."
         )
         .small()
         .color(MUTED),
@@ -680,7 +693,8 @@ fn ai_cleanup_card(app: &mut SettingsApp, ui: &mut egui::Ui) {
         }
     }
     if delete {
-        app.config.dictation.ai_cleanup = false;
+        // The switch keeps its position: without the model it does nothing,
+        // and a later download picks up where the user left it.
         match app.dictation_ui.manager.delete_addon(addon) {
             Ok(()) => {
                 app.dictation_ui

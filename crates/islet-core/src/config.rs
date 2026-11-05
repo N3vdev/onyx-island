@@ -69,15 +69,33 @@ pub struct GeneralConfig {
     pub bottom_expanded_scale: f32,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WidgetConfig {
+    /// OLE drag-to-convert; no background worker while idle.
+    pub file_converter: bool,
     /// Opt-in: existing idle behavior stays unchanged until enabled.
     pub calculator: bool,
     /// Live CPU, GPU, memory, network, and temperature. Sampled once a second
     /// only while it is on screen; the CPU alone, every two seconds, for the
     /// hot-CPU glow otherwise.
     pub system_stats: bool,
+}
+
+impl Default for WidgetConfig {
+    fn default()->Self { Self { file_converter:true,calculator:false,system_stats:false } }
+}
+
+#[cfg(test)]
+mod converter_config_tests {
+    use super::*;
+    #[test]
+    fn converter_is_on_for_existing_configs_and_explicit_off_survives_save_load() {
+        assert!(Config::from_toml("[widgets]\ncalculator = true\n").unwrap().widgets.file_converter);
+        let off=Config::from_toml("[widgets]\nfile_converter = false\n").unwrap();
+        assert!(!off.widgets.file_converter);
+        assert!(!Config::from_toml(&off.to_toml().unwrap()).unwrap().widgets.file_converter);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -180,8 +198,9 @@ pub struct DictationConfig {
     /// Spoken triggers that expand to longer text ("insert my email").
     pub snippets: Vec<Replacement>,
     /// Rewrite each dictation with the optional on-device language model
-    /// (fixes grammar, drops corrected words, lays out lists). Off until the
-    /// user downloads the model and turns it on.
+    /// (fixes grammar, drops corrected words, lays out lists). On by default;
+    /// it only runs once the model is downloaded, and until then dictation
+    /// uses the rule-based cleanup.
     pub ai_cleanup: bool,
 }
 
@@ -260,7 +279,7 @@ impl Default for DictationConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            push_to_talk: "Ctrl+Win".to_owned(),
+            push_to_talk: "Right Ctrl".to_owned(),
             hands_free: "Ctrl+Win+Space".to_owned(),
             hands_free_enabled: false,
             filler_removal: true,
@@ -268,7 +287,8 @@ impl Default for DictationConfig {
             injection: InjectionMethod::Clipboard,
             copy_to_clipboard: true,
             history: false,
-            model: "parakeet-tdt-0.6b-v3-int8".to_owned(),
+            // Same as islet_asr::DEFAULT_MODEL_ID (core doesn't depend on the ASR crate).
+            model: "parakeet-tdt-0.6b-v2-int8".to_owned(),
             keep_warm: false,
             unload_after_minutes: 10,
             microphone: String::new(),
@@ -277,7 +297,7 @@ impl Default for DictationConfig {
             trailing_space: true,
             dictionary: Vec::new(),
             snippets: Vec::new(),
-            ai_cleanup: false,
+            ai_cleanup: true,
         }
     }
 }
@@ -537,7 +557,7 @@ mod tests {
     fn defaults_are_valid_and_stable() {
         let config = Config::default();
         assert_eq!(config.schema_version, Config::CURRENT_SCHEMA_VERSION);
-        assert_eq!(config.dictation.push_to_talk, "Ctrl+Win");
+        assert_eq!(config.dictation.push_to_talk, "Right Ctrl");
         assert!(config.agents.sticky_needs_input);
         assert_eq!(config.general.position, ScreenPosition::Bottom);
 
@@ -556,7 +576,7 @@ mod tests {
         let parsed = Config::from_toml(&text).expect("parse");
         assert_eq!(config, parsed);
         assert!(text.contains("[dictation]"));
-        assert!(text.contains("push_to_talk = \"Ctrl+Win\""));
+        assert!(text.contains("push_to_talk = \"Right Ctrl\""));
     }
 
     #[test]
@@ -574,7 +594,7 @@ mod tests {
         assert_eq!(config.general.position, ScreenPosition::Top);
         assert!(config.general.hide_in_fullscreen);
         assert_eq!(config.keysounds.volume, 1.0);
-        assert_eq!(config.dictation.push_to_talk, "Ctrl+Win");
+        assert_eq!(config.dictation.push_to_talk, "Right Ctrl");
     }
 
     #[test]
