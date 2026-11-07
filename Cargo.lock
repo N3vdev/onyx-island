@@ -1350,6 +1350,7 @@ dependencies = [
  "islet-asr",
  "islet-audio",
  "islet-core",
+ "serde_json",
  "windows",
 ]
 

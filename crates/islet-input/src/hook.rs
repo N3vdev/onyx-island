@@ -43,6 +43,7 @@ pub enum HookEvent {
 
 enum Command {
     SetCombos(Option<Combo>, Option<Combo>),
+    SetAssistant(Option<Combo>),
     SetEnabled(bool),
     RecordingEnded,
 }
@@ -100,6 +101,11 @@ impl KeyboardHook {
             Combo::parse(push_to_talk).ok(),
             Combo::parse(hands_free).ok(),
         ));
+    }
+
+    /// The assistant's hold-to-speak hotkey; empty or unparsable turns it off.
+    pub fn set_command(&self, command: &str) {
+        self.send(Command::SetAssistant(Combo::parse(command).ok()));
     }
 
     /// Pausing dictation makes every key pass straight through.
@@ -192,6 +198,7 @@ fn apply(command: Command) {
                 Command::SetCombos(push_to_talk, hands_free) => {
                     state.fsm.set_combos(push_to_talk, hands_free);
                 }
+                Command::SetAssistant(command) => state.fsm.set_command(command),
                 Command::SetEnabled(enabled) => state.fsm.set_enabled(enabled),
                 Command::RecordingEnded => state.fsm.recording_ended(),
             }

@@ -3,7 +3,11 @@ use super::*;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Axis { Horizontal, Vertical }
-pub(super) struct Drag { start: POINT, dx: f32, dy: f32, axis: Option<Axis>, top: bool }
+/// `media`: the pill was showing the song when the press began, so sideways
+/// swipes change track and a push into the screen edge plays or pauses.
+/// `room`: logical pixels between the press and that edge, since the cursor
+/// stops at the edge and a push can travel no further.
+pub(super) struct Drag { start: POINT, dx: f32, dy: f32, axis: Option<Axis>, top: bool, media: bool, room: f32 }
 fn axis(dx: f32, dy: f32) -> Option<Axis> {
     if dx.abs().max(dy.abs()) < 8.0 { None }
     else if dx.abs() > dy.abs() * 1.2 { Some(Axis::Horizontal) }
@@ -11,6 +15,8 @@ fn axis(dx: f32, dy: f32) -> Option<Axis> {
     else { None }
 }
 fn rubber(distance: f32) -> f32 { distance / (1.0 + distance.abs() / 120.0) }
+/// How far a push into the edge must go to count, given the room left.
+fn push_threshold(room: f32) -> f32 { (room * 0.6).clamp(4.0, 24.0) }
 
 impl IslandHost {
     pub(super) fn begin_gesture(&mut self) -> bool {
@@ -22,7 +28,15 @@ impl IslandHost {
         self.cancel_timer(TimerKind::HoverExpand);
         self.cancel_timer(TimerKind::HoverCollapse);
         self.press_armed = false;
-        self.gesture = Some(Drag { start, dx: 0.0, dy: 0.0, axis: None, top: self.effective_anchor_top() });
+        let top = self.effective_anchor_top();
+        let media = matches!(self.state.primary_card(), Some(islet_core::ContentCard::Media(_)));
+        let scale = 96.0 / self.dpi as f32;
+        let room = monitor_info(unsafe { MonitorFromPoint(start, MONITOR_DEFAULTTONEAREST) })
+            .map_or(0.0, |info| {
+                let edge = if top { start.y - info.rcMonitor.top } else { info.rcMonitor.bottom - 1 - start.y };
+                edge.max(0) as f32 * scale
+            });
+        self.gesture = Some(Drag { start, dx: 0.0, dy: 0.0, axis: None, top, media, room });
         unsafe {
             SetCapture(self.hwnd);
             // A non-activating HWND cannot rely on capture outside its bounds.
@@ -42,18 +56,16 @@ impl IslandHost {
         drag.dx = dx;
         drag.dy = dy;
         drag.axis = drag.axis.or_else(|| axis(drag.dx, drag.dy));
+        // Resist a pull into the edge; allow generous inward travel. With a
+        // song showing, the edge gives a little, since a push there plays or
+        // pauses.
+        let outward = (drag.top && drag.dy < 0.0) || (!drag.top && drag.dy > 0.0);
+        let give = if !outward { 1.0 } else if drag.media { 0.45 } else { 0.04 };
         let (x, y) = match drag.axis {
             Some(Axis::Horizontal) => (rubber(drag.dx), 0.0),
-            Some(Axis::Vertical) => {
-                // Resist a pull into the edge; allow generous inward travel.
-                let outward = (drag.top && drag.dy < 0.0) || (!drag.top && drag.dy > 0.0);
-                (0.0, if outward { rubber(drag.dy) * 0.04 } else { rubber(drag.dy) })
-            }
+            Some(Axis::Vertical) => (0.0, rubber(drag.dy) * give),
             // Feedback starts at the first pixel, before navigation locks an axis.
-            None => {
-                let outward = (drag.top && drag.dy < 0.0) || (!drag.top && drag.dy > 0.0);
-                (rubber(drag.dx), rubber(drag.dy) * if outward { 0.04 } else { 1.0 })
-            },
+            None => (rubber(drag.dx), rubber(drag.dy) * give),
         };
         let target = self.last_target.unwrap_or(LayoutTarget::HIDDEN);
         self.morph_box = self.target_frame(target, self.effective_anchor_top()).bounds().map(|r| r.inflate(140.0));
@@ -65,7 +77,16 @@ impl IslandHost {
         unsafe { let _ = KillTimer(Some(self.hwnd), TIMER_GESTURE); let _ = ReleaseCapture(); }
         let _ = self.tx.send(RenderCommand::Pull(0.0, 0.0, false));
         if !commit { self.send_snapshot(); return; }
+        let outward = (drag.top && drag.dy < 0.0) || (!drag.top && drag.dy > 0.0);
         match drag.axis {
+            // A song on the pill: left for the next track, right for the last.
+            Some(Axis::Horizontal) if drag.media && drag.dx.abs() >= 48.0 => {
+                self.media_action(if drag.dx < 0.0 { MediaAction::Next } else { MediaAction::Previous });
+            }
+            // Pushed into the edge it already sits on: play or pause.
+            Some(Axis::Vertical) if drag.media && outward && drag.dy.abs() >= push_threshold(drag.room) => {
+                self.media_action(MediaAction::PlayPause);
+            }
             Some(Axis::Horizontal) if drag.dx.abs() >= 48.0 => {
                 let page: i32 = match self.state.compact_widget {
                     None => 0, Some(IdleGlance::Clock) => 1, Some(IdleGlance::Stats) => 2,
@@ -112,6 +133,11 @@ mod tests {
         assert_eq!(axis(30.0, 30.0), None);
         assert_eq!(axis(-40.0, 10.0), Some(Axis::Horizontal));
         assert_eq!(axis(4.0, -30.0), Some(Axis::Vertical));
+    }
+    #[test] fn a_push_into_the_edge_fits_the_room_left() {
+        assert_eq!(push_threshold(100.0), 24.0);
+        assert_eq!(push_threshold(20.0), 12.0);
+        assert_eq!(push_threshold(0.0), 4.0);
     }
     #[test] fn resistance_is_continuous_symmetric_and_bounded() {
         assert_eq!(rubber(0.0), 0.0);

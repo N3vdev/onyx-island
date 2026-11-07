@@ -285,6 +285,28 @@ fn remove_fillers(tokens: Vec<Token>) -> Vec<Token> {
             index += hedge;
             continue;
         }
+        // "We should, you know, send it" / "the third one is, like, to…":
+        // set off by commas on both sides, they say nothing.
+        let after_comma = out.last().is_some_and(|previous| previous.trail == ",");
+        let aside = if !token.verbatim && after_comma && token.key() == "like" && token.trail == "," {
+            1
+        } else if !token.verbatim
+            && after_comma
+            && token.key() == "you"
+            && token.trail.is_empty()
+            && tokens.get(index + 1).is_some_and(|next| next.key() == "know" && next.trail == ",")
+        {
+            2
+        } else {
+            0
+        };
+        if aside > 0 {
+            if let Some(previous) = out.last_mut() {
+                previous.trail.clear();
+            }
+            index += aside;
+            continue;
+        }
         let is_filler = !token.verbatim && (FILLERS.contains(&token.key().as_str()) || stray_oh);
         let is_you_know = at_clause_start
             && !token.verbatim
@@ -388,6 +410,13 @@ fn undo_hyphen_stutter(token: &mut Token) {
 
 /// True when `token` is a broken-off start of `next` ("th the", "wh- what").
 fn is_false_start(token: &Token, next: &Token) -> bool {
+    // "we we're", "I I'm", "it it's": the word, then its own contraction.
+    if plain_word(token) && token.trail.is_empty() && !next.verbatim {
+        let contraction = next.word.to_lowercase().replace('\u{2019}', "'");
+        if contraction.starts_with(&format!("{}'", token.key())) {
+            return true;
+        }
+    }
     if !plain_word(token) || !plain_word(next) {
         return false;
     }
@@ -417,13 +446,73 @@ fn repeated_run(tokens: &[Token], index: usize) -> usize {
         // purpose ("Go. Go."), not a restart.
         let restarted = first.iter().all(|token| !token.ends_sentence());
         if same && restarted {
-            if length == 1 && INTENDED_REPEATS.contains(&first[0].key().as_str()) {
+            // "is is" is meant only as in "what it is is…"; elsewhere ("the
+            // page is is messy") it is a stutter.
+            let meant_is = first[0].key() != "is"
+                || index.checked_sub(1).is_some_and(|before| matches!(tokens[before].key().as_str(), "it" | "what"));
+            if length == 1 && INTENDED_REPEATS.contains(&first[0].key().as_str()) && meant_is {
                 return 0;
             }
             return length;
         }
     }
     0
+}
+
+/// Question words; two in a row with nothing between them are a swap.
+const QUESTION_WORDS: &[&str] = &["how", "what", "when", "where", "why", "who", "whom", "whose", "which"];
+
+/// Two quick self-corrections that carry no cue phrase:
+/// - "enter not enter but enable" -> "enable": a word, "not", the same word,
+///   "but", then the right one. The repeat is required, so ordinary "not red
+///   but blue" stays as it is.
+/// - "know how when to do that" -> "know when to do that": a question word
+///   replaced straight away by another. Any punctuation between them ("what,
+///   when") means two separate words, which stay.
+fn resolve_quick_swaps(tokens: Vec<Token>) -> Vec<Token> {
+    let mut out: Vec<Token> = Vec::with_capacity(tokens.len());
+    let mut index = 0;
+    while index < tokens.len() {
+        let token = &tokens[index];
+        let rejected = tokens.get(index + 3).is_some_and(|but| {
+            tokens.len() > index + 4
+                && tokens[index + 1].key() == "not"
+                && tokens[index + 2].key() == token.key()
+                && but.key() == "but"
+                && !token.ends_sentence()
+        });
+        let swapped_question = tokens.get(index + 1).is_some_and(|next| {
+            QUESTION_WORDS.contains(&token.key().as_str())
+                && QUESTION_WORDS.contains(&next.key().as_str())
+                && token.key() != next.key()
+                && token.trail.is_empty()
+                && next.lead.is_empty()
+        });
+        let skip = if rejected {
+            4
+        } else if swapped_question {
+            1
+        } else {
+            0
+        };
+        if skip == 0 {
+            out.push(token.clone());
+            index += 1;
+            continue;
+        }
+        // The replacement takes the dropped word's place: its opening
+        // bracket or quote, and its capital at the start of a sentence.
+        let mut kept = tokens[index + skip].clone();
+        if kept.lead.is_empty() {
+            kept.lead = token.lead.clone();
+        }
+        if token.word.chars().next().is_some_and(char::is_uppercase) {
+            capitalize(&mut kept);
+        }
+        out.push(kept);
+        index += skip + 1;
+    }
+    out
 }
 
 /// Removes stutters: "I I I want" -> "I want", "I want to I want to go" ->
@@ -575,6 +664,430 @@ pub fn correction_cue_count(text: &str) -> usize {
     count
 }
 
+/// A word without its surrounding punctuation, lower case.
+fn bare_word(word: &str) -> String {
+    word.trim_matches(|c: char| !c.is_alphanumeric() && c != '\'').to_lowercase()
+}
+
+/// Never the noun of a restarted phrase ("the hotel near the near the").
+const PREPOSITIONS: &[&str] = &[
+    "near", "about", "above", "across", "after", "against", "along", "among", "around", "before", "behind",
+    "below", "beneath", "beside", "between", "beyond", "during", "except", "inside", "into", "onto", "outside",
+    "over", "past", "since", "through", "toward", "towards", "under", "until", "upon", "within", "without",
+];
+
+const UNIT_WORDS: &[&str] = &["dollars", "dollar", "rupees", "rupee", "euros", "euro", "pounds", "percent", "bucks"];
+const DETERMINERS: &[&str] = &["the", "a", "an", "this", "that", "my", "our", "your", "their"];
+
+/// "The new contract the contract should…" → "The contract should…": a
+/// noun phrase started, then said again shorter, ending on the same noun.
+fn drop_noun_restarts(text: &str) -> String {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let mut out: Vec<String> = Vec::with_capacity(words.len());
+    let mut index = 0;
+    'outer: while index < words.len() {
+        if DETERMINERS.contains(&bare_word(words[index]).as_str()) {
+            for length in 2..=4 {
+                let Some(phrase) = words.get(index..index + length) else { break };
+                if phrase[..length - 1].iter().any(|w| w.ends_with(|c: char| !c.is_alphanumeric())) {
+                    break;
+                }
+                let noun = bare_word(phrase[length - 1]);
+                if noun.len() < 3
+                    || FUNCTION_WORDS.contains(&noun.as_str())
+                    || PREPOSITIONS.contains(&noun.as_str())
+                    || phrase[length - 1].ends_with(|c: char| !c.is_alphanumeric())
+                {
+                    continue;
+                }
+                let Some(next) = words.get(index + length) else { break };
+                if !DETERMINERS.contains(&bare_word(next).as_str()) {
+                    continue;
+                }
+                for gap in 1..length {
+                    if words.get(index + length + gap).is_some_and(|w| bare_word(w) == noun) {
+                        // Keep the second try, with the first try's capital.
+                        let mut kept = words[index + length].to_owned();
+                        if words[index].starts_with(char::is_uppercase) {
+                            kept = capitalized(&kept);
+                        }
+                        out.push(kept);
+                        index += length + 1;
+                        continue 'outer;
+                    }
+                }
+            }
+        }
+        out.push(words[index].to_owned());
+        index += 1;
+    }
+    out.join(" ")
+}
+
+/// A number starting at `at`: one written word ("$25,000", "5") or spoken
+/// words ("twenty two thousand"). Gives its value and how many words.
+fn number_span(words: &[&str], at: usize) -> Option<(u64, usize)> {
+    let first = words.get(at)?;
+    let digits: String = first.chars().filter(char::is_ascii_digit).collect();
+    if !digits.is_empty() && first.trim_matches(|c: char| !c.is_alphanumeric()).chars().all(|c| c.is_ascii_digit() || c == ',') {
+        return digits.parse().ok().map(|value| (value, 1));
+    }
+    let unit = |word: &str| -> Option<u64> {
+        Some(match word {
+            "zero" => 0, "one" => 1, "two" => 2, "three" => 3, "four" => 4, "five" => 5, "six" => 6, "seven" => 7,
+            "eight" => 8, "nine" => 9, "ten" => 10, "eleven" => 11, "twelve" => 12, "thirteen" => 13,
+            "fourteen" => 14, "fifteen" => 15, "sixteen" => 16, "seventeen" => 17, "eighteen" => 18,
+            "nineteen" => 19, "twenty" => 20, "thirty" => 30, "forty" => 40, "fifty" => 50, "sixty" => 60,
+            "seventy" => 70, "eighty" => 80, "ninety" => 90,
+            _ => return None,
+        })
+    };
+    let (mut total, mut current, mut used, mut numeric) = (0u64, 0u64, 0usize, false);
+    for word in &words[at..] {
+        let bare = bare_word(word);
+        match bare.as_str() {
+            "hundred" if numeric => current = current.max(1) * 100,
+            "thousand" if numeric => {
+                total += current.max(1) * 1_000;
+                current = 0;
+            }
+            "million" if numeric => {
+                total += current.max(1) * 1_000_000;
+                current = 0;
+            }
+            "and" if numeric && used > 0 => {}
+            other => match unit(other) {
+                Some(value) => {
+                    current += value;
+                    numeric = true;
+                }
+                None => break,
+            },
+        }
+        used += 1;
+        if word.ends_with(|c: char| !c.is_alphanumeric()) {
+            break;
+        }
+    }
+    // A trailing "and" isn't part of the number.
+    while used > 0 && bare_word(words[at + used - 1]) == "and" {
+        used -= 1;
+    }
+    numeric.then_some((total + current, used))
+}
+
+/// "around 25,000 dollars. No, no, not $25,000. Sorry, $30,000." → "around
+/// $30,000.": a value denied by name ("not X") and then given again takes
+/// the place of the earlier mention of X. Values may be written or spoken
+/// ("not twenty two thousand, sorry, twenty five thousand").
+fn resolve_denied_value(text: &str) -> String {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let bare: Vec<String> = words.iter().map(|w| bare_word(w)).collect();
+    let mark = |word: &str| -> String {
+        word.chars().rev().take_while(|c| !c.is_alphanumeric()).collect::<Vec<_>>().into_iter().rev().collect()
+    };
+    let plain = |word: &str| word.trim_end_matches(|c: char| !c.is_alphanumeric()).to_owned();
+    for start in 0..words.len() {
+        if bare[start] != "no" {
+            continue;
+        }
+        let mut at = start + 1;
+        if bare.get(at).is_some_and(|w| w == "no") {
+            at += 1;
+        }
+        if bare.get(at).is_none_or(|w| w != "not") {
+            continue;
+        }
+        let Some((denied, denied_len)) = number_span(&words, at + 1) else { continue };
+        let mut cue = at + 1 + denied_len;
+        if bare.get(cue).is_some_and(|w| UNIT_WORDS.contains(&w.as_str())) {
+            cue += 1;
+        }
+        let new_at = match (bare.get(cue).map(String::as_str), bare.get(cue + 1).map(String::as_str)) {
+            (Some("sorry" | "actually"), _) => cue + 1,
+            (Some("i"), Some("mean" | "meant")) => cue + 2,
+            (Some("it's"), _) => cue + 1,
+            _ => continue,
+        };
+        let Some((_, new_len)) = number_span(&words, new_at) else { continue };
+        let mut end = new_at + new_len;
+        let new_unit = words.get(end).filter(|w| UNIT_WORDS.contains(&bare_word(w).as_str())).copied();
+        if new_unit.is_some() {
+            end += 1;
+        }
+        // The earlier mention, the latest one before the correction.
+        let Some((old, old_len)) = (0..start).rev().find_map(|i| {
+            number_span(&words, i).filter(|&(value, len)| value == denied && i + len <= start).map(|(_, len)| (i, len))
+        }) else {
+            continue;
+        };
+        let old_unit = words.get(old + old_len).filter(|w| UNIT_WORDS.contains(&bare_word(w).as_str())).copied();
+        let old_end = old + old_len + usize::from(old_unit.is_some());
+        let new_words: Vec<String> = words[new_at..new_at + new_len].iter().map(|w| plain(w)).collect();
+        let symbol = new_words[0].starts_with(|c: char| !c.is_alphanumeric());
+        let mut replacement = new_words.join(" ");
+        if !symbol {
+            if let Some(unit) = new_unit.or(old_unit) {
+                replacement = format!("{replacement} {}", bare_word(unit));
+            }
+        }
+        let closing = mark(words[old_end - 1]);
+        let tail_mark = mark(words[end - 1]);
+        let mut out: Vec<String> = words[..old].iter().map(|w| (*w).to_owned()).collect();
+        let mut between: Vec<String> = words[old_end..start].iter().map(|w| (*w).to_owned()).collect();
+        if between.is_empty() {
+            // The correction's own sentence end wins ("…dollars, no, not X.
+            // Sorry, Y." ends where the correction ended).
+            let ends = tail_mark.contains(['.', '?', '!']) || closing.is_empty();
+            out.push(format!("{replacement}{}", if ends { &tail_mark } else { &closing }));
+        } else {
+            out.push(format!("{replacement}{}", closing.trim_end_matches(['.', '!', '?'])));
+            if let Some(last) = between.last_mut() {
+                *last = format!("{}{}", plain(last), tail_mark);
+            }
+            out.extend(between);
+        }
+        out.extend(words[end..].iter().map(|w| (*w).to_owned()));
+        return resolve_denied_value(&out.join(" "));
+    }
+    text.to_owned()
+}
+
+/// "this settings page should be the settings page should be cleaner" →
+/// "the settings page should be cleaner": three to six words said again
+/// straight after, maybe with a different "the/this/a" in front.
+fn drop_repeated_runs(text: &str) -> String {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let keys: Vec<String> = words.iter().map(|w| bare_word(w)).collect();
+    let ends = |w: &str| w.ends_with(['.', '?', '!', ',', ';', ':']);
+    for start in 0..words.len() {
+        for length in (3..=6).rev() {
+            if start + 2 * length > words.len() {
+                continue;
+            }
+            if words[start..start + length].iter().any(|w| ends(w)) {
+                continue;
+            }
+            let run = &keys[start..start + length];
+            let mut again = start + length;
+            let det_between = words.get(again).is_some_and(|w| DETERMINERS.contains(&bare_word(w).as_str()) && !ends(w));
+            if det_between {
+                again += 1;
+            }
+            if keys.get(again..again + length) != Some(run) {
+                continue;
+            }
+            // Drop the first try and the determiner in front of it, keeping
+            // the second try (and its own determiner).
+            let mut from = start;
+            if det_between && start > 0 && DETERMINERS.contains(&keys[start - 1].as_str()) && !ends(words[start - 1]) {
+                from -= 1;
+            }
+            let keep_from = if det_between { start + length } else { again };
+            let mut out: Vec<String> = words[..from].iter().map(|w| (*w).to_owned()).collect();
+            let mut rest: Vec<String> = words[keep_from..].iter().map(|w| (*w).to_owned()).collect();
+            if words[from].starts_with(char::is_uppercase) {
+                if let Some(first) = rest.first_mut() {
+                    *first = capitalized(first);
+                }
+            }
+            out.append(&mut rest);
+            return drop_repeated_runs(&out.join(" "));
+        }
+    }
+    text.to_owned()
+}
+
+/// "Tanks." / "Tanks for the update" → "Thanks": the speech model drops the
+/// "h" of a quick "thanks". Only where it opens a sentence and stands alone
+/// or goes on as thanks does ("for", "a lot", "again", "so much", a name),
+/// never "the tanks" or "fish tanks".
+fn misheard_thanks(text: &str) -> String {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let mut out: Vec<String> = Vec::with_capacity(words.len());
+    for (index, word) in words.iter().enumerate() {
+        let bare = word.trim_matches(|c: char| !c.is_alphanumeric());
+        let opens = index == 0 || words[index - 1].ends_with(['.', '?', '!']);
+        let next = words.get(index + 1).map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase());
+        let alone = word.ends_with(['.', '!', ',']) || next.is_none();
+        let thanking = matches!(next.as_deref(), Some("for" | "a" | "again" | "so" | "you" | "everyone" | "guys" | "all"));
+        if bare == "Tanks" && opens && (alone || thanking) {
+            out.push(word.replacen("Tanks", "Thanks", 1));
+        } else {
+            out.push((*word).to_owned());
+        }
+    }
+    out.join(" ")
+}
+
+/// "…to Daniel? before 5pm." → "…to Daniel before 5pm?", "pricing. and the
+/// dates" → "pricing and the dates": the speech model put a stop where you
+/// paused, but the next word, in lower case, shows the sentence went on.
+fn continue_sentences(text: &str) -> String {
+    const ABBREVIATIONS: &[&str] = &["mr.", "mrs.", "ms.", "dr.", "vs.", "etc.", "e.g.", "i.e.", "st.", "no."];
+    let mut words: Vec<String> = text.split_whitespace().map(str::to_owned).collect();
+    let mut question_pending = false;
+    for index in 0..words.len() {
+        let command_follows = matches!(
+            (words.get(index + 1).map(|w| bare_word(w)).as_deref(), words.get(index + 2).map(|w| bare_word(w)).as_deref()),
+            (Some("new"), Some("paragraph" | "line" | "bullet")) | (Some("bullet"), Some("point")) | (Some("next"), Some("bullet"))
+        );
+        let next_lower = !command_follows
+            && words
+                .get(index + 1)
+                .and_then(|w| w.chars().next())
+                .is_some_and(|c| c.is_lowercase());
+        let word = &words[index];
+        let mark = word.chars().last();
+        let stop = matches!(mark, Some('.' | '?')) && !word.ends_with("..");
+        let abbreviation = ABBREVIATIONS.contains(&word.to_lowercase().as_str())
+            || word.trim_end_matches('.').contains('.')
+            || word.chars().rev().nth(1).is_some_and(|c| c.is_ascii_digit());
+        if stop && next_lower && !abbreviation {
+            question_pending |= mark == Some('?');
+            words[index].pop();
+            continue;
+        }
+        if question_pending && matches!(mark, Some('.' | '!')) {
+            words[index].pop();
+            words[index].push('?');
+            question_pending = false;
+        }
+    }
+    if question_pending {
+        if let Some(last) = words.last_mut() {
+            last.push('?');
+        }
+    }
+    words.join(" ")
+}
+
+/// The last touches on what gets typed: a capital at the start of every
+/// bullet, and currency signs spaced as written ("not $25,000", "$30,000").
+#[must_use]
+pub fn finish_layout(text: &str) -> String {
+    let text = &even_list_stops(text);
+    let mut out = String::with_capacity(text.len());
+    for (index, line) in text.split('\n').enumerate() {
+        if index > 0 {
+            out.push('\n');
+        }
+        let line = match line.strip_prefix("- ") {
+            Some(item) => format!("- {}", capitalized(item)),
+            None => line.to_owned(),
+        };
+        let chars: Vec<char> = line.chars().collect();
+        let mut fixed = String::with_capacity(line.len() + 4);
+        for (at, &c) in chars.iter().enumerate() {
+            let currency = matches!(c, '$' | '\u{20b9}' | '\u{20ac}' | '\u{a3}');
+            if currency && at > 0 && !chars[at - 1].is_whitespace() && chars[at - 1] != '(' && chars[at + 1..].first().is_some_and(char::is_ascii_digit) {
+                fixed.push(' ');
+            }
+            if c == ' ' && at > 0 && matches!(chars[at - 1], '$' | '\u{20b9}' | '\u{20ac}' | '\u{a3}') && chars.get(at + 1).is_some_and(char::is_ascii_digit) {
+                continue;
+            }
+            fixed.push(c);
+        }
+        out.push_str(&fixed);
+    }
+    out
+}
+
+/// In each run of bullets, items end the same way: with a full stop when
+/// most do (or half), bare when most don't.
+fn even_list_stops(text: &str) -> String {
+    let mut lines: Vec<String> = text.split('\n').map(str::to_owned).collect();
+    let mut index = 0;
+    while index < lines.len() {
+        if !lines[index].starts_with("- ") {
+            index += 1;
+            continue;
+        }
+        let end = (index..lines.len()).find(|&i| !lines[i].starts_with("- ")).unwrap_or(lines.len());
+        let stopped = lines[index..end].iter().filter(|l| l.ends_with(['.', '!', '?'])).count();
+        let bare = lines[index..end].iter().filter(|l| l.ends_with(|c: char| c.is_alphanumeric())).count();
+        for line in &mut lines[index..end] {
+            if stopped * 2 >= stopped + bare && line.ends_with(|c: char| c.is_alphanumeric()) {
+                line.push('.');
+            } else if stopped * 2 < stopped + bare && line.ends_with('.') && !line.ends_with("..") {
+                line.pop();
+            }
+        }
+        index = end;
+    }
+    lines.join("\n")
+}
+
+/// Small words that say nothing about what a sentence is about.
+const FUNCTION_WORDS: &[&str] = &[
+    "the", "a", "an", "this", "that", "these", "those", "for", "to", "of", "and", "or", "but",
+    "in", "on", "at", "by", "with", "from", "is", "are", "was", "were", "be", "it", "its", "i",
+    "you", "we", "they", "he", "she", "me", "my", "your", "our", "if", "so", "can", "could",
+    "would", "will", "do", "does", "did", "just", "like", "some", "any", "not", "have", "has",
+    "should", "must", "may", "might", "let", "let's", "about", "also", "then", "there", "here",
+];
+
+/// "…search for a certain mus— I'm sorry. If I open Spotify and search for
+/// a certain music…": a sentence started, given up with "sorry", and begun
+/// again. The unfinished start and the apology go.
+///
+/// Only when the apology closes its phrase, the start is short, and the
+/// next sentence picks up at least two of its words (a cut-off word counts
+/// towards the whole one). When speech recognition already ended the start
+/// with a full stop ("…should follow the system. I'm sorry. Can the dark
+/// mode toggle follow the system theme…"), it looks like a finished
+/// sentence, so the next one must repeat at least three of its words and
+/// most of them. A real apology ("I'm late, I'm sorry. I missed the bus.")
+/// shares little and stays.
+fn abandoned_start(tokens: &[Token], out: &mut Vec<Token>, cue_end: usize) -> Option<usize> {
+    let last_cue = &tokens[cue_end - 1];
+    if norm(last_cue) != "sorry" || !(closes_phrase(last_cue) || cue_end == tokens.len()) {
+        return None;
+    }
+    let finished = out.last().is_some_and(Token::ends_sentence);
+    let before_end = out.len() - usize::from(finished);
+    let start = out[..before_end].iter().rposition(Token::ends_sentence).map_or(0, |at| at + 1);
+    let fragment = &out[start..];
+    if fragment.is_empty() || fragment.len() > 12 || fragment.iter().any(|t| t.verbatim) {
+        return None;
+    }
+    let mut end = cue_end;
+    while end < tokens.len() {
+        end += 1;
+        if tokens[end - 1].ends_sentence() {
+            break;
+        }
+    }
+    let content = |token: &Token| {
+        let word = norm(token);
+        (word.len() >= 3 && !FUNCTION_WORDS.contains(&word.as_str())).then_some(word)
+    };
+    let before: Vec<String> = fragment.iter().filter_map(content).collect();
+    let after: Vec<String> = tokens[cue_end..end].iter().filter_map(content).collect();
+    let shared = before
+        .iter()
+        .filter(|a| after.iter().any(|b| a == &b || b.starts_with(a.as_str()) || a.starts_with(b.as_str())))
+        .count();
+    let enough = if finished {
+        shared >= 3 && shared * 5 >= before.len() * 3
+    } else {
+        shared >= 2
+    };
+    if !enough {
+        return None;
+    }
+    out.truncate(start);
+    let Some(next) = tokens.get(cue_end) else {
+        return Some(cue_end);
+    };
+    let mut next = next.clone();
+    if out.last().is_none_or(clause_boundary) {
+        capitalize(&mut next);
+    }
+    out.push(next);
+    Some(cue_end + 1)
+}
+
 fn clause_boundary(token: &Token) -> bool {
     token.ends_sentence() || is_break(token)
 }
@@ -636,7 +1149,10 @@ fn drop_restarts(tokens: Vec<Token>) -> Vec<Token> {
                 continue;
             }
             let (a, b) = (norm(&first[0]), norm(&second[0]));
+            // "it" after a verb is its object ("I like it like that"), not
+            // a second start.
             if a != b
+                && b != "it"
                 && RESTART_OPENERS.contains(&a.as_str())
                 && RESTART_OPENERS.contains(&b.as_str())
                 && norm(&first[length - 1]) == norm(&second[length - 1])
@@ -726,9 +1242,11 @@ fn apply_cue(
         return corrections::verified_restate(tokens, out, cue_end);
     }
     if matches!(cue, Cue::Scoped) && out.last().is_some_and(Token::ends_sentence) {
-        return (norm(&tokens[index]) != "no")
-            .then(|| corrections::scoped_after_sentence(tokens, out, cue_end))
-            .flatten();
+        if norm(&tokens[index]) == "no" {
+            return None;
+        }
+        return corrections::scoped_after_sentence(tokens, out, cue_end)
+            .or_else(|| abandoned_start(tokens, out, cue_end));
     }
     if !matches!(
         cue,
@@ -742,7 +1260,7 @@ fn apply_cue(
     match cue {
         Cue::Contrast => corrections::contrast(tokens, out, cue_end),
         Cue::VerifiedRestate => corrections::verified_restate(tokens, out, cue_end),
-        Cue::Scoped => None,
+        Cue::Scoped => abandoned_start(tokens, out, cue_end),
         Cue::Scratch => {
             // Only when it ends its clause ("scratch that." / "scratch that, ...").
             if !(closes_phrase(last_cue) || cue_end == tokens.len()) || out.is_empty() {
@@ -966,25 +1484,40 @@ const MARKERS: &[(&str, Marker)] = &[
     ("start with", Marker::Rank(1)),
     ("first of all", Marker::Rank(1)),
     ("number one", Marker::Rank(1)),
+    ("number 1", Marker::Rank(1)),
+    ("point 1", Marker::Rank(1)),
+    ("step 1", Marker::Rank(1)),
     ("point one", Marker::Rank(1)),
     ("step one", Marker::Rank(1)),
     ("firstly", Marker::Rank(1)),
     ("first", Marker::Rank(1)),
     ("number two", Marker::Rank(2)),
+    ("number 2", Marker::Rank(2)),
+    ("point 2", Marker::Rank(2)),
+    ("step 2", Marker::Rank(2)),
     ("point two", Marker::Rank(2)),
     ("step two", Marker::Rank(2)),
     ("secondly", Marker::Rank(2)),
     ("second", Marker::Rank(2)),
     ("number three", Marker::Rank(3)),
+    ("number 3", Marker::Rank(3)),
+    ("point 3", Marker::Rank(3)),
+    ("step 3", Marker::Rank(3)),
     ("point three", Marker::Rank(3)),
     ("step three", Marker::Rank(3)),
     ("thirdly", Marker::Rank(3)),
     ("third", Marker::Rank(3)),
     ("number four", Marker::Rank(4)),
+    ("number 4", Marker::Rank(4)),
+    ("point 4", Marker::Rank(4)),
+    ("step 4", Marker::Rank(4)),
     ("point four", Marker::Rank(4)),
     ("step four", Marker::Rank(4)),
     ("fourth", Marker::Rank(4)),
     ("number five", Marker::Rank(5)),
+    ("number 5", Marker::Rank(5)),
+    ("point 5", Marker::Rank(5)),
+    ("step 5", Marker::Rank(5)),
     ("point five", Marker::Rank(5)),
     ("step five", Marker::Rank(5)),
     ("fifth", Marker::Rank(5)),
@@ -1002,7 +1535,7 @@ fn marker_prefix(sentence: &str) -> Option<(Marker, &str)> {
         let rest = &sentence[phrase.len()..];
         let whole_word = rest.chars().next().is_none_or(|c| !c.is_alphanumeric());
         (head.eq_ignore_ascii_case(phrase) && whole_word)
-            .then(|| (*marker, rest.trim_start_matches([',', ':', ' ', '-'])))
+            .then(|| (*marker, rest.trim_start_matches([',', ':', ' ', '-', '.'])))
     })
 }
 
@@ -1010,7 +1543,7 @@ fn strip_words<'a>(text: &'a str, words: &str) -> Option<&'a str> {
     let head = text.get(..words.len())?;
     let rest = &text[words.len()..];
     (head.eq_ignore_ascii_case(words) && rest.chars().next().is_none_or(|c| !c.is_alphanumeric()))
-        .then(|| rest.trim_start_matches([',', ':', ' ', '-']))
+        .then(|| rest.trim_start_matches([',', ':', ' ', '-', '.']))
 }
 
 /// Recognize explicit item scaffolding without treating "the first car"
@@ -1139,7 +1672,13 @@ fn spoken_list(parts: &[&str]) -> Option<String> {
         return None;
     }
     let mut items: Vec<String> = Vec::new();
-    for part in &parts[first..] {
+    // A new list asked for after this one ("Also make a list of …") ends it.
+    let mut next_block = None;
+    for (offset, part) in parts[first..].iter().enumerate() {
+        if !items.is_empty() && split_marker(part).is_none() && explicit_bullets(part) {
+            next_block = Some(first + offset);
+            break;
+        }
         match split_marker(part) {
             Some((_, rest)) if !rest.is_empty() => items.push(capitalized(rest)),
             Some(_) => items.push(String::new()),
@@ -1161,7 +1700,112 @@ fn spoken_list(parts: &[&str]) -> Option<String> {
         out.push_str("- ");
         out.push_str(item);
     }
+    let mut out = even_stops(out);
+    if let Some(at) = next_block {
+        out.push('\n');
+        out.push_str(&bulletize(parts[at..].join(" ")));
+    }
     Some(out)
+}
+
+/// Splits "To set it up, step one, download the installer." into its
+/// lead-in and the first item, when a second item follows later; otherwise
+/// returns the sentences unchanged.
+fn split_lead_in<'a>(parts: &[&'a str]) -> Vec<&'a str> {
+    let rank = |part: &str, wanted: u8| split_marker(part).is_some_and(|(m, _)| m == Marker::Rank(wanted));
+    for (index, part) in parts.iter().enumerate() {
+        if split_marker(part).is_some() {
+            continue;
+        }
+        let later_second = parts[index + 1..].iter().any(|later| rank(later, 2));
+        if !later_second {
+            continue;
+        }
+        let split = part
+            .match_indices(", ")
+            .map(|(at, _)| at)
+            .find(|&at| rank(&part[at + 2..], 1));
+        if let Some(at) = split {
+            let mut out: Vec<&str> = parts[..index].to_vec();
+            out.push(&part[..at]);
+            out.push(&part[at + 2..]);
+            out.extend_from_slice(&parts[index + 1..]);
+            return out;
+        }
+    }
+    parts.to_vec()
+}
+
+/// "Make a list of things to pack: passport, charger, headphones and a
+/// jacket." → a bullet per item. Only when a list was asked for, the items
+/// end the dictation, and there are three or more short ones.
+fn inline_list(parts: &[&str]) -> Option<String> {
+    if parts.len() < 2 {
+        return colon_less_list(parts);
+    }
+    let intro = parts.len() - 2;
+    let introduced = parts[intro].ends_with(':') || (parts[intro].ends_with('.') && explicit_bullets(parts[intro]));
+    if !introduced || !explicit_bullets(&parts[..=intro].join(" ")) {
+        return colon_less_list(parts);
+    }
+    let body = parts[intro + 1].trim_end_matches(['.', '!', ';']);
+    let mut items: Vec<&str> = body.split(", ").collect();
+    let last = items.pop()?;
+    let last = last.strip_prefix("and ").or_else(|| last.strip_prefix("or ")).unwrap_or(last);
+    let (before, after) = last
+        .split_once(" and ")
+        .or_else(|| last.split_once(" or "))
+        .unwrap_or((last, ""));
+    items.push(before);
+    if !after.is_empty() {
+        items.push(after);
+    }
+    let items: Vec<&str> = items.into_iter().map(str::trim).filter(|item| !item.is_empty()).collect();
+    if items.len() < 3 || items.iter().any(|item| item.split_whitespace().count() > 6) {
+        return None;
+    }
+    let mut out = heading(&parts[..=intro]);
+    for item in items {
+        out.push_str("\n- ");
+        out.push_str(&capitalized(item));
+    }
+    Some(out)
+}
+
+/// "Make a list of things to pack for a passport, charger, headphones and
+/// a jacket": the colon was not heard, so the first item starts after the
+/// last small linking word before the first comma.
+fn colon_less_list(parts: &[&str]) -> Option<String> {
+    const LINKS: &[&str] = &[
+        "for", "to", "of", "with", "including", "include", "like", "are", "is", "a", "an", "the",
+        "some", "these", "those", "my", "our",
+    ];
+    let last = *parts.last()?;
+    if !explicit_bullets(last) || last.matches(", ").count() < 1 {
+        return None;
+    }
+    let (head, tail) = last.split_once(", ")?;
+    let words: Vec<&str> = head.split_whitespace().collect();
+    let boundary = words.iter().rposition(|w| LINKS.contains(&w.to_lowercase().as_str()))?;
+    if boundary + 1 >= words.len() {
+        return None;
+    }
+    let mut lead_end = boundary + 1;
+    while lead_end > 0 && LINKS.contains(&words[lead_end - 1].to_lowercase().as_str()) {
+        lead_end -= 1;
+    }
+    let lead = words[..lead_end].join(" ");
+    if !explicit_bullets(&lead) {
+        return None;
+    }
+    let first = words[boundary + 1..].join(" ");
+    let body = format!("{first}, {tail}");
+    let mut lead_parts: Vec<&str> = parts[..parts.len() - 1].to_vec();
+    let lead_line = format!("{lead}:");
+    lead_parts.push(&lead_line);
+    let list = format!("{}\n{}", lead_parts.join(" "), body);
+    let lines: Vec<&str> = list.splitn(2, '\n').collect();
+    inline_list(&[lines[0], lines[1]]).filter(|out| out.contains("\n- "))
 }
 
 /// An ASR result may omit every sentence stop. Require an explicit list
@@ -1243,14 +1887,37 @@ fn unpunctuated_list(text: &str) -> Option<String> {
 /// more sentences after it, so one stray sentence is never a list.
 fn bulletize(text: String) -> String {
     if text.contains('\n') {
-        return text;
+        // Each paragraph or line on its own; bullets already made stay.
+        return text
+            .split('\n')
+            .map(|line| {
+                if line.trim().is_empty() || line.starts_with("- ") {
+                    line.to_owned()
+                } else {
+                    bulletize(line.to_owned())
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
     }
     let parts = sentences(&text);
+    // "Firstly, X, secondly, Y, lastly, Z": markers after commas count too.
+    if let Some(list) = spoken_list(&split_at_comma_markers(&parts)) {
+        return list;
+    }
     if let Some(list) = spoken_list(&parts) {
         return list;
     }
-    if let Some(list) = unpunctuated_list(&text) {
+    // "To set it up, step one, download it. Step two, …": the first marker
+    // follows a lead-in in the same sentence.
+    if let Some(list) = spoken_list(&split_lead_in(&parts)) {
         return list;
+    }
+    if let Some(list) = inline_list(&parts) {
+        return list;
+    }
+    if let Some(list) = unpunctuated_list(&text) {
+        return even_stops(list);
     }
     let Some(intro) = parts.iter().position(|part| introduces_list(part)) else {
         return text;
@@ -1258,10 +1925,100 @@ fn bulletize(text: String) -> String {
     if parts.len() < intro + 3 {
         return text;
     }
-    let mut out = heading(&parts[..=intro]);
+    let mut items: Vec<String> = Vec::new();
     for part in &parts[intro + 1..] {
+        items.extend(parallel_clauses(part).into_iter().map(capitalized));
+    }
+    // "I want three things": three items; anything after is ordinary text.
+    let rest = announced_count(parts[intro])
+        .filter(|&count| count >= 2 && count < items.len())
+        .map(|count| items.split_off(count));
+    let mut out = heading(&parts[..=intro]);
+    for item in &items {
         out.push_str("\n- ");
-        out.push_str(&capitalized(part));
+        out.push_str(item);
+    }
+    let mut out = even_stops(out);
+    if let Some(rest) = rest {
+        out.push('\n');
+        out.push_str(&rest.join(" "));
+    }
+    out
+}
+
+/// The count in "I want three things" / "here are 4 points".
+fn announced_count(sentence: &str) -> Option<usize> {
+    let words: Vec<String> = sentence.split_whitespace().map(bare_word).collect();
+    words.iter().enumerate().find_map(|(index, word)| {
+        let value = match word.as_str() {
+            "two" => 2, "three" => 3, "four" => 4, "five" => 5, "six" => 6, "seven" => 7, "eight" => 8,
+            other => other.parse::<usize>().ok().filter(|n| (2..=12).contains(n))?,
+        };
+        words.get(index + 1).is_some_and(|next| LIST_NOUNS.contains(&next.as_str()) || next == "things").then_some(value)
+    })
+}
+
+/// When some bullets end with a full stop, the ones left bare (or ending in
+/// a comma, from a split) get one too.
+fn even_stops(list: String) -> String {
+    let ends = |line: &str| line.ends_with(['.', '!', '?']);
+    let bullets: Vec<&str> = list.lines().filter(|line| line.starts_with("- ")).collect();
+    if !bullets.iter().any(|line| ends(line)) {
+        return list;
+    }
+    list.lines()
+        .map(|line| {
+            if line.starts_with("- ") && !ends(line) {
+                format!("{}.", line.trim_end_matches([',', ';', ' ']))
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// "We need a landing page, we need a demo video." is two items said in
+/// one breath: clauses after a comma that open with the same two words.
+fn parallel_clauses(sentence: &str) -> Vec<&str> {
+    let opening: Vec<String> = sentence.split_whitespace().take(2).map(str::to_lowercase).collect();
+    if opening.len() < 2 {
+        return vec![sentence];
+    }
+    let mut out = Vec::new();
+    let mut start = 0;
+    for (at, _) in sentence.match_indices(", ") {
+        let next: Vec<String> = sentence[at + 2..].split_whitespace().take(2).map(str::to_lowercase).collect();
+        if next == opening {
+            out.push(sentence[start..at].trim());
+            start = at + 2;
+        }
+    }
+    out.push(sentence[start..].trim());
+    out
+}
+
+/// Splits sentences where a list marker follows a comma ("…is broken,
+/// lastly, the settings…"). Used only when the result reads as a list.
+fn split_at_comma_markers<'a>(parts: &[&'a str]) -> Vec<&'a str> {
+    let mut out = Vec::with_capacity(parts.len() * 2);
+    for part in parts {
+        let mut start = 0;
+        for (at, _) in part.match_indices(", ") {
+            // Ordinals and closing words only: "cook rice, then add salt"
+            // stays one step.
+            let marker = split_marker(&part[at + 2..]).is_some_and(|(marker, _)| {
+                matches!(marker, Marker::Rank(_))
+                    || ["finally", "lastly", "and finally"]
+                        .iter()
+                        .any(|word| strip_words(&part[at + 2..], word).is_some())
+            });
+            if at > start && marker {
+                out.push(&part[start..at]);
+                start = at + 2;
+            }
+        }
+        out.push(&part[start..]);
     }
     out
 }
@@ -1406,6 +2163,11 @@ pub fn rewrite_rejection(original: &str, rewrite: &str) -> Option<RewriteRejecti
     }
     if let Some(reason) = safety::rejection(original, rewrite) {
         return Some(reason);
+    }
+    // Line breaks were asked for ("new paragraph", "new line", bullets):
+    // the rewrite keeps every one (it may add a list's, never remove one).
+    if original.matches('\n').count() > rewrite.matches('\n').count() {
+        return Some(RewriteRejection::Length);
     }
     // Shorter is expected (fillers, restarts); much longer means new content.
     if after.len() > before.len() + before.len() / 5 + 3 || after.len() * 4 < before.len() {
@@ -1618,6 +2380,13 @@ pub fn clean(text: &str, options: &TextOptions) -> String {
             .collect::<Vec<_>>()
             .join("\n");
     }
+    let joined;
+    let text = if options.filler_removal {
+        joined = misheard_thanks(&continue_sentences(&resolve_denied_value(&drop_repeated_runs(&drop_noun_restarts(text)))));
+        joined.as_str()
+    } else {
+        text
+    };
     let tokens = literal_tokens(text);
     if tokens.is_empty() {
         return String::new();
@@ -1632,7 +2401,9 @@ pub fn clean(text: &str, options: &TextOptions) -> String {
         tokens = written_numbers(tokens);
     }
     if options.filler_removal {
-        tokens = remove_stutters(resolve_corrections(drop_restarts(remove_fillers(tokens))));
+        tokens = remove_stutters(resolve_quick_swaps(resolve_corrections(drop_restarts(
+            remove_fillers(tokens),
+        ))));
     }
     safety::punctuate_questions(&mut tokens);
     let text = render(&tokens);
@@ -1646,6 +2417,76 @@ pub fn clean(text: &str, options: &TextOptions) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_rejected_word_and_a_swapped_question_word_are_resolved() {
+        // Dictated exactly like this; both corrections were missed before.
+        assert_eq!(
+            clean(
+                "For the PDF support the users will have to enter not enter but enable allow access to file URLs inside the extension settings. How would the users know how when to do that?",
+                &options()
+            ),
+            "For the PDF support the users will have to enable allow access to file URLs inside the extension settings. How would the users know when to do that?"
+        );
+        assert_eq!(clean("Click save, not save but submit.", &options()), "Click submit.");
+        assert_eq!(clean("What when did it start?", &options()), "When did it start?");
+    }
+
+    #[test]
+    fn a_start_given_up_with_sorry_is_dropped() {
+        // Dictated exactly like this.
+        assert_eq!(
+            clean(
+                "For example, let's say if I ask the voice assistant to open Spotify and search for this type of music. This search  for a certain mus I'm sorry. If I open Spotify and ask it to search for a certain specific music, can it do it?",
+                &options()
+            ),
+            "For example, let's say if I ask the voice assistant to open Spotify and search for this type of music. If I open Spotify and ask it to search for a certain specific music, can it do it?"
+        );
+        assert_eq!(
+            clean("Can you send the quarterly rep, sorry, can you send the quarterly report today?", &options()),
+            "Can you send the quarterly report today?"
+        );
+    }
+
+    #[test]
+    fn a_start_ended_with_a_full_stop_and_given_up_is_dropped() {
+        // Dictated exactly like this.
+        assert_eq!(
+            clean(
+                "Can we add a dark mode toggle to the settings page? This dark mode should follow the system. I'm sorry. Can the dark mode toggle follow the system theme automatically?",
+                &options()
+            ),
+            "Can we add a dark mode toggle to the settings page? Can the dark mode toggle follow the system theme automatically?"
+        );
+    }
+
+    #[test]
+    fn real_apologies_stay() {
+        for text in [
+            "I'm late. I'm sorry. I missed the bus this morning.",
+            "The quarterly report is late. I'm sorry. The quarterly report will be ready tomorrow.",
+            "I broke the build. I'm sorry. I'll fix the build tonight.",
+            "I'm late, I'm sorry. I missed the bus.",
+            "I am so sorry. That was my fault.",
+            "Sorry. Can we talk tomorrow?",
+            "I'm sorry about the delay. The report is ready.",
+        ] {
+            assert_eq!(clean(text, &options()), text);
+        }
+    }
+
+    #[test]
+    fn ordinary_not_but_and_separate_question_words_stay() {
+        for text in [
+            "It is not red but blue.",
+            "Use the light theme, not the dark one but the default.",
+            "I know what, when and where.",
+            "Tell me who, what and why.",
+            "Not now but later.",
+        ] {
+            assert_eq!(clean(text, &options()), text);
+        }
+    }
 
     fn options() -> TextOptions {
         TextOptions {
@@ -2709,7 +3550,7 @@ mod tests {
     #[test]
     fn explicit_start_next_finally_lists_keep_alternatives_and_require_the_request() {
         assert_eq!(clean("Put these into bullet points, start with checking the sensors or asking Ingrid, next, save 12 receipts, finally, keep the logs.",&options()),
-            "Put these into bullet points:\n- Checking the sensors or asking Ingrid,\n- Save 12 receipts,\n- Keep the logs.");
+            "Put these into bullet points:\n- Checking the sensors or asking Ingrid.\n- Save 12 receipts.\n- Keep the logs.");
         assert_eq!(clean("Put these into bullet points. Start with checking the sensors or asking Ingrid. Next, save 12 receipts. Finally, keep the logs.",&options()),
             "Put these into bullet points:\n- Checking the sensors or asking Ingrid.\n- Save 12 receipts.\n- Keep the logs.");
         assert_eq!(clean("put these into bullet points start with checking the sensors or asking Ingrid next save 12 receipts finally keep the logs",&options()),
@@ -3041,3 +3882,203 @@ mod tests {
         ));
     }
 }
+
+
+
+#[cfg(test)]
+mod list_layout_tests {
+    use super::{clean, TextOptions};
+
+    fn options() -> TextOptions {
+        TextOptions { filler_removal: true, spoken_punctuation: true, dictionary: Vec::new(), snippets: Vec::new() }
+    }
+
+    #[test]
+    fn steps_after_a_lead_in_become_a_list() {
+        assert_eq!(
+            clean("To set it up, step one, download the installer. Step two, run it as admin. Step three, restart your PC.", &options()),
+            "To set it up:
+- Download the installer.
+- Run it as admin.
+- Restart your PC."
+        );
+        // Without a second step it is just a sentence.
+        let text = "To be fair, first, we should ask. Then we decide.";
+        assert_eq!(clean(text, &options()), text);
+    }
+
+    #[test]
+    fn a_requested_list_of_comma_items_becomes_bullets() {
+        assert_eq!(
+            clean("Make a list of things to pack: passport, charger, headphones and a jacket.", &options()),
+            "Make a list of things to pack:
+- Passport
+- Charger
+- Headphones
+- A jacket"
+        );
+        // Not asked for: an ordinary sentence.
+        for text in [
+            "We bought apples, pears and plums.",
+            "Pack these: passport, charger and a jacket.",
+        ] {
+            assert_eq!(clean(text, &options()), text);
+        }
+    }
+}
+
+
+#[cfg(test)]
+mod dictated_list_tests {
+    use super::{accept_rewrite, clean, format_numbers, TextOptions};
+
+    fn options() -> TextOptions {
+        TextOptions { filler_removal: true, spoken_punctuation: true, dictionary: Vec::new(), snippets: Vec::new() }
+    }
+
+    fn cleaned(text: &str) -> String {
+        format_numbers(&clean(text, &options()))
+    }
+
+    /// Each of these came back from the speech model exactly like this in a
+    /// real test and was laid out wrong before.
+    #[test]
+    fn lists_as_the_speech_model_punctuates_them() {
+        assert_eq!(
+            cleaned("I need three things for the launch. We need a landing page, we need a demo video. We need a press kit."),
+            "I need 3 things for the launch:\n- We need a landing page.\n- We need a demo video.\n- We need a press kit."
+        );
+        for text in [
+            "Firstly, the app crashes on startup, secondly, the dark mode is broken, lastly, the settings don't save.",
+            "Firstly, the app crashes on startup. Secondly, the dark mode is broken, lastly, the settings don't save.",
+        ] {
+            assert_eq!(
+                cleaned(text),
+                "- The app crashes on startup.\n- The dark mode is broken.\n- The settings don't save.",
+                "{text}"
+            );
+        }
+        assert_eq!(
+            cleaned("Number 1. Faster search. Number 2. Better offline mode. Number 3. A cleaner settings page."),
+            "- Faster search.\n- Better offline mode.\n- A cleaner settings page."
+        );
+        assert_eq!(
+            cleaned("I have a few pointers for the next release. The first one is to add voice commands. The second feature will be to support dark mode. And the third one is. Improving battery life."),
+            "I have a few pointers for the next release:\n- Add voice commands.\n- Support dark mode.\n- Improving battery life."
+        );
+        assert_eq!(
+            cleaned("Set it up. Step 1: Download the installer. Step 2: Run it as an admin. Step 3: Restart your PC."),
+            "Set it up:\n- Download the installer.\n- Run it as an admin.\n- Restart your PC."
+        );
+        assert_eq!(
+            cleaned("Make a list of things to pack for a passport, charger, headphones and a jacket."),
+            "Make a list of things to pack:\n- Passport\n- Charger\n- Headphones\n- A jacket"
+        );
+        // A step's own "then" stays inside it.
+        assert_eq!(
+            cleaned("First, cook the rice, then add salt. Second, fry the onions."),
+            "- Cook the rice, then add salt.\n- Fry the onions."
+        );
+    }
+
+    #[test]
+    fn a_list_asked_for_after_steps_is_its_own_list() {
+        assert_eq!(
+            cleaned("Okay so to fix the build, step one, delete the target folder, step two, run cargo clean, and step three, rebuild the release. Also make a list of things to check after that: the logs, the installer, the icons and the settings page."),
+            "Okay so to fix the build:\n- Delete the target folder.\n- Run cargo clean.\n- Rebuild the release.\nAlso make a list of things to check after that:\n- The logs\n- The installer\n- The icons\n- The settings page"
+        );
+    }
+
+    /// Round three, said with deliberate mistakes.
+    #[test]
+    fn a_denied_value_is_replaced_where_it_was_first_said() {
+        assert_eq!(
+            cleaned("Finalize the budget, which is around 25,000 dollars. No, no, not $25,000. Sorry, $30,000."),
+            "Finalize the budget, which is around $30,000."
+        );
+        assert_eq!(cleaned("Order 12 chairs, no, not 12, I mean 15."), "Order 15 chairs.");
+        // A plain "no, not now" is no correction.
+        let text = "Can we start? No, not now. Sorry, I am busy.";
+        assert_eq!(cleaned(text), text);
+    }
+
+    #[test]
+    fn a_misheard_thanks_is_thanks() {
+        assert_eq!(cleaned("Can you send it before 5 PM? Tanks."), "Can you send it before 5 PM? Thanks.");
+        assert_eq!(cleaned("Tanks for the update, I will review it today."), "Thanks for the update, I will review it today.");
+        assert_eq!(cleaned("Tanks a lot, Maya."), "Thanks a lot, Maya.");
+        for text in ["The army moved the tanks closer.", "Tanks are expensive to run.", "Clean the fish tanks. Tanks need water."] {
+            assert_eq!(clean(text, &options()), text);
+        }
+    }
+
+    #[test]
+    fn a_stop_before_a_lowercase_word_was_only_a_pause() {
+        assert_eq!(
+            cleaned("Can you send the contract to Daniel? before 5pm. The new contract the contract should include the new pricing. and the delivery dates."),
+            "Can you send the contract to Daniel before 5pm? The contract should include the new pricing and the delivery dates."
+        );
+        // Real sentence ends and abbreviations stay.
+        for text in ["It works. Then we ship.", "Talk to Dr. smith today.", "Use e.g. the logs."] {
+            assert_eq!(clean(text, &options()), text);
+        }
+    }
+
+    #[test]
+    fn a_requested_list_after_a_full_stop() {
+        assert_eq!(
+            cleaned("Also make a list of things to check after that. Logs, installer, the icons and the settings page."),
+            "Also make a list of things to check after that:\n- Logs\n- Installer\n- The icons\n- The settings page"
+        );
+    }
+
+    #[test]
+    fn the_final_layout_capitalizes_bullets_and_spaces_currency() {
+        assert_eq!(super::finish_layout("Steps:\n- rebuild the release.\n- Ship"), "Steps:\n- Rebuild the release.\n- Ship.");
+        assert_eq!(super::finish_layout("No, not$25,000. Sorry,$30,000 and $ 40"), "No, not $25,000. Sorry, $30,000 and $40");
+        assert_eq!(super::finish_layout("Pay ($5) now"), "Pay ($5) now");
+    }
+
+    /// Round four: long dictations with stutters, fillers, corrections,
+    /// lists and paragraphs, as the rules see them.
+    #[test]
+    fn complex_dictations() {
+        assert_eq!(
+            cleaned("Um so so I was thinking about the the launch plan and uh I have a few pointers. The first one is to to finalize the landing page by by Friday, no sorry, by Thursday. The second one is, um, we need to hire two two designers. And the third one is, like, to set up the the analytics dashboard. And finally, we should, you know, send the press kit to Maya, I mean to Daniel."),
+            "So I was thinking about the launch plan and I have a few pointers:\n- Finalize the landing page by Thursday.\n- We need to hire 2 designers.\n- Set up the analytics dashboard.\n- We should send the press kit to Daniel."
+        );
+        assert_eq!(
+            cleaned("First, book the flights. Second, reserve the the hotel near the near the conference center. Third, buy train tickets."),
+            "- Book the flights.\n- Reserve the hotel near the conference center.\n- Buy train tickets."
+        );
+        assert_eq!(
+            cleaned("Hey Priya new paragraph Thanks for the the update on the the budget. I I think we we're around twenty two thousand dollars, no, no, not twenty two thousand, sorry, twenty five thousand dollars. Can you, uh, can you check the numbers before before Monday? new paragraph So the plan. First, uh, review the invoices. Second, flag anything above five hundred dollars. Finally, send me a summary. new paragraph Thanks"),
+            "Hey Priya\n\nThanks for the update on the budget. I think we're around 25000 dollars. Can you check the numbers before Monday?\n\nSo the plan:\n- Review the invoices.\n- Flag anything above 500 dollars.\n- Send me a summary.\n\nThanks"
+        );
+        assert_eq!(
+            cleaned("So for the app I want three things. We need a dark mode, we need offline sync. We need faster search. Also this settings page should be the settings page should be cleaner."),
+            "So for the app I want 3 things:\n- We need a dark mode.\n- We need offline sync.\n- We need faster search.\nAlso the settings page should be cleaner."
+        );
+        // Ordinary speech stays.
+        for text in [
+            "Put the book on the table near the door.",
+            "I like it like that.",
+            "Do you know the answer?",
+            "Send it to the team that built the team page.",
+            "What it is is a better way to work.",
+        ] {
+            assert_eq!(clean(text, &options()), text, "{text}");
+        }
+        assert_eq!(cleaned("The settings page is is kind of messy."), "The settings page is kind of messy.");
+        assert_eq!(super::finish_layout("Check:\n- The logs\n- The installer\n- The settings page."), "Check:\n- The logs\n- The installer\n- The settings page");
+    }
+
+    #[test]
+    fn the_model_may_not_flatten_requested_lines() {
+        let rules = clean("Hi Sarah new paragraph Thanks for the update new line I will review it today new paragraph Best regards", &options());
+        assert_eq!(rules, "Hi Sarah\n\nThanks for the update\nI will review it today\n\nBest regards");
+        assert!(!accept_rewrite(&rules, "Hi Sarah, Thanks for the update. I will review it today."));
+    }
+}
+
+

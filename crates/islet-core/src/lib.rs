@@ -3,11 +3,13 @@
 //! Everything in this crate must be safe, testable, and independent of Win32. The
 //! renderer, input hooks, and other platform layers are consumers of these types.
 
+pub mod command;
 pub mod config;
 pub mod converter;
 pub mod geometry;
 pub mod handoff;
 pub mod hotkey;
+pub mod learn;
 pub mod island;
 pub mod media;
 pub mod music;

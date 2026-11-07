@@ -516,6 +516,9 @@ impl fmt::Display for Combo {
 pub enum Action {
     /// Begin recording.
     Start,
+    /// Begin recording a spoken command for the assistant (the command
+    /// hotkey), instead of text to type.
+    StartCommand,
     /// A hold turned into hands-free recording (or the hands-free hotkey
     /// started one).
     EnterHandsFree,
@@ -563,6 +566,8 @@ enum Phase {
     /// The push-to-talk combo is held and recording.
     Ptt {
         since: f64,
+        /// Started by the command hotkey rather than push-to-talk.
+        command: bool,
     },
     HandsFree,
     /// A dictation ended or was interrupted; ignore keys until all are up.
@@ -583,6 +588,8 @@ const MAX_KEYS: usize = 8;
 pub struct HotkeyFsm {
     push_to_talk: Option<Combo>,
     hands_free: Option<Combo>,
+    /// Hold to speak a command to the assistant.
+    command: Option<Combo>,
     enabled: bool,
     /// One bit per modifier virtual key (LShift..RWin), so left and right
     /// are tracked separately and released independently.
@@ -600,6 +607,7 @@ impl HotkeyFsm {
         Self {
             push_to_talk,
             hands_free,
+            command: None,
             enabled: true,
             modifier_keys: 0,
             keys: [0; MAX_KEYS],
@@ -621,6 +629,11 @@ impl HotkeyFsm {
     pub fn set_combos(&mut self, push_to_talk: Option<Combo>, hands_free: Option<Combo>) {
         self.push_to_talk = push_to_talk;
         self.hands_free = hands_free;
+    }
+
+    /// The assistant's hold-to-speak combo; `None` turns it off.
+    pub fn set_command(&mut self, command: Option<Combo>) {
+        self.command = command;
     }
 
     /// Pausing dictation (tray menu) makes every key pass through.
@@ -709,7 +722,20 @@ impl HotkeyFsm {
     }
 
     fn push_to_talk_triggered(&self, vk: u16) -> bool {
-        let Some(combo) = self.push_to_talk else {
+        self.hold_triggered(self.push_to_talk, vk)
+    }
+
+    /// The combo for the hold in progress.
+    fn active_hold(&self, command: bool) -> Option<Combo> {
+        if command {
+            self.command
+        } else {
+            self.push_to_talk
+        }
+    }
+
+    fn hold_triggered(&self, combo: Option<Combo>, vk: u16) -> bool {
+        let Some(combo) = combo else {
             return false;
         };
         if !combo.modifiers.matches(self.modifier_keys) {
@@ -760,7 +786,7 @@ impl HotkeyFsm {
                 if self.hands_free_pressed(vk) {
                     self.begin_hands_free(vk, &mut out);
                 } else if self.push_to_talk_triggered(vk) {
-                    self.phase = Phase::Ptt { since: now };
+                    self.phase = Phase::Ptt { since: now, command: false };
                     out.push(Action::Start);
                     if self
                         .push_to_talk
@@ -772,15 +798,30 @@ impl HotkeyFsm {
                         out.swallow = true;
                         self.swallow_release_of(vk);
                     }
+                } else if self.hold_triggered(self.command, vk) {
+                    self.phase = Phase::Ptt { since: now, command: true };
+                    out.push(Action::StartCommand);
+                    // A lone Alt or Win released would open the app's menu
+                    // bar or the Start menu.
+                    if self
+                        .command
+                        .is_some_and(|c| c.modifiers.has(Group::Win) || c.modifiers.has(Group::Alt))
+                    {
+                        out.push(Action::SuppressStartMenu);
+                    }
+                    if self.command.is_some_and(|c| c.key == Some(vk)) {
+                        out.swallow = true;
+                        self.swallow_release_of(vk);
+                    }
                 }
             }
-            Phase::Ptt { .. } => {
-                if self.hands_free_pressed(vk) {
+            Phase::Ptt { command, .. } => {
+                if !command && self.hands_free_pressed(vk) {
                     self.phase = Phase::HandsFree;
                     out.push(Action::EnterHandsFree);
                     out.swallow = true;
                     self.swallow_release_of(vk);
-                } else if self.push_to_talk.is_some_and(|c| c.key == Some(vk)) {
+                } else if self.active_hold(command).is_some_and(|c| c.key == Some(vk)) {
                     // The push-to-talk key itself (repeat or re-press).
                     out.swallow = true;
                 } else {
@@ -826,8 +867,8 @@ impl HotkeyFsm {
         }
 
         match self.phase {
-            Phase::Ptt { since } => {
-                let combo_still_held = self.push_to_talk.is_some_and(|combo| {
+            Phase::Ptt { since, command } => {
+                let combo_still_held = self.active_hold(command).is_some_and(|combo| {
                     combo.modifiers.matches(self.modifier_keys)
                         && combo.key.is_none_or(|key| self.is_held(key))
                 });
@@ -877,6 +918,25 @@ mod tests {
 
     fn all(outcomes: &[Outcome]) -> Vec<Action> {
         outcomes.iter().flat_map(|o| o.actions()).collect()
+    }
+
+    #[test]
+    fn the_command_hotkey_records_a_command_and_keeps_alt_quiet() {
+        let mut fsm = HotkeyFsm::from_strings("Right Ctrl", "");
+        fsm.set_command(Combo::parse("Right Alt").ok());
+        let down = press(&mut fsm, &[VK_RMENU], 1.0);
+        assert_eq!(all(&down), [Action::StartCommand, Action::SuppressStartMenu]);
+        let up = release(&mut fsm, &[VK_RMENU], 2.0);
+        assert_eq!(all(&up), [Action::Stop]);
+        // Push-to-talk still starts ordinary dictation.
+        let down = press(&mut fsm, &[VK_RCONTROL], 3.0);
+        assert_eq!(all(&down), [Action::Start]);
+        release(&mut fsm, &[VK_RCONTROL], 4.0);
+        // A quick tap, or Right Alt used with another key, is not a command.
+        press(&mut fsm, &[VK_RMENU], 5.0);
+        assert_eq!(all(&release(&mut fsm, &[VK_RMENU], 5.1)), [Action::Discard]);
+        press(&mut fsm, &[VK_RMENU], 6.0);
+        assert_eq!(all(&press(&mut fsm, &[0x45], 6.3)), [Action::Discard]);
     }
 
     #[test]

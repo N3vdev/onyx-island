@@ -127,6 +127,18 @@ pub fn insert_text_with_clipboard(
 }
 
 /// Sends a harmless key so releasing the Win key does not open Start.
+/// Presses `keys` in order and releases them in reverse: a shortcut such
+/// as Win+Shift+S, or a media key. Marked as Islet's own input, so the
+/// hotkey hook ignores it.
+pub fn press_chord(keys: &[u16]) {
+    let mut events: Vec<INPUT> = keys.iter().map(|&vk| key_event(vk, false)).collect();
+    events.extend(keys.iter().rev().map(|&vk| key_event(vk, true)));
+    // SAFETY: plain SendInput of keyboard events built above.
+    unsafe {
+        SendInput(&events, std::mem::size_of::<INPUT>() as i32);
+    }
+}
+
 pub fn suppress_start_menu() {
     let events = [
         key_event(VK_UNASSIGNED, false),

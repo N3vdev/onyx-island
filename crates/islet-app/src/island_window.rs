@@ -68,7 +68,6 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 /// Room for the expanded player plus the second player's bubble beside it.
 pub const WINDOW_LOGICAL_WIDTH: f32 = 720.0;
-pub const WINDOW_LOGICAL_HEIGHT: f32 = 200.0;
 
 const TIMER_HOVER_EXPAND: usize = 1;
 const TIMER_HOVER_COLLAPSE: usize = 2;
@@ -84,6 +83,10 @@ const TIMER_STATS: usize = 11;
 const TIMER_CLOCK: usize = 12;
 const TIMER_RESUME: usize = 13;
 const TIMER_GESTURE: usize = 14;
+const TIMER_INTRO: usize = 15;
+/// How long the startup greeting stays before the island moves on. Its
+/// beats finish by about 2.3 s after the pill appears (islet-render intro).
+const INTRO_MS: u32 = 2_900;
 /// After this long without a media session, play is sent to the relaunched
 /// player's window directly (Spotify reports no session until it plays).
 const RESUME_NUDGE_AFTER: std::time::Duration = std::time::Duration::from_secs(4);
@@ -161,9 +164,18 @@ struct WindowLayout {
     height: i32,
     dpi: u32,
     anchor_top: bool,
-    /// Logical height of the window. At the top the window spans the whole
-    /// work area so the renderer can spring the pill between both edges.
+    /// Logical height of the window. It spans the whole work area at either
+    /// edge so the renderer can glide the pill between both edges.
     logical_height: f32,
+}
+
+impl WindowLayout {
+    /// Same place, size and scale: only the home edge may differ.
+    fn same_geometry(&self, other: &Self) -> bool {
+        (self.x, self.y, self.width, self.height, self.dpi)
+            == (other.x, other.y, other.width, other.height, other.dpi)
+            && self.logical_height == other.logical_height
+    }
 }
 
 /// The window region, in physical pixels. `HTTRANSPARENT` only passes
@@ -320,7 +332,7 @@ impl IslandHost {
         demo_state: Option<usize>,
     ) -> WinResult<Box<Self>> {
         let config = read_config(&shared);
-        let layout = compute_window_layout(&config, config.general.position.home_is_top())?;
+        let layout = compute_window_layout(&config)?;
         apply_window_layout(hwnd, layout)?;
         let file_drop = crate::file_drop::Registration::new(hwnd)?;
         file_drop.set_enabled(config.widgets.file_converter);
@@ -441,6 +453,13 @@ impl IslandHost {
         });
 
         host.state.media_paused_ms = config.media.pause_hide_seconds.saturating_mul(1_000);
+        // The startup greeting, once per launch (not in the demo).
+        if !demo && demo_state.is_none() {
+            host.state.intro = true;
+            unsafe {
+                SetTimer(Some(hwnd), TIMER_INTRO, INTRO_MS, None);
+            }
+        }
         host.register_appbar();
         host.send_snapshot();
         host.update_poll_timer();
@@ -881,10 +900,17 @@ impl IslandHost {
                 while let Ok(update) = self.dictation_rx.try_recv() {
                     match update {
                         UiUpdate::PauseMedia => islet_media::pause_playing_media(),
-                        UiUpdate::Card(card) => self.dispatch(IslandEvent::SetDictation(card)),
+                        UiUpdate::Card(card) => {
+                            let starting = card.is_some() && self.state.dictation.is_none();
+                            self.dispatch(IslandEvent::SetDictation(card));
+                            if starting {
+                                self.log_dictation_visibility();
+                            }
+                        }
                         UiUpdate::Notice(notice) => {
                             self.dispatch(IslandEvent::SetDone(Some(notice)));
                         }
+                        UiUpdate::Media(verb) => self.voice_media(verb),
                     }
                 }
                 Some(LRESULT(0))
@@ -1809,6 +1835,23 @@ impl IslandHost {
         }
     }
 
+    /// A music control said to the assistant. "Play" and "pause" only act
+    /// when they would change something, unlike the toggle they share.
+    fn voice_media(&mut self, verb: islet_core::command::MediaVerb) {
+        use islet_core::command::MediaVerb;
+        let playing = self.state.media.as_ref().is_some_and(|media| media.playing);
+        let action = match verb {
+            MediaVerb::Next => Some(MediaAction::Next),
+            MediaVerb::Previous => Some(MediaAction::Previous),
+            MediaVerb::PlayPause => Some(MediaAction::PlayPause),
+            MediaVerb::Play => (!playing).then_some(MediaAction::PlayPause),
+            MediaVerb::Pause => playing.then_some(MediaAction::PlayPause),
+        };
+        if let Some(action) = action {
+            self.media_action(action);
+        }
+    }
+
     /// Sends a transport command and updates the card optimistically, so
     /// the island reacts before the app reports back.
     fn media_action(&mut self, action: MediaAction) {
@@ -2242,6 +2285,13 @@ impl IslandHost {
             TIMER_STATS => self.sample_stats(),
             TIMER_CLOCK => self.update_clock(),
             TIMER_RESUME => self.finish_resume(),
+            TIMER_INTRO => {
+                unsafe {
+                    let _ = KillTimer(Some(self.hwnd), TIMER_INTRO);
+                }
+                self.state.intro = false;
+                self.send_snapshot();
+            }
             TIMER_MEDIA_PAUSED => {
                 unsafe {
                     let _ = KillTimer(Some(self.hwnd), TIMER_MEDIA_PAUSED);
@@ -2329,6 +2379,25 @@ impl IslandHost {
         } else {
             LRESULT(HTTRANSPARENT as isize)
         }
+    }
+
+    /// One line per dictation, when the pill should appear: everything that
+    /// can keep it off screen. Holds no dictated text.
+    fn log_dictation_visibility(&self) {
+        let mut rect = windows::Win32::Foundation::RECT::default();
+        let _ = unsafe { GetWindowRect(self.hwnd, &mut rect) };
+        tracing::info!(
+            window_visible = unsafe { IsWindowVisible(self.hwnd) }.as_bool(),
+            window = ?(rect.left, rect.top, rect.right, rect.bottom),
+            fullscreen_hidden = self.fullscreen_hidden,
+            preview_attached = self.preview.is_some(),
+            preview_pending = ?self.preview_pending.map(|next| next.is_some()),
+            at_top = self.effective_anchor_top(),
+            tucked = self.state.tucked,
+            traveling = self.traveling,
+            morphing = self.morph_box.is_some(),
+            "dictation pill requested"
+        );
     }
 
     fn begin_departure(&mut self) {
@@ -2466,9 +2535,12 @@ impl IslandHost {
             return Ok(());
         }
         let config = read_config(&self.shared);
-        let layout = compute_window_layout(&config, self.anchor_top)?;
+        let layout = compute_window_layout(&config)?;
         self.home_layout = Some(layout);
-        if self.last_layout == Some(layout) {
+        // A new home edge alone moves nothing: the window is the same, and the
+        // renderer glides the pill across to the other edge.
+        if self.last_layout.is_some_and(|last| last.same_geometry(&layout)) {
+            self.last_layout = Some(layout);
             return Ok(());
         }
         apply_window_layout(self.hwnd, layout)?;
@@ -2986,7 +3058,7 @@ fn point_from_lparam(lparam: LPARAM) -> POINT {
     POINT { x, y }
 }
 
-fn compute_window_layout(config: &Config, anchor_top: bool) -> WinResult<WindowLayout> {
+fn compute_window_layout(config: &Config) -> WinResult<WindowLayout> {
     let monitor = if config.general.monitor == MonitorChoice::FollowCursor {
         let mut point = POINT::default();
         unsafe { GetCursorPos(&mut point) }?;
@@ -3003,23 +3075,13 @@ fn compute_window_layout(config: &Config, anchor_top: bool) -> WinResult<WindowL
 
     let width = (WINDOW_LOGICAL_WIDTH * dpi as f32 / 96.0).round() as i32;
     let work = info.rcWork;
-    // At the top the window covers the full work area: the island can then
-    // glide between the top and bottom edges inside one window instead of
-    // teleporting a small window between them. At the bottom there is nowhere
-    // to glide to, so keep the window compact.
-    let (height, y, logical_height) = if anchor_top {
-        let height = (work.bottom - work.top).max(1);
-        (height, work.top, height as f32 * 96.0 / dpi as f32)
-    } else {
-        // Drag conversion can open a taller card without changing settings.
-        // Include the supported expanded scale and the configured edge margin.
-        let work_height=(work.bottom-work.top) as f32*96.0/dpi as f32;
-        let logical_height=(islet_core::converter::HEIGHT*1.25+24.0
-            +work_height*config.general.bottom_margin_percent.clamp(0.0,5.0)/100.0)
-            .max(WINDOW_LOGICAL_HEIGHT).min(work_height);
-        let height = (logical_height * dpi as f32 / 96.0).round() as i32;
-        (height.max(1), work.bottom - height, logical_height)
-    };
+    // At either edge the window covers the full work area, so the island
+    // glides between the top and bottom edges inside one window (Dynamic
+    // docking, dictation, and pulling it to the other edge) instead of a
+    // window being moved and resized under it. Clicks pass through everything
+    // outside the pill's own shape, so the tall window blocks nothing.
+    let height = (work.bottom - work.top).max(1);
+    let (height, y, logical_height) = (height, work.top, height as f32 * 96.0 / dpi as f32);
     let x = work.left + ((work.right - work.left) - width) / 2;
 
     Ok(WindowLayout {
@@ -3028,7 +3090,7 @@ fn compute_window_layout(config: &Config, anchor_top: bool) -> WinResult<WindowL
         width: width.max(1),
         height: height.max(1),
         dpi,
-        anchor_top,
+        anchor_top: config.general.position.home_is_top(),
         logical_height,
     })
 }
@@ -3171,6 +3233,7 @@ fn demo_needs_input() -> NotificationCard {
         title: "Permission needed".to_owned(),
         body: "Allow cargo clippy to run?".to_owned(),
         level: AlertLevel::NeedsInput,
+        icon: None,
     }
 }
 
@@ -3180,6 +3243,7 @@ fn demo_done() -> NotificationCard {
         title: "Claude finished".to_owned(),
         body: "Refactored auth.rs and updated tests".to_owned(),
         level: AlertLevel::Success,
+        icon: None,
     }
 }
 
@@ -3204,6 +3268,7 @@ fn demo_dictation_as(phase: DictationPhase, hands_free: bool) -> DictationCard {
         phase,
         bars,
         hands_free,
+        command: false,
     }
 }
 

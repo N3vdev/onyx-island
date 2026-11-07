@@ -46,6 +46,8 @@ pub enum UiUpdate {
     Card(Option<DictationCard>),
     /// A transient message ("model not installed", an error).
     Notice(NotificationCard),
+    /// A music control said to the assistant.
+    Media(islet_core::command::MediaVerb),
 }
 
 enum Command {
@@ -104,6 +106,25 @@ pub fn spawn(
 }
 
 /// The hands-free hotkey text, or nothing while hands-free mode is off.
+/// The kind of command, for the log (never the words).
+fn command_kind(command: &islet_core::command::Command) -> &'static str {
+    use islet_core::command::Command;
+    match command {
+        Command::Open(_) => "open",
+        Command::Close(_) => "close",
+        Command::Minimize(_) => "minimize",
+        Command::Maximize => "maximize",
+        Command::ShowDesktop => "show desktop",
+        Command::Media(_) => "media",
+        Command::Play { .. } => "play",
+        Command::Volume(_) => "volume",
+        Command::Type(_) => "type",
+        Command::Search { .. } => "search",
+        Command::Screenshot => "screenshot",
+        Command::Lock => "lock",
+    }
+}
+
 fn hands_free_hotkey(config: &DictationConfig) -> &str {
     if config.hands_free_enabled {
         &config.hands_free
@@ -136,6 +157,8 @@ const POLISH_PER_WORD: Duration = Duration::from_millis(60);
 const POLISH_MAX: Duration = Duration::from_secs(15);
 /// Notices about a missing model are not repeated more often than this.
 const NOTICE_COOLDOWN: Duration = Duration::from_secs(8);
+/// How long "open X and type ..." waits for X's window.
+const OPEN_WAIT: Duration = Duration::from_secs(8);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
@@ -159,6 +182,8 @@ struct Session {
     reveal_at: Instant,
     revealed: bool,
     hands_free: bool,
+    /// Spoken to the assistant (the command hotkey), not text to type.
+    command: bool,
     /// `Begin` has been sent to the worker.
     began: bool,
     /// The user stopped before the model finished loading.
@@ -219,7 +244,47 @@ struct Controller {
     sample_count: usize,
     level: f32,
     bars: [u8; DICTATION_BARS],
+    /// The room's noise and the voice's loudness, learned as you speak, so
+    /// the bars span quiet to loud for this mic instead of saturating.
+    loudness: Loudness,
+    /// The voice assistant, while it is turned on.
+    assistant: Option<crate::assistant::Assistant>,
+    /// What the dictation being typed was heard as and cleaned to, for
+    /// learning from corrections (only kept while that is on).
+    last_dictated: Option<(String, String)>,
     next_tick: Instant,
+}
+
+/// Tracks the background noise and the loudness of recent speech, in dB.
+#[derive(Clone, Copy, Debug)]
+struct Loudness {
+    floor: f32,
+    peak: f32,
+}
+
+impl Default for Loudness {
+    fn default() -> Self {
+        Self { floor: -60.0, peak: -30.0 }
+    }
+}
+
+impl Loudness {
+    /// Learns from one 33 ms reading and returns where it sits between the
+    /// noise and the loudest recent speech, 0..=1. Ordinary speech lands in
+    /// the middle and only stressed syllables reach the top.
+    fn place(&mut self, db: f32) -> f32 {
+        // The noise floor drops at once and creeps back up about 1 dB a
+        // second, so speech never becomes the floor.
+        self.floor = if db < self.floor { db } else { self.floor + 0.03 };
+        self.floor = self.floor.clamp(-80.0, -35.0);
+        // The loudness reference jumps to each peak and eases back over a
+        // few seconds, so a loud phrase doesn't flatten what follows.
+        self.peak = if db > self.peak { db } else { self.peak - 0.1 };
+        self.peak = self.peak.max(self.floor + 20.0);
+        let above = db - self.floor - 5.0;
+        let span = (self.peak - self.floor - 5.0).max(15.0);
+        (above / span).clamp(0.0, 1.0).powf(1.5)
+    }
 }
 
 impl Controller {
@@ -262,8 +327,12 @@ impl Controller {
             sample_count: 0,
             level: 0.0,
             bars: [0; DICTATION_BARS],
+            loudness: Loudness::default(),
+            assistant: None,
+            last_dictated: None,
             next_tick: Instant::now(),
         };
+        controller.update_assistant();
         controller.update_hook_enabled();
         controller.maybe_preload();
         controller
@@ -421,6 +490,7 @@ impl Controller {
         let model_changed = config.model != self.config.model;
         let mic_changed = config.microphone != self.config.microphone;
         self.config = config;
+        self.update_assistant();
         self.update_hook_enabled();
 
         if mic_changed && self.phase == Phase::Idle {
@@ -433,6 +503,20 @@ impl Controller {
             self.loaded_model.clear();
         }
         self.maybe_preload();
+    }
+
+    /// Arms the assistant's hotkey while it is on, and lists the installed
+    /// apps ahead of the first command.
+    fn update_assistant(&mut self) {
+        let on = self.config.assistant_enabled && !self.config.assistant_hotkey.trim().is_empty();
+        if let Some(hook) = &self.hook {
+            hook.set_command(if on { &self.config.assistant_hotkey } else { "" });
+        }
+        if on && self.assistant.is_none() {
+            self.assistant = Some(crate::assistant::Assistant::new());
+        } else if !on {
+            self.assistant = None;
+        }
     }
 
     fn update_hook_enabled(&self) {
@@ -484,7 +568,8 @@ impl Controller {
 
     fn on_action(&mut self, action: Action) {
         match action {
-            Action::Start => self.start(),
+            Action::Start => self.start(false),
+            Action::StartCommand => self.start(true),
             Action::EnterHandsFree => {
                 if let Some(session) = &mut self.session {
                     session.hands_free = true;
@@ -504,7 +589,8 @@ impl Controller {
         }
     }
 
-    fn start(&mut self) {
+    /// Begins recording: text to type, or a `command` for the assistant.
+    fn start(&mut self, command: bool) {
         if self.phase == Phase::Transcribing || self.phase == Phase::Recording {
             // Still busy with the previous dictation.
             self.recording_ended();
@@ -543,6 +629,7 @@ impl Controller {
             reveal_at: Instant::now() + REVEAL_DELAY,
             revealed: false,
             hands_free: false,
+            command,
             began: false,
             stop_requested: false,
             pending: Vec::new(),
@@ -791,9 +878,9 @@ impl Controller {
         self.sum_squares = 0.0;
         self.sample_count = 0;
         let db = 20.0 * rms.max(1e-5).log10();
-        let target = ((db + 55.0) / 45.0).clamp(0.0, 1.0).powf(0.85);
-        // Fast attack, slower release.
-        let rate = if target > self.level { 0.7 } else { 0.25 };
+        let target = self.loudness.place(db);
+        // Fast attack and a quick release, so syllables show as dips.
+        let rate = if target > self.level { 0.75 } else { 0.42 };
         self.level += (target - self.level) * rate;
         self.bars.copy_within(1.., 0);
         self.bars[DICTATION_BARS - 1] = (self.level * 255.0) as u8;
@@ -915,8 +1002,14 @@ impl Controller {
             .session
             .as_ref()
             .is_some_and(|session| session.peak < SILENCE_PEAK);
+        let command = self.session.as_ref().is_some_and(|session| session.command);
         self.session = None;
         let text = transcript::clean(raw, &self.text_options);
+        if command && !text.is_empty() {
+            self.run_command(&text);
+            return;
+        }
+        self.last_dictated = self.config.learn_corrections.then(|| (raw.to_owned(), text.clone()));
         tracing::info!(
             recognized_correction_cues = transcript::correction_cue_count(raw),
             remaining_correction_cues = transcript::correction_cue_count(&text),
@@ -946,6 +1039,117 @@ impl Controller {
             self.start_polish(text, timing);
         } else {
             self.insert(text, timing);
+        }
+    }
+
+    /// Carries out what was said to the assistant. The words themselves are
+    /// never logged; only whether it was understood.
+    fn run_command(&mut self, said: &str) {
+        self.phase = Phase::Idle;
+        self.recording_ended();
+        self.hide();
+        self.last_used = Instant::now();
+        use islet_core::command::Command;
+        // What was heard, shown under a failure so it is clear why.
+        let heard = format!("Heard \u{201c}{}\u{201d}", said.trim().trim_end_matches(['.', '?', '!']));
+        let Some(commands) = islet_core::command::parse_all(said) else {
+            tracing::info!("assistant: not a command");
+            self.notice("Not sure what to do", &heard, AlertLevel::Info);
+            return;
+        };
+        let mut last_notice = None;
+        let mut opened: Option<String> = None;
+        for command in &commands {
+            // "Open Spotify and search for lo-fi", or "search lo-fi on
+            // Spotify": the search happens in that app, not on the web.
+            let in_app = match (command, &opened, &self.assistant) {
+                (Command::Search { query, site: None }, Some(app), Some(_)) => Some((app.clone(), query)),
+                (Command::Search { query, site: Some(site) }, _, Some(assistant)) if assistant.is_app(site) => {
+                    let reply = assistant.run(&Command::Open(site.clone()));
+                    if !reply.ok {
+                        let title = reply.notice.map_or_else(|| "Couldn't open that".to_owned(), |(title, _)| title);
+                        self.notice_with_icon(&title, &heard, AlertLevel::Info, reply.icon);
+                        return;
+                    }
+                    Some((site.clone(), query))
+                }
+                _ => None,
+            };
+            if let (Some((app, query)), Some(assistant)) = (in_app, &self.assistant) {
+                tracing::info!("assistant: search in app");
+                let method = match self.config.injection {
+                    InjectionMethod::Clipboard => Method::Clipboard,
+                    InjectionMethod::Unicode => Method::Unicode,
+                };
+                let reply = assistant.search_in(&app, query, method, OPEN_WAIT);
+                if !reply.ok {
+                    let title = reply.notice.map_or_else(|| "Couldn't search there".to_owned(), |(title, _)| title);
+                    self.notice_with_icon(&title, &heard, AlertLevel::Info, reply.icon);
+                    return;
+                }
+                if let Some((title, body)) = reply.notice {
+                    last_notice = Some((title, body, reply.icon));
+                }
+                opened = None;
+                continue;
+            }
+            if let Command::Type(text) = command {
+                tracing::info!("assistant: type");
+                // Just opened something: type into it once its window is up.
+                if let (Some(name), Some(assistant)) = (&opened, &self.assistant) {
+                    if !assistant.wait_for_window(name, OPEN_WAIT) {
+                        self.notice("The app didn't open in time", &heard, AlertLevel::Info);
+                        return;
+                    }
+                }
+                let method = match self.config.injection {
+                    InjectionMethod::Clipboard => Method::Clipboard,
+                    InjectionMethod::Unicode => Method::Unicode,
+                };
+                if let Err(error) = islet_input::insert_text_with_clipboard(text, method, false) {
+                    self.notice("Can't type there", &error.to_string(), AlertLevel::Error);
+                    return;
+                }
+                opened = None;
+                continue;
+            }
+            let Some(assistant) = &self.assistant else {
+                return;
+            };
+            let reply = assistant.run(command);
+            tracing::info!(ok = reply.ok, kind = command_kind(command), "assistant: command");
+            if !reply.ok {
+                // Stop here: the next step would land in the wrong place.
+                let title = reply.notice.map_or_else(|| "Couldn't do that".to_owned(), |(title, _)| title);
+                self.notice_with_icon(&title, &heard, AlertLevel::Info, reply.icon);
+                return;
+            }
+            opened = match command {
+                Command::Open(name) => Some(name.clone()),
+                _ => None,
+            };
+            if let Some(verb) = reply.media {
+                self.send(UiUpdate::Media(verb));
+            }
+            if let Some((verb, after)) = reply.media_later {
+                let ui = self.ui.clone();
+                let notify = Arc::clone(&self.notify);
+                std::thread::spawn(move || {
+                    std::thread::sleep(after);
+                    if ui.send(UiUpdate::Media(verb)).is_ok() {
+                        notify();
+                    }
+                });
+            }
+            if let Some((title, body)) = reply.notice {
+                last_notice = Some((title, body, reply.icon));
+            }
+        }
+        if self.config.tones {
+            tone::play(Tone::Done);
+        }
+        if let Some((title, body, icon)) = last_notice {
+            self.notice_with_icon(&title, &body, AlertLevel::Success, icon);
         }
     }
 
@@ -1006,7 +1210,7 @@ impl Controller {
     }
 
     fn insert(&mut self, mut text: String, timing: Timing) {
-        text = transcript::format_numbers(&text);
+        text = transcript::finish_layout(&transcript::format_numbers(&text));
         let Timing {
             stopped_at,
             worker_ms,
@@ -1037,6 +1241,9 @@ impl Controller {
                 );
                 if self.config.tones {
                     tone::play(Tone::Done);
+                }
+                if let Some((heard, rule)) = self.last_dictated.take() {
+                    crate::learn::watch(crate::learn::Dictated { heard, rule, typed: text.trim().to_owned() });
                 }
                 // No "done" mark: the pill simply goes, back to the music
                 // if it was playing.
@@ -1083,18 +1290,21 @@ impl Controller {
             }
             Phase::Transcribing => DictationPhase::Transcribing,
         };
-        let (elapsed_ms, hands_free) = self.session.as_ref().map_or((0, false), |session| {
-            (
-                session.started.elapsed().as_millis() as u32,
-                session.hands_free,
-            )
-        });
+        let (elapsed_ms, hands_free, command) =
+            self.session.as_ref().map_or((0, false, false), |session| {
+                (
+                    session.started.elapsed().as_millis() as u32,
+                    session.hands_free,
+                    session.command,
+                )
+            });
         let card = DictationCard {
             elapsed_ms,
             level: self.level,
             phase,
             bars: self.bars,
             hands_free,
+            command,
         };
         self.send(UiUpdate::Card(Some(card)));
     }
@@ -1103,12 +1313,25 @@ impl Controller {
         self.send(UiUpdate::Card(None));
     }
 
+    /// One of Onyx's own messages: no sender line, the Onyx mark beside it.
     fn notice(&mut self, title: &str, body: &str, level: AlertLevel) {
+        self.notice_with_icon(title, body, level, None);
+    }
+
+    /// The same, with the icon of the app it is about.
+    fn notice_with_icon(
+        &mut self,
+        title: &str,
+        body: &str,
+        level: AlertLevel,
+        icon: Option<islet_core::media::ArtImage>,
+    ) {
         self.send(UiUpdate::Notice(NotificationCard {
-            source: "Onyx".to_owned(),
+            source: String::new(),
             title: title.to_owned(),
             body: body.to_owned(),
             level,
+            icon,
         }));
     }
 
@@ -1172,8 +1395,27 @@ mod tests {
             sample_count: 0,
             level: 0.0,
             bars: [0; DICTATION_BARS],
+            loudness: Loudness::default(),
+            assistant: None,
+            last_dictated: None,
             next_tick: Instant::now(),
         }
+    }
+
+    #[test]
+    fn steady_speech_leaves_room_for_louder_syllables() {
+        let mut loudness = Loudness::default();
+        // A second of room noise, then several seconds of steady speech.
+        for _ in 0..30 {
+            loudness.place(-58.0);
+        }
+        let mut steady = 0.0;
+        for i in 0..150 {
+            steady = loudness.place(if i % 6 == 0 { -14.0 } else { -22.0 });
+        }
+        assert!(steady > 0.2 && steady < 0.8, "steady speech sits mid-range: {steady}");
+        assert!(loudness.place(-14.0) > steady + 0.15, "stressed syllables stand out");
+        assert!(loudness.place(-58.0) < 0.05, "pauses fall back to rest");
     }
 
     #[test]
@@ -1191,6 +1433,7 @@ mod tests {
                 reveal_at: Instant::now(),
                 revealed: false,
                 hands_free: false,
+                command: false,
                 began: true,
                 stop_requested: false,
                 pending: Vec::new(),

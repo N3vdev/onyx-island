@@ -17,7 +17,7 @@ use islet_core::handoff::Handoff;
 use islet_core::island::{
     arrange_at, AgentCard, AgentState, AlertLevel, ContentCard, ContentSnapshot, DictationCard,
     DictationPhase, LayoutTarget, MediaCard, NotificationCard, PillSize, COMPACT,
-    DEFAULT_MEDIA_ACCENT, DICTATION_BARS,
+    DEFAULT_MEDIA_ACCENT,
 };
 use islet_core::media::{
     expanded, format_clock, ArtImage, BarLevels, BarSmoother, MediaHover, BAR_COUNT,
@@ -69,7 +69,7 @@ use windows::Win32::Graphics::Dxgi::{
 };
 use windows_numerics::{Matrix3x2, Vector2};
 
-/// Pure black, as on iOS (PLAN §4.2).
+/// Pure black, as on iOS (PLAN Â§4.2).
 const FRAME_COLOR: D2D1_COLOR_F = D2D1_COLOR_F {
     r: 0.0,
     g: 0.0,
@@ -212,6 +212,8 @@ pub type RenderResult<T> = Result<T, RenderError>;
 #[cfg(test)]
 mod widget_tests;
 mod widgets;
+mod intro;
+mod voice;
 mod converter;
 
 pub struct Renderer {
@@ -247,6 +249,8 @@ pub struct Renderer {
     pixel_width: u32,
     pixel_height: u32,
     dpi: f32,
+    /// When the startup greeting began to show, while it is on screen.
+    intro_since: Option<f64>,
 }
 
 impl Renderer {
@@ -288,6 +292,7 @@ impl Renderer {
             pixel_width: config.pixel_width,
             pixel_height: config.pixel_height,
             dpi: config.dpi,
+            intro_since: None,
         })
     }
 
@@ -587,10 +592,23 @@ impl Renderer {
             return Ok(false);
         }
         self.presented = key;
+        // The greeting's clock starts with its first frame, after the device
+        // exists, so a slow start never skips its opening beats.
+        let greeting = |content: &ContentSnapshot| matches!(content.primary, Some(ContentCard::Intro));
+        let intro_t = if greeting(&self.content) || previous.is_some_and(greeting) {
+            (now - *self.intro_since.get_or_insert(now)) as f32
+        } else {
+            self.intro_since = None;
+            0.0
+        };
         // SAFETY: the renderer owns all graphics state and is only used from
         // the render thread that created it.
         unsafe {
             let gfx = self.gfx.as_mut().ok_or(RenderError::InvalidSize)?;
+            gfx.intro_t = intro_t;
+            if self.intro_since.is_none() {
+                gfx.intro_sheen = None;
+            }
             gfx.media_hover = self.media_hover;
             gfx.media_rest = self.media_rest;
             gfx.main_spring_height = sample.main_height;
@@ -659,7 +677,7 @@ impl Renderer {
                 },
                 ContentCard::Stats(stats) => format!("{stats:?}").hash(&mut hasher),
                 ContentCard::Glance(glance) => format!("{glance:?}").hash(&mut hasher),
-                ContentCard::Agent(_) | ContentCard::Dictation(_) => return None,
+                ContentCard::Agent(_) | ContentCard::Dictation(_) | ContentCard::Intro => return None,
                 ContentCard::Media(media) => {
                     // Mirrors `Gfx::draw_card`'s layout choice.
                     if rect.width < 60.0 && rect.height < 60.0 {
@@ -1088,7 +1106,7 @@ fn morph_of(
         ContentCard::Notification(_) | ContentCard::Agent(_) => {
             (COMPACT, islet_core::island::NOTIFICATION)
         }
-        ContentCard::Dictation(_) | ContentCard::Glance(_) => return None,
+        ContentCard::Dictation(_) | ContentCard::Glance(_) | ContentCard::Intro => return None,
     };
     if big.height <= small.height + 1.0 {
         return None;
@@ -1378,6 +1396,12 @@ struct Gfx {
     morph_part: Option<MorphPart>,
     /// The art is drawn on its own while morphing, so the looks skip it.
     skip_art: bool,
+    /// Seconds into the startup greeting, set by the renderer each frame.
+    intro_t: f32,
+    intro_sheen: Option<windows::Win32::Graphics::Direct2D::ID2D1LinearGradientBrush>,
+    intro_stroke: Option<ID2D1StrokeStyle>,
+    /// The dictation bars' springs, carried from frame to frame.
+    voice_bars: voice::VoiceBars,
     pixel_width: u32,
     pixel_height: u32,
     dpi: f32,
@@ -1548,6 +1572,10 @@ impl Gfx {
             main_spring_height: 0.0,
             morph_part: None,
             skip_art: false,
+            intro_t: 0.0,
+            intro_sheen: None,
+            intro_stroke: None,
+            voice_bars: voice::VoiceBars::default(),
             pixel_width: config.pixel_width,
             pixel_height: config.pixel_height,
             dpi: config.dpi,
@@ -2126,6 +2154,9 @@ impl Gfx {
         if let Some(part) = self.morph_part {
             return self.draw_card_part(now, width, height, card, accent, alpha, part);
         }
+        if let ContentCard::Intro = card {
+            return self.draw_intro(width, height, corner, accent, alpha);
+        }
         if width < 60.0 && height < 60.0 && !matches!(card, ContentCard::Dictation(_)) {
             return self.draw_bubble(now, width, height, corner, card, accent, alpha);
         }
@@ -2159,6 +2190,7 @@ impl Gfx {
             ContentCard::Dictation(dictation) => {
                 self.draw_dictation(now, width, height, dictation, accent, alpha)
             }
+            ContentCard::Intro => Ok(()),
         };
         drawn?;
         if height > 60.0
@@ -2268,7 +2300,7 @@ impl Gfx {
             }
             (ContentCard::Stats(stats), _) => self.draw_stats(w, h, stats, alpha),
             (ContentCard::Glance(glance), _) => self.draw_glance(w, h, glance, alpha),
-            (ContentCard::Dictation(_), _) => Ok(()),
+            (ContentCard::Dictation(_) | ContentCard::Intro, _) => Ok(()),
         };
         self.skip_art = false;
         self.dc.SetTransform(&base);
@@ -2388,7 +2420,7 @@ impl Gfx {
             }
             ContentCard::Glance(glance) => (glance_line(glance), None),
             ContentCard::Converter(_) | ContentCard::Calculator(_) | ContentCard::Stats(_) => return Ok(()),
-            ContentCard::Dictation(_) => return Ok(()),
+            ContentCard::Dictation(_) | ContentCard::Intro => return Ok(()),
         };
 
         let text_x = if trailing_bars.is_some() {
@@ -2948,27 +2980,12 @@ impl Gfx {
         }
         let icon = 36.0;
         let icon_y = (height - icon) * 0.5;
-        self.fill_round_rect(16.0, icon_y, icon, icon, 12.0, color(accent, 0.18 * alpha))?;
-        let initial = notification
-            .source
-            .chars()
-            .next()
-            .unwrap_or('I')
-            .to_uppercase()
-            .next()
-            .unwrap_or('I');
-        self.draw_text(
-            &initial.to_string(),
-            FormatId::Bubble,
-            16.0,
-            icon_y,
-            icon,
-            icon,
-            color(accent, 0.98 * alpha),
-        )?;
+        self.draw_notice_icon(Rect::new(16.0, icon_y, icon, icon), 12.0, notification, accent, alpha)?;
 
         let text_x = 64.0;
         let text_w = (width - text_x - 24.0).max(40.0);
+        // Without a source line the title and body sit centred.
+        let lift = if notification.source.is_empty() { 7.0 } else { 0.0 };
         self.draw_text(
             &notification.source.to_uppercase(),
             FormatId::Tiny,
@@ -2982,7 +2999,7 @@ impl Gfx {
             &notification.title,
             FormatId::Title,
             text_x,
-            26.0,
+            26.0 - lift,
             text_w,
             22.0,
             color([255, 255, 255], 0.98 * alpha),
@@ -2991,13 +3008,49 @@ impl Gfx {
             &notification.body,
             FormatId::Sub,
             text_x,
-            48.0,
+            48.0 - lift,
             text_w,
             17.0,
             color([177, 185, 204], 0.92 * alpha),
         )?;
 
         self.draw_alert_dot(width - 19.0, 19.0, notification.level, accent, alpha)
+    }
+
+    /// The square beside a notice: the app's own icon when there is one,
+    /// the Onyx mark for Onyx's own messages, else the sender's initial.
+    unsafe fn draw_notice_icon(
+        &mut self,
+        rect: Rect,
+        radius: f32,
+        notification: &NotificationCard,
+        accent: [u8; 3],
+        alpha: f32,
+    ) -> RenderResult<()> {
+        if let Some(icon) = &notification.icon {
+            return self.draw_art(rect, radius * 0.6, Some(icon), accent, alpha);
+        }
+        if notification.source.is_empty() {
+            // A tiny version of the app icon: a black pill with a silver
+            // rim and the lavender dot at its right end.
+            let pill_h = rect.height * 0.42;
+            let pill = Rect::new(rect.x + rect.width * 0.08, rect.y + (rect.height - pill_h) * 0.5, rect.width * 0.84, pill_h);
+            self.fill_round_rect(rect.x, rect.y, rect.width, rect.height, radius, color([255, 255, 255], 0.07 * alpha))?;
+            let rounded = D2D1_ROUNDED_RECT {
+                rect: D2D_RECT_F { left: pill.x, top: pill.y, right: pill.right(), bottom: pill.bottom() },
+                radiusX: pill_h * 0.5,
+                radiusY: pill_h * 0.5,
+            };
+            self.set_color(color([0, 0, 0], alpha));
+            self.dc.FillRoundedRectangle(&rounded, &self.brush);
+            self.set_color(color([214, 218, 230], 0.85 * alpha));
+            self.dc.DrawRoundedRectangle(&rounded, &self.brush, (rect.height / 24.0).max(1.0), None::<&ID2D1StrokeStyle>);
+            let dot = pill_h * 0.2;
+            return self.fill_circle(pill.right() - pill_h * 0.5, pill.y + pill_h * 0.5, dot, color(islet_core::island::INTRO_ACCENT, alpha));
+        }
+        self.fill_round_rect(rect.x, rect.y, rect.width, rect.height, radius, color(accent, 0.18 * alpha))?;
+        let initial = notification.source.chars().next().unwrap_or('I').to_uppercase().next().unwrap_or('I');
+        self.draw_text(&initial.to_string(), FormatId::Bubble, rect.x, rect.y, rect.width, rect.height, color(accent, 0.98 * alpha))
     }
 
     unsafe fn draw_notification_compact(
@@ -3010,38 +3063,24 @@ impl Gfx {
     ) -> RenderResult<()> {
         let icon = 24.0;
         let icon_y = (height - icon) * 0.5;
-        self.fill_round_rect(8.0, icon_y, icon, icon, 8.0, color(accent, 0.18 * alpha))?;
-        let initial = notification
-            .source
-            .chars()
-            .next()
-            .unwrap_or('I')
-            .to_uppercase()
-            .next()
-            .unwrap_or('I');
-        self.draw_text(
-            &initial.to_string(),
-            FormatId::Bubble,
-            8.0,
-            icon_y,
-            icon,
-            icon,
-            color(accent, 0.98 * alpha),
-        )?;
+        self.draw_notice_icon(Rect::new(8.0, icon_y, icon, icon), 8.0, notification, accent, alpha)?;
 
         let text_x = 40.0;
         let text_w = (width - text_x - 28.0).max(30.0);
+        // The second line names the sender; Onyx's own messages show their
+        // detail there instead, or centre a lone title.
+        let second = if notification.source.is_empty() { &notification.body } else { &notification.source };
         self.draw_text(
             &notification.title,
             FormatId::CompactTitle,
             text_x,
-            2.0,
+            if second.is_empty() { (height - 16.0) * 0.5 } else { 2.0 },
             text_w,
             16.0,
             color([255, 255, 255], 0.96 * alpha),
         )?;
         self.draw_text(
-            &notification.source,
+            second,
             FormatId::CompactSub,
             text_x,
             19.0,
@@ -3141,6 +3180,7 @@ impl Gfx {
                     AgentState::NeedsInput => AlertLevel::NeedsInput,
                     AgentState::Done => AlertLevel::Success,
                 },
+                icon: None,
             },
             accent,
             alpha,
@@ -3160,7 +3200,7 @@ impl Gfx {
         accent: [u8; 3],
         alpha: f32,
     ) -> RenderResult<()> {
-        const BARS: usize = 6;
+        use voice::BARS;
         const PITCH: f32 = 9.0;
         const BAR_WIDTH: f32 = 3.0;
 
@@ -3169,31 +3209,26 @@ impl Gfx {
         let span = (BARS - 1) as f32 * PITCH + BAR_WIDTH;
         let left = (width - span) * 0.5;
         let max_h = (height - 12.0).max(6.0);
-        // Each bar is the average of a few of the recent mic readings, newest
-        // on the right, so the bars flow calmly instead of flickering.
-        let group = DICTATION_BARS / BARS;
-        for index in 0..BARS {
-            let (level, bar_alpha) = match dictation.phase {
-                DictationPhase::Recording => {
-                    let from = index * group;
-                    let sum: u32 = dictation.bars[from..from + group]
-                        .iter()
-                        .map(|&value| u32::from(value))
-                        .sum();
-                    let level = sum as f32 / (group as f32 * 255.0);
-                    (level, 0.55 + 0.4 * (index as f32 / (BARS - 1) as f32))
+        // Loading shows the live mic too: the audio is already being kept,
+        // and the model catches up on it once it is ready.
+        let targets = match dictation.phase {
+            DictationPhase::Transcribing => {
+                let mut wave = [0.0; BARS];
+                for (index, value) in wave.iter_mut().enumerate() {
+                    let phase = (now * 6.0 - index as f64 * 0.8).sin() * 0.5 + 0.5;
+                    *value = 0.12 + 0.34 * phase as f32;
                 }
-                DictationPhase::Transcribing => {
-                    let wave = (now * 6.0 - index as f64 * 0.8).sin() * 0.5 + 0.5;
-                    (0.12 + 0.34 * wave as f32, 0.9)
-                }
-                // Loading, and anything else: a slow breathing pulse.
-                _ => {
-                    let breath = (now * 3.2 - index as f64 * 0.55).sin() * 0.5 + 0.5;
-                    (0.08 + 0.3 * breath as f32, 0.75)
-                }
+                wave
+            }
+            _ => voice::targets(&dictation.bars, now),
+        };
+        let heights = self.voice_bars.step(now, targets);
+        for (index, level) in heights.iter().enumerate() {
+            let bar_alpha = match dictation.phase {
+                DictationPhase::Transcribing => 0.9,
+                _ => 0.7 + 0.25 * (1.0 - (index as f32 - 2.5).abs() / 2.5),
             };
-            let bar_h = 3.0 + level.clamp(0.0, 1.0) * (max_h - 3.0);
+            let bar_h = 3.0 + level.max(0.0) * (max_h - 3.0);
             self.fill_round_rect(
                 left + index as f32 * PITCH,
                 mid - bar_h * 0.5,
@@ -3268,7 +3303,7 @@ impl Gfx {
                 let mark = match notification.level {
                     AlertLevel::NeedsInput => "!",
                     AlertLevel::Error => "!",
-                    AlertLevel::Success => "✓",
+                    AlertLevel::Success => "âœ“",
                     AlertLevel::Info => "i",
                 };
                 self.fill_round_rect(
@@ -3296,7 +3331,7 @@ impl Gfx {
             ContentCard::Dictation(_) => {
                 self.fill_circle(center_x, center_y, 5.0, color(accent, alpha))?;
             }
-            ContentCard::Converter(_) | ContentCard::Calculator(_) | ContentCard::Stats(_) | ContentCard::Glance(_) => {
+            ContentCard::Converter(_) | ContentCard::Calculator(_) | ContentCard::Stats(_) | ContentCard::Glance(_) | ContentCard::Intro => {
                 return Ok(())
             }
         }

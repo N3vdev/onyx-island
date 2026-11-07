@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod assistant;
 mod clock;
 mod config_watch;
 mod context_menu;
@@ -8,6 +9,7 @@ mod converter;
 mod file_drop;
 mod icon;
 mod last_music;
+mod learn;
 mod island_window;
 mod logging;
 mod occlusion;

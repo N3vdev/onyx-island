@@ -10,6 +10,7 @@ name = "islet-settings"
 path = "src/main.rs"
 
 [dependencies]
+serde_json = "1"
 islet-core = { path = "../islet-core" }
 islet-asr = { path = "../islet-asr" }
 islet-audio = { path = "../islet-audio" }

@@ -162,3 +162,36 @@ fn publish(shared: &Shared, endpoint: &Option<IAudioEndpointVolume>) {
         Err(_) => shared.valid.store(false, Ordering::Release),
     }
 }
+
+/// Sets the system volume (0..=1) and/or mute once, for a voice command.
+/// Runs on a short-lived thread with its own COM apartment so the caller's
+/// threading model never matters. Setting a level above zero also unmutes.
+#[must_use]
+pub fn set_master_once(level: Option<f32>, mute: Option<bool>) -> bool {
+    std::thread::spawn(move || {
+        // SAFETY: this thread owns its apartment until CoUninitialize below,
+        // and every interface is dropped before then.
+        unsafe {
+            if CoInitializeEx(None, COINIT_MULTITHREADED).is_err() {
+                return false;
+            }
+            let ok = open_endpoint().is_some_and(|device| {
+                let mut ok = true;
+                if let Some(level) = level {
+                    ok &= write(&device, level);
+                    if level > 0.0 && mute.is_none() {
+                        ok &= device.SetMute(false, std::ptr::null()).is_ok();
+                    }
+                }
+                if let Some(mute) = mute {
+                    ok &= device.SetMute(mute, std::ptr::null()).is_ok();
+                }
+                ok
+            });
+            CoUninitialize();
+            ok
+        }
+    })
+    .join()
+    .unwrap_or(false)
+}

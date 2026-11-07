@@ -19,20 +19,6 @@ fn reveal_in_explorer(path: &Path) {
         .spawn();
 }
 
-#[cfg(test)]
-mod reveal_tests {
-    use super::*;
-
-    #[test]
-    fn explorer_gets_the_path_quoted_on_its_own() {
-        let path = Path::new(r"C:\Users\me\My Files\report (watermarked).pdf");
-        assert_eq!(
-            explorer_select_arg(path),
-            r#"/select,"C:\Users\me\My Files\report (watermarked).pdf""#
-        );
-    }
-}
-
 impl IslandHost {
     pub(super) fn converter_visible(&self) -> bool {
         self.state.expanded
@@ -413,5 +399,19 @@ impl IslandHost {
         self.converter_outputs.clear();
         self.dispatch(IslandEvent::SetConverter(None));
         self.release_calculator_focus();
+    }
+}
+
+#[cfg(test)]
+mod reveal_tests {
+    use super::*;
+
+    #[test]
+    fn explorer_gets_the_path_quoted_on_its_own() {
+        let path = Path::new(r"C:\Users\me\My Files\report (watermarked).pdf");
+        assert_eq!(
+            explorer_select_arg(path),
+            r#"/select,"C:\Users\me\My Files\report (watermarked).pdf""#
+        );
     }
 }

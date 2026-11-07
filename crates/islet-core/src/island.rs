@@ -23,6 +23,8 @@ pub const fn visible_ms(level: AlertLevel) -> u32 {
         _ => DONE_VISIBLE_MS,
     }
 }
+/// A notice this close to its time is gone (timers fire a few ms early).
+const DONE_EXPIRY_SLACK: f64 = 0.05;
 /// Default delay before paused media closes (`media.pause_hide_seconds`).
 pub const MEDIA_PAUSED_MS: u32 = 5 * 1_000;
 /// Keep the track title and artist visible this long before shrinking to art and bars.
@@ -54,6 +56,11 @@ pub const STATS: PillSize = PillSize::new(
 );
 /// Small and sleek: just six bars (see the renderer), no text or timer.
 pub const DICTATION: PillSize = PillSize::new(92.0, 32.0, 16.0);
+/// The startup pill, shaped like the pill on the app icon, shown once when
+/// the app starts.
+pub const INTRO: PillSize = PillSize::new(112.0, 40.0, 20.0);
+/// The glowing dot on the app icon.
+pub const INTRO_ACCENT: [u8; 3] = [168, 178, 255];
 /// Bar colour of a music pill whose art gave no colour.
 pub const DEFAULT_MEDIA_ACCENT: [u8; 3] = [92, 132, 255];
 /// Dictation bar colour when no music has played yet.
@@ -313,10 +320,15 @@ impl MediaCard {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct NotificationCard {
+    /// Who it is from ("Claude Code"). Empty for Onyx's own messages, which
+    /// show the Onyx mark instead of a name.
     pub source: String,
     pub title: String,
     pub body: String,
     pub level: AlertLevel,
+    /// The app it is about (the assistant's "Opening Spotify"), drawn in
+    /// place of the source's initial.
+    pub icon: Option<crate::media::ArtImage>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -336,6 +348,8 @@ pub struct DictationCard {
     pub bars: [u8; DICTATION_BARS],
     /// Locked on with the hands-free hotkey; shown as a ring around the dot.
     pub hands_free: bool,
+    /// A command for the assistant: the bars take the assistant's colour.
+    pub command: bool,
 }
 
 impl Default for DictationCard {
@@ -346,6 +360,7 @@ impl Default for DictationCard {
             phase: DictationPhase::Recording,
             bars: [0; DICTATION_BARS],
             hands_free: false,
+            command: false,
         }
     }
 }
@@ -374,6 +389,8 @@ pub enum ContentCard {
     Notification(NotificationCard),
     Agent(AgentCard),
     Dictation(DictationCard),
+    /// The startup greeting: the renderer animates it from when it appears.
+    Intro,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -386,6 +403,7 @@ pub enum CardKind {
     Notification,
     Agent,
     Dictation,
+    Intro,
 }
 
 impl ContentCard {
@@ -400,6 +418,7 @@ impl ContentCard {
             Self::Notification(_) => CardKind::Notification,
             Self::Agent(_) => CardKind::Agent,
             Self::Dictation(_) => CardKind::Dictation,
+            Self::Intro => CardKind::Intro,
         }
     }
 
@@ -422,7 +441,7 @@ impl ContentCard {
     pub fn animates(&self) -> bool {
         match self {
             Self::Media(media) => media.playing,
-            Self::Dictation(_) => true,
+            Self::Dictation(_) | Self::Intro => true,
             Self::Notification(_)
             | Self::Converter(_)
             | Self::Agent(_)
@@ -505,6 +524,8 @@ pub struct IslandState {
     /// the opened island always starts on. Kept across collapse.
     pub widget: Option<WidgetKind>,
     pub cpu_hot: bool,
+    /// The startup greeting is showing (the first seconds after launch).
+    pub intro: bool,
     /// The last song played (paused), kept across restarts. Opening the
     /// island with no player open shows it first; the pill never does.
     pub remembered: Option<MediaCard>,
@@ -554,6 +575,7 @@ impl Default for IslandState {
             stats: None,
             widget: None,
             cpu_hot: false,
+            intro: false,
             remembered: None,
             glance: None,
             compact_widget: None,
@@ -684,6 +706,9 @@ impl IslandState {
         if let Some(notification) = &self.needs_input {
             return Some(ContentCard::Notification(notification.clone()));
         }
+        if self.intro && !self.expanded {
+            return Some(ContentCard::Intro);
+        }
         if self.expanded {
             if let Some(converter) = &self.converter {
                 return Some(ContentCard::Converter(converter.clone()));
@@ -792,6 +817,10 @@ impl IslandState {
         if self.dictation.is_some() {
             return LayoutTarget::single(DICTATION);
         }
+        // Shown whatever the idle style, even tucked: it is a greeting.
+        if self.intro && !self.expanded && self.needs_input.is_none() {
+            return LayoutTarget::single(INTRO);
+        }
 
         // Out of the way of the window behind; hovering expands as usual.
         // The pill keeps its normal shape and just docks at the other edge.
@@ -854,6 +883,8 @@ impl IslandState {
         };
 
         let accent = match &primary {
+            // A command for the assistant takes the logo's colour.
+            Some(ContentCard::Dictation(card)) if card.command => INTRO_ACCENT,
             Some(ContentCard::Dictation(_)) => {
                 self.last_music_accent.unwrap_or(DICTATION_FALLBACK_ACCENT)
             }
@@ -1164,17 +1195,23 @@ pub fn reduce(state: &mut IslandState, event: IslandEvent, now: f64) -> Vec<Effe
                 Vec::new()
             }
         }
-        IslandEvent::Tick { now } => {
-            if state.done_deadline.is_some_and(|deadline| now >= deadline) {
+        IslandEvent::Tick { now } => match state.done_deadline {
+            Some(deadline) if now + DONE_EXPIRY_SLACK >= deadline => {
                 state.done = None;
                 state.done_deadline = None;
                 let mut effects = Effect::changed();
                 effects.push(Effect::CancelTimer(TimerKind::DoneExpiry));
                 effects
-            } else {
-                Vec::new()
             }
-        }
+            // Windows timers can fire a little early. The timer is single
+            // shot, so without a new one the notice would never go: check
+            // again when the rest of its time is up.
+            Some(deadline) => vec![Effect::ArmTimer {
+                kind: TimerKind::DoneExpiry,
+                after_ms: ((deadline - now) * 1000.0).ceil().max(1.0) as u32 + 16,
+            }],
+            None => Vec::new(),
+        },
         IslandEvent::SetExpanded(expanded) => {
             if state.expanded != expanded {
                 state.expanded = expanded;
@@ -1406,6 +1443,7 @@ fn accent_for_card(card: &ContentCard) -> [u8; 3] {
         },
         // Chosen in `IslandState::content` from the last music colour.
         ContentCard::Dictation(_) => DICTATION_FALLBACK_ACCENT,
+        ContentCard::Intro => INTRO_ACCENT,
     }
 }
 
@@ -1705,6 +1743,7 @@ mod tests {
             title: "Claude finished".to_owned(),
             body: "Refactored auth.rs".to_owned(),
             level,
+            icon: None,
         }
     }
 
@@ -2020,6 +2059,15 @@ mod tests {
     }
 
     #[test]
+    fn a_timer_firing_a_few_ms_early_still_clears_the_notice() {
+        let mut state = IslandState::default();
+        reduce(&mut state, IslandEvent::SetDone(Some(notification(AlertLevel::Success))), 10.0);
+        let deadline = state.done_deadline.unwrap();
+        reduce(&mut state, IslandEvent::Tick { now: deadline - 0.008 }, deadline - 0.008);
+        assert!(state.done.is_none());
+    }
+
+    #[test]
     fn done_notifications_expire_after_four_seconds() {
         let mut state = IslandState::default();
         let effects = reduce(
@@ -2033,8 +2081,13 @@ mod tests {
         }));
         assert!(state.done.is_some());
 
-        assert!(reduce(&mut state, IslandEvent::Tick { now: 13.9 }, 13.9).is_empty());
+        // A tick before the time is up keeps the notice and checks again.
+        let early = reduce(&mut state, IslandEvent::Tick { now: 13.9 }, 13.9);
         assert!(state.done.is_some());
+        assert!(matches!(
+            early.as_slice(),
+            [Effect::ArmTimer { kind: TimerKind::DoneExpiry, after_ms }] if (100..200).contains(after_ms)
+        ));
 
         let effects = reduce(&mut state, IslandEvent::Tick { now: 14.0 }, 14.0);
         assert!(effects.contains(&Effect::LayoutChanged));
@@ -2239,7 +2292,7 @@ mod tests {
             kind: TimerKind::DoneExpiry,
             after_ms: INFO_VISIBLE_MS,
         }));
-        assert!(reduce(&mut state, IslandEvent::Tick { now: 12.4 }, 12.4).is_empty());
+        assert!(!reduce(&mut state, IslandEvent::Tick { now: 12.4 }, 12.4).contains(&Effect::LayoutChanged));
         assert!(!reduce(&mut state, IslandEvent::Tick { now: 12.5 }, 12.5).is_empty());
         assert!(state.done.is_none());
 
@@ -2529,12 +2582,38 @@ mod compact_gesture_tests {
     use super::*;
     #[test]
     fn selected_glance_has_content_and_size_without_media() {
-        let mut state = IslandState::default();
-        state.compact_widget = Some(IdleGlance::Clock);
+        let mut state = IslandState {
+            compact_widget: Some(IdleGlance::Clock),
+            ..IslandState::default()
+        };
         assert!(state.has_activity());
         assert_eq!(state.layout().main, GLANCE_CLOCK);
         assert!(matches!(state.content().primary, Some(ContentCard::Glance(_))));
         state.compact_widget = Some(IdleGlance::Stats);
         assert_eq!(state.layout().main, GLANCE_STATS);
+    }
+}
+
+#[cfg(test)]
+mod intro_tests {
+    use super::*;
+
+    #[test]
+    fn the_greeting_shows_even_when_the_idle_island_is_hidden() {
+        let mut state = IslandState { intro: true, ..IslandState::default() };
+        assert_eq!(state.layout(), LayoutTarget::single(INTRO));
+        assert_eq!(state.content().primary, Some(ContentCard::Intro));
+        state.intro = false;
+        assert!(!state.layout().visible);
+    }
+
+    #[test]
+    fn dictation_and_opening_the_island_take_over_from_the_greeting() {
+        let mut state = IslandState { intro: true, ..IslandState::default() };
+        state.dictation = Some(DictationCard::default());
+        assert_eq!(state.layout(), LayoutTarget::single(DICTATION));
+        state.dictation = None;
+        state.expanded = true;
+        assert_ne!(state.content().primary, Some(ContentCard::Intro));
     }
 }

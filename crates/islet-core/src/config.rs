@@ -174,6 +174,14 @@ pub struct DictationConfig {
     pub hands_free: String,
     /// Hands-free mode: off by default, so the one hotkey is hold-to-speak.
     pub hands_free_enabled: bool,
+    /// The voice assistant: hold `assistant_hotkey` and say a command
+    /// ("open Spotify", "next song", "type see you soon").
+    pub assistant_enabled: bool,
+    pub assistant_hotkey: String,
+    /// Learn from your corrections: after a dictation, notice words you
+    /// changed in what Onyx typed and keep the pair on this PC only. Off by
+    /// default.
+    pub learn_corrections: bool,
     pub filler_removal: bool,
     pub spoken_punctuation: bool,
     pub injection: InjectionMethod,
@@ -282,6 +290,9 @@ impl Default for DictationConfig {
             push_to_talk: "Right Ctrl".to_owned(),
             hands_free: "Ctrl+Win+Space".to_owned(),
             hands_free_enabled: false,
+            assistant_enabled: true,
+            assistant_hotkey: "Right Alt".to_owned(),
+            learn_corrections: false,
             filler_removal: true,
             spoken_punctuation: true,
             injection: InjectionMethod::Clipboard,
@@ -424,6 +435,7 @@ impl Config {
         self.dictation.unload_after_minutes = self.dictation.unload_after_minutes.clamp(1, 240);
         self.dictation.push_to_talk = self.dictation.push_to_talk.trim().to_owned();
         self.dictation.hands_free = self.dictation.hands_free.trim().to_owned();
+        self.dictation.assistant_hotkey = self.dictation.assistant_hotkey.trim().to_owned();
         self.media.pause_hide_seconds = self.media.pause_hide_seconds.clamp(1, 300);
         for list in [&mut self.dictation.dictionary, &mut self.dictation.snippets] {
             list.retain(|entry| !entry.from.trim().is_empty());

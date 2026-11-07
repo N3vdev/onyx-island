@@ -27,6 +27,7 @@ const OK: Color32 = Color32::from_rgb(64, 210, 122);
 enum HotkeyTarget {
     PushToTalk,
     HandsFree,
+    Assistant,
 }
 
 /// A hotkey being captured: held keys are polled until all are released.
@@ -64,6 +65,54 @@ pub struct DictationUi {
     messages: Vec<(&'static str, String, bool)>,
     new_word: Replacement,
     new_snippet: Replacement,
+    /// Saved corrections, re-read every few seconds while the page is open.
+    learned: Learned,
+}
+
+/// What the corrections file holds: how many, and the word swaps you made
+/// more than once (most frequent first).
+#[derive(Default)]
+struct Learned {
+    read_at: Option<std::time::Instant>,
+    count: usize,
+    swaps: Vec<(String, String, usize)>,
+}
+
+fn corrections_file() -> PathBuf {
+    // Tests point this at their own file, never the user's.
+    if let Some(path) = std::env::var_os("ONYX_CORRECTIONS_FILE") {
+        return PathBuf::from(path);
+    }
+    std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("Islet")
+        .join("corrections.jsonl")
+}
+
+impl Learned {
+    fn refresh(&mut self) {
+        if self.read_at.is_some_and(|at| at.elapsed() < Duration::from_secs(3)) {
+            return;
+        }
+        self.read_at = Some(std::time::Instant::now());
+        let text = std::fs::read_to_string(corrections_file()).unwrap_or_default();
+        let mut counts: std::collections::HashMap<(String, String), usize> = std::collections::HashMap::new();
+        self.count = 0;
+        for line in text.lines() {
+            let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+            self.count += 1;
+            for swap in record["swaps"].as_array().into_iter().flatten() {
+                if let (Some(heard), Some(meant)) = (swap[0].as_str(), swap[1].as_str()) {
+                    *counts.entry((heard.to_owned(), meant.to_owned())).or_default() += 1;
+                }
+            }
+        }
+        let mut swaps: Vec<_> = counts.into_iter().filter(|(_, n)| *n >= 2).map(|((h, m), n)| (h, m, n)).collect();
+        swaps.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+        swaps.truncate(8);
+        self.swaps = swaps;
+    }
 }
 
 fn models_dir() -> PathBuf {
@@ -87,6 +136,7 @@ impl DictationUi {
             messages: Vec::new(),
             new_word: Replacement::default(),
             new_snippet: Replacement::default(),
+            learned: Learned::default(),
         }
     }
 
@@ -355,6 +405,7 @@ fn hotkey_row(
     let current = match target {
         HotkeyTarget::PushToTalk => app.config.dictation.push_to_talk.clone(),
         HotkeyTarget::HandsFree => app.config.dictation.hands_free.clone(),
+        HotkeyTarget::Assistant => app.config.dictation.assistant_hotkey.clone(),
     };
     let is_set = !current.trim().is_empty();
     let mut start_capture = false;
@@ -390,6 +441,7 @@ fn hotkey_row(
         match target {
             HotkeyTarget::PushToTalk => app.config.dictation.push_to_talk.clear(),
             HotkeyTarget::HandsFree => app.config.dictation.hands_free.clear(),
+            HotkeyTarget::Assistant => app.config.dictation.assistant_hotkey.clear(),
         }
         app.dictation_ui.capture = None;
         app.dictation_ui.capture_error = None;
@@ -715,6 +767,7 @@ pub fn show(app: &mut SettingsApp, ui: &mut egui::Ui) {
         match target {
             HotkeyTarget::PushToTalk => app.config.dictation.push_to_talk = text,
             HotkeyTarget::HandsFree => app.config.dictation.hands_free = text,
+            HotkeyTarget::Assistant => app.config.dictation.assistant_hotkey = text,
         }
     }
     if app.dictation_ui.capture.is_some() || !app.dictation_ui.jobs.is_empty() {
@@ -801,6 +854,109 @@ pub fn show(app: &mut SettingsApp, ui: &mut egui::Ui) {
             .small()
             .color(MUTED),
         );
+    });
+
+    card(ui, "Voice assistant", |ui| {
+        row(
+            ui,
+            "Voice assistant",
+            "Hold the assistant hotkey and say what to do. It works offline, and nothing you say leaves this PC.",
+            |ui| {
+                toggle(ui, &mut app.config.dictation.assistant_enabled, "Voice assistant");
+            },
+        );
+        if app.config.dictation.assistant_enabled {
+            divider(ui);
+            hotkey_row(
+                app,
+                ui,
+                HotkeyTarget::Assistant,
+                "Assistant hotkey",
+                "Hold to speak a command, release to run it. The bars turn lavender while it listens.",
+            );
+            ui.add_space(4.0);
+            for (what, examples) in [
+                ("Apps", "\u{201c}Open Spotify\u{201d}, \u{201c}switch to Chrome\u{201d}, \u{201c}close Notepad\u{201d}"),
+                ("Music", "\u{201c}Play\u{201d}, \u{201c}pause\u{201d}, \u{201c}next song\u{201d}, \u{201c}play Blinding Lights on Spotify\u{201d}"),
+                ("Volume", "\u{201c}Volume up\u{201d}, \u{201c}set volume to 40\u{201d}, \u{201c}mute\u{201d}"),
+                ("Typing", "\u{201c}Type see you at five\u{201d} types into the window you're in"),
+                ("Web", "\u{201c}Search for flights to Dubai\u{201d}, \u{201c}search lo-fi on YouTube\u{201d}, \u{201c}open Gmail\u{201d}"),
+                ("Windows", "\u{201c}Minimize this\u{201d}, \u{201c}show desktop\u{201d}, \u{201c}take a screenshot\u{201d}, \u{201c}lock my PC\u{201d}"),
+            ] {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(what).small().strong());
+                    ui.label(RichText::new(examples).small().color(MUTED));
+                });
+            }
+        } else if app
+            .dictation_ui
+            .capture
+            .as_ref()
+            .is_some_and(|capture| capture.target == HotkeyTarget::Assistant)
+        {
+            app.dictation_ui.capture = None;
+        }
+    });
+
+    card(ui, "Learn from corrections", |ui| {
+        row(
+            ui,
+            "Learn from my corrections",
+            "After a dictation, notice words you change in what Onyx typed. Only the dictated sentence and your edit are kept, on this PC. Password fields and other windows are never read.",
+            |ui| {
+                toggle(ui, &mut app.config.dictation.learn_corrections, "Learn from my corrections");
+            },
+        );
+        app.dictation_ui.learned.refresh();
+        let learned = &app.dictation_ui.learned;
+        if learned.count > 0 || app.config.dictation.learn_corrections {
+            divider(ui);
+            let mut delete = false;
+            row(
+                ui,
+                &format!("{} correction{} saved", learned.count, if learned.count == 1 { "" } else { "s" }),
+                "Kept in corrections.jsonl in Onyx's data folder. Used to suggest dictionary words below, and later to train the cleanup model.",
+                |ui| {
+                    if learned.count > 0 && ui.button("Delete all").clicked() {
+                        delete = true;
+                    }
+                    if ui.button("Show file").clicked() {
+                        let file = corrections_file();
+                        if file.exists() {
+                            let _ = std::process::Command::new("explorer").arg("/select,").arg(&file).spawn();
+                        } else if let Some(folder) = file.parent() {
+                            let _ = std::process::Command::new("explorer").arg(folder).spawn();
+                        }
+                    }
+                },
+            );
+            if delete {
+                let _ = std::fs::remove_file(corrections_file());
+                app.dictation_ui.learned = Learned::default();
+            }
+        }
+        let suggestions: Vec<(String, String, usize)> = app
+            .dictation_ui
+            .learned
+            .swaps
+            .iter()
+            .filter(|(heard, meant, _)| {
+                !app.config.dictation.dictionary.iter().any(|entry| entry.from.eq_ignore_ascii_case(heard) && entry.to.eq_ignore_ascii_case(meant))
+            })
+            .cloned()
+            .collect();
+        if !suggestions.is_empty() {
+            divider(ui);
+            ui.label(RichText::new("Words you often correct").small().strong());
+            for (heard, meant, times) in suggestions {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("\u{201c}{heard}\u{201d} corrected to \u{201c}{meant}\u{201d}, {times} times")).small());
+                    if ui.small_button("Add to dictionary").on_hover_text("Always write this word as you corrected it").clicked() {
+                        app.config.dictation.dictionary.push(Replacement { from: heard.clone(), to: meant.clone() });
+                    }
+                });
+            }
+        }
     });
 
     card(ui, "Microphone", |ui| {
