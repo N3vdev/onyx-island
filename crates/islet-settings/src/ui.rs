@@ -10,14 +10,14 @@ use islet_core::config::{ExpandTrigger, IdleGlance, IdleStyle, MonitorChoice, Sc
 
 use crate::{Page, SettingsApp};
 
-const BG: Color32 = Color32::from_rgb(16, 17, 19);
+pub(crate) const BG: Color32 = Color32::from_rgb(16, 17, 19);
 const SIDEBAR: Color32 = BG;
-const CARD: Color32 = Color32::from_rgb(23, 24, 27);
-const CARD_LINE: Color32 = Color32::from_rgb(47, 49, 53);
-const TEXT: Color32 = Color32::from_rgb(236, 237, 242);
-const MUTED: Color32 = Color32::from_rgb(166, 170, 178);
-const ACCENT: Color32 = Color32::from_rgb(164, 204, 180);
-const DANGER: Color32 = Color32::from_rgb(255, 110, 110);
+pub(crate) const CARD: Color32 = Color32::from_rgb(23, 24, 27);
+pub(crate) const CARD_LINE: Color32 = Color32::from_rgb(47, 49, 53);
+pub(crate) const TEXT: Color32 = Color32::from_rgb(236, 237, 242);
+pub(crate) const MUTED: Color32 = Color32::from_rgb(166, 170, 178);
+pub(crate) const ACCENT: Color32 = Color32::from_rgb(164, 204, 180);
+pub(crate) const DANGER: Color32 = Color32::from_rgb(255, 110, 110);
 
 /// Mouse-wheel scrolling at the speed of other Windows apps. egui moves 40
 /// points per wheel notch; Windows apps move the user's "lines to scroll at a
@@ -117,8 +117,8 @@ pub fn install_theme(ctx: &egui::Context) {
 
 /// Keep Windows' native caption controls while matching the settings frame.
 /// Older Windows versions retain their system caption if an attribute is unsupported.
-pub fn install_titlebar_theme() {
-    use windows::core::w;
+pub fn install_titlebar_theme(title: &str) {
+    use windows::core::PCWSTR;
     use windows::Win32::Graphics::Dwm::{
         DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR,
         DWMWA_USE_IMMERSIVE_DARK_MODE,
@@ -127,7 +127,8 @@ pub fn install_titlebar_theme() {
 
     // The native window exists before eframe invokes the app creation callback.
     unsafe {
-        let Ok(hwnd) = FindWindowW(None, w!("Onyx Settings")) else {
+        let wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+        let Ok(hwnd) = FindWindowW(None, PCWSTR(wide.as_ptr())) else {
             return;
         };
         let colorref = |color: Color32| {
@@ -250,7 +251,7 @@ pub fn draw(app: &mut SettingsApp, ctx: &egui::Context) {
         });
 }
 
-fn bold_font(size: f32) -> FontId {
+pub(crate) fn bold_font(size: f32) -> FontId {
     FontId::new(size, FontFamily::Name("Nunito Bold".into()))
 }
 
@@ -847,6 +848,19 @@ fn about(app: &mut SettingsApp, ui: &mut egui::Ui) {
         row(ui, "Version", "", |ui| {
             ui.label(RichText::new(env!("CARGO_PKG_VERSION")).color(MUTED));
         });
+        divider(ui);
+        row(
+            ui,
+            "Welcome tour",
+            "Set up dictation again, try it, and see what the island can do.",
+            |ui| {
+                if ui.button("Open tour").clicked() {
+                    if let Ok(exe) = std::env::current_exe() {
+                        let _ = std::process::Command::new(exe).arg("--onboarding").spawn();
+                    }
+                }
+            },
+        );
         divider(ui);
         row(
             ui,

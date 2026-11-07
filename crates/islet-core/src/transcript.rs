@@ -1738,14 +1738,28 @@ fn split_lead_in<'a>(parts: &[&'a str]) -> Vec<&'a str> {
 
 /// "Make a list of things to pack: passport, charger, headphones and a
 /// jacket." → a bullet per item. Only when a list was asked for, the items
-/// end the dictation, and there are three or more short ones.
+/// end the dictation, and there are three or more short ones. A counted
+/// lead-in ("I need 3 things: milk, eggs and bread") counts as asking when
+/// the count matches the items.
 fn inline_list(parts: &[&str]) -> Option<String> {
     if parts.len() < 2 {
         return colon_less_list(parts);
     }
     let intro = parts.len() - 2;
-    let introduced = parts[intro].ends_with(':') || (parts[intro].ends_with('.') && explicit_bullets(parts[intro]));
-    if !introduced || !explicit_bullets(&parts[..=intro].join(" ")) {
+    let asked = explicit_bullets(&parts[..=intro].join(" "));
+    // "I need three things: ..." anywhere before the colon; after a full
+    // stop only when the sentence ends on the count ("I need three things.").
+    let counted = if parts[intro].ends_with(':') {
+        announced_count(parts[intro])
+    } else if parts[intro].ends_with('.') {
+        counted_lead(parts[intro])
+    } else {
+        None
+    };
+    let introduced = parts[intro].ends_with(':')
+        || (parts[intro].ends_with('.') && explicit_bullets(parts[intro]))
+        || counted.is_some();
+    if !introduced || (!asked && counted.is_none()) {
         return colon_less_list(parts);
     }
     let body = parts[intro + 1].trim_end_matches(['.', '!', ';']);
@@ -1761,8 +1775,15 @@ fn inline_list(parts: &[&str]) -> Option<String> {
         items.push(after);
     }
     let items: Vec<&str> = items.into_iter().map(str::trim).filter(|item| !item.is_empty()).collect();
-    if items.len() < 3 || items.iter().any(|item| item.split_whitespace().count() > 6) {
+    if items.iter().any(|item| item.split_whitespace().count() > 6) {
         return None;
+    }
+    match counted {
+        // "Two things: X and Y" is a list too, but only if the count fits.
+        Some(count) if !asked && (count != items.len() || count < 2) => return None,
+        None if items.len() < 3 => return None,
+        _ if items.len() < 2 => return None,
+        _ => {}
     }
     let mut out = heading(&parts[..=intro]);
     for item in items {
@@ -1781,6 +1802,9 @@ fn colon_less_list(parts: &[&str]) -> Option<String> {
         "some", "these", "those", "my", "our",
     ];
     let last = *parts.last()?;
+    if let Some(list) = counted_list(parts) {
+        return Some(list);
+    }
     if !explicit_bullets(last) || last.matches(", ").count() < 1 {
         return None;
     }
@@ -1947,6 +1971,49 @@ fn bulletize(text: String) -> String {
 }
 
 /// The count in "I want three things" / "here are 4 points".
+/// The count when `sentence` ends on it: "I need three things." -> 3.
+fn counted_lead(sentence: &str) -> Option<usize> {
+    let words: Vec<&str> = sentence.split_whitespace().collect();
+    (words.len() >= 2)
+        .then(|| announced_count(&words[words.len() - 2..].join(" ")))
+        .flatten()
+}
+
+/// "I need three things, milk, eggs and bread", or with no stop heard at
+/// all, "I need three things milk eggs and bread": the items start right
+/// after the count. A list only when the items match the count.
+fn counted_list(parts: &[&str]) -> Option<String> {
+    let last = *parts.last()?;
+    let words: Vec<&str> = last.split_whitespace().collect();
+    let at = (0..words.len().saturating_sub(1))
+        .rev()
+        .find(|&i| announced_count(&format!("{} {}", words[i], words[i + 1])).is_some())?;
+    let count = announced_count(&format!("{} {}", words[at], words[at + 1]))?;
+    let lead = words[..=at + 1].join(" ");
+    let rest = words[at + 2..].join(" ");
+    let rest = rest.trim_start_matches([',', ':', ';', ' ']);
+    if rest.is_empty() {
+        return None;
+    }
+    let body = if rest.contains(", ") {
+        rest.to_owned()
+    } else {
+        // No commas: one word per item, then "and" before the last one.
+        let plain = rest.trim_end_matches(['.', '!', '?']);
+        let (before, after) = plain.rsplit_once(" and ").or_else(|| plain.rsplit_once(" or "))?;
+        let singles: Vec<&str> = before.split_whitespace().collect();
+        if count < 3 || singles.len() + 1 != count || after.split_whitespace().count() > 3 {
+            return None;
+        }
+        format!("{}, {after}.", singles.join(", "))
+    };
+    let mut lead_parts: Vec<&str> = parts[..parts.len() - 1].to_vec();
+    let lead_line = format!("{}:", lead.trim_end_matches([',', ':', ';']));
+    lead_parts.push(&lead_line);
+    let lead = lead_parts.join(" ");
+    inline_list(&[&lead, &body]).filter(|out| out.contains("\n- "))
+}
+
 fn announced_count(sentence: &str) -> Option<usize> {
     let words: Vec<String> = sentence.split_whitespace().map(bare_word).collect();
     words.iter().enumerate().find_map(|(index, word)| {
@@ -3930,6 +3997,33 @@ mod list_layout_tests {
 
 #[cfg(test)]
 mod dictated_list_tests {
+    #[test]
+    fn a_counted_lead_in_makes_a_list_when_the_count_fits() {
+        let bullets = "I need 3 things:\n- Milk\n- Eggs\n- Bread";
+        for said in [
+            "I need 3 things: milk, eggs, and bread.",
+            "I need three things: milk, eggs and bread.",
+            "I need three things, milk, eggs, and bread.",
+            // Nothing heard after the count, or a full stop there.
+            "I need three things milk, eggs, and bread.",
+            "I need three things milk eggs and bread.",
+            "I need three things. Milk, eggs, and bread.",
+        ] {
+            assert_eq!(cleaned(said), bullets, "{said}");
+        }
+        // The count must match, and the noun must be a list word.
+        for prose in [
+            "I need 3 things: milk and eggs.",
+            "I have three kids: Anna, Ben and Carl.",
+            "We tried three things, none of them worked, sadly.",
+            "I tried two things today and yesterday.",
+            "I need three things. Milk and eggs are two of them.",
+        ] {
+            let out = cleaned(prose);
+            assert!(!out.contains("\n- "), "{prose} -> {out}");
+        }
+    }
+
     use super::{accept_rewrite, clean, format_numbers, TextOptions};
 
     fn options() -> TextOptions {

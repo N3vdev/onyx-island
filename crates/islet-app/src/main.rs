@@ -94,9 +94,13 @@ fn run(paths: Paths) -> Result<(), Box<dyn std::error::Error>> {
     if !existed {
         config.save_atomic(&paths.config_file)?;
         tracing::info!(path = %paths.config_file.display(), "wrote default config");
-        // First run after install: show the settings so the user can set
-        // things up.
-        settings::open(None);
+    }
+    if !config.general.onboarded {
+        // First run: the welcome tour, once the startup animation has played.
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(3_200));
+            settings::open_onboarding();
+        });
     }
 
     let shared = Arc::new(RwLock::new(config));

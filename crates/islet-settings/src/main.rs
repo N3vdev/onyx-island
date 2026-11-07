@@ -9,6 +9,8 @@
 mod autostart;
 mod customize;
 mod dictation_page;
+mod onboarding;
+mod showcase;
 mod preview;
 mod ui;
 
@@ -28,6 +30,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 const WINDOW_TITLE: &str = "Onyx Settings";
 
 fn main() -> eframe::Result {
+    if std::env::args().any(|arg| arg == "--onboarding") {
+        return onboarding::run(config_path(), Arc::new(window_icon()));
+    }
     // One settings window per session: a second launch focuses the first.
     // SAFETY: plain named-mutex creation; the handle lives until exit.
     let mutex = unsafe { CreateMutexW(None, true, w!("Local\\Islet.Settings")) };
@@ -126,7 +131,7 @@ impl SettingsApp {
     ) -> Self {
         ui::install_theme(&cc.egui_ctx);
         ui::install_scrolling(&cc.egui_ctx);
-        ui::install_titlebar_theme();
+        ui::install_titlebar_theme(WINDOW_TITLE);
         Self {
             customization: None,
             preview: preview::PreviewLink::default(),
@@ -165,6 +170,11 @@ impl SettingsApp {
         normalized.normalize();
         if normalized == self.saved {
             return;
+        }
+        // The welcome tour may have finished while this window was open.
+        if let Ok(disk) = Config::load(&self.config_file) {
+            normalized.general.onboarded |= disk.general.onboarded;
+            self.config.general.onboarded = normalized.general.onboarded;
         }
         let mut startup_error = None;
         if normalized.general.start_with_windows != self.saved.general.start_with_windows {

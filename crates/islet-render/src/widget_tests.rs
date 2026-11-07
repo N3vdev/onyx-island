@@ -124,6 +124,34 @@ fn capture_widget_previews() {
             &directory.join("widget-navigation.tga"),
         )
         .unwrap();
+        // The system stats page, to compare with the calculator's size. One
+        // renderer per window at a time.
+        drop(renderer);
+        let mut renderer = calculator_renderer(hwnd, 1.0);
+        let stats = islet_core::widgets::SystemStats {
+            cpu: 0.42,
+            gpu: Some(0.18),
+            ram_used: 9_800_000_000,
+            ram_total: 16_000_000_000,
+            down_bps: 2_400_000.0,
+            up_bps: 310_000.0,
+            temp_c: Some(54.0),
+            cpu_history: (0..40).map(|i| 0.3 + 0.2 * ((i as f32) * 0.4).sin()).collect(),
+            ..Default::default()
+        };
+        let state = IslandState {
+            stats: Some(stats),
+            widget: Some(islet_core::island::WidgetKind::Stats),
+            expanded: true,
+            ..Default::default()
+        };
+        let target = state.layout();
+        renderer.set_snapshot(target, state.content(), 0.0);
+        renderer.animator.jump_to(target, 0.0);
+        renderer.render(5.0, true).unwrap();
+        renderer.render(8.0, true).unwrap();
+        renderer.render(8.1, true).unwrap();
+        save_buffer(renderer.gfx.as_ref().unwrap(), &directory.join("stats-100.tga")).unwrap();
         DestroyWindow(hwnd).unwrap();
     }
 }

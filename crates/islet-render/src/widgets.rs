@@ -294,11 +294,13 @@ impl Gfx {
             return Ok(());
         }
         let left = 28.0;
+        // The contents span 112 points; centre them in the panel.
+        let top = (widgets::STATS_HEIGHT - 112.0) * 0.5 - 18.0;
         self.draw_text(
             "CPU",
             FormatId::CompactSub,
             left,
-            20.0,
+            top + 20.0,
             80.0,
             14.0,
             color(STATS_MUTED, alpha),
@@ -307,14 +309,14 @@ impl Gfx {
             &widgets::format_percent(stats.cpu),
             FormatId::StatsValue,
             left,
-            34.0,
+            top + 34.0,
             150.0,
             40.0,
             color(load_color(stats.cpu), alpha),
         )?;
-        self.draw_sparkline(left, 84.0, 160.0, 46.0, &stats.cpu_history, alpha)?;
+        self.draw_sparkline(left, top + 84.0, 160.0, 46.0, &stats.cpu_history, alpha)?;
 
-        let tile = |column: f32, row: f32| (212.0 + column * 132.0, 18.0 + row * 60.0);
+        let tile = |column: f32, row: f32| (212.0 + column * 132.0, top + 18.0 + row * 60.0);
         let gpu = stats.gpu.map_or_else(|| "\u{2014}".to_owned(), widgets::format_percent);
         let (x, y) = tile(0.0, 0.0);
         self.draw_stat_tile(x, y, "GPU", &gpu, stats.gpu, alpha)?;

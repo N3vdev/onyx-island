@@ -32,7 +32,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC, VIRTUAL_KEY,
     VK_CONTROL, VK_LWIN, VK_MENU, VK_RETURN, VK_RWIN, VK_SHIFT,
 };
-use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId,
+};
 
 use crate::EXTRA_INFO;
 
@@ -464,6 +466,15 @@ unsafe fn is_elevated(process: HANDLE) -> bool {
 /// Lowercase executable name of the focused window ("notepad.exe"), for
 /// per-app insertion overrides.
 #[must_use]
+/// The title of the window in front (empty when it has none). Read only to
+/// recognise Onyx's own windows; never logged.
+pub fn foreground_title() -> String {
+    let mut buffer = [0u16; 256];
+    // SAFETY: GetWindowTextW writes at most the buffer's length.
+    let length = unsafe { GetWindowTextW(GetForegroundWindow(), &mut buffer) };
+    String::from_utf16_lossy(&buffer[..length.max(0) as usize])
+}
+
 pub fn foreground_exe() -> Option<String> {
     // SAFETY: read-only process query; the handle is closed.
     unsafe {

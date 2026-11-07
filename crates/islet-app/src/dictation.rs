@@ -598,8 +598,11 @@ impl Controller {
         }
 
         // Setting a hotkey in Islet's own settings window must not start a
-        // dictation (and there is nowhere to type into there).
-        if islet_input::foreground_exe().as_deref() == Some("islet-settings.exe") {
+        // dictation (and there is nowhere to type into there). The welcome
+        // tour is the exception: it has a box for trying dictation out.
+        if islet_input::foreground_exe().as_deref() == Some("islet-settings.exe")
+            && islet_input::foreground_title() != islet_core::handoff::ONBOARDING_TITLE
+        {
             self.recording_ended();
             return;
         }

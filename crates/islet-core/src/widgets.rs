@@ -32,7 +32,11 @@ pub struct ScrollGate {
     last_input: Option<f64>,
 }
 impl ScrollGate {
-    pub fn push(&mut self, delta: i32, now: f64) -> bool {
+    /// Feeds one wheel event (`delta` as Windows reports it: positive is
+    /// away from you). Returns the step to take once a full notch has
+    /// built up: `Some(true)` for the next page (scrolling down),
+    /// `Some(false)` for the previous one (scrolling up).
+    pub fn push(&mut self, delta: i32, now: f64) -> Option<bool> {
         if self.last_input.is_none_or(|last| now - last > 0.3)
             || self.remainder.signum() != delta.signum()
         {
@@ -41,15 +45,16 @@ impl ScrollGate {
         self.last_input = Some(now);
         if self.last_switch.is_some_and(|last| now - last < 0.18) {
             self.remainder = 0;
-            return false;
+            return None;
         }
         self.remainder = self.remainder.saturating_add(delta);
         if self.remainder.unsigned_abs() < 120 {
-            return false;
+            return None;
         }
+        let forward = self.remainder < 0;
         self.remainder = 0;
         self.last_switch = Some(now);
-        true
+        Some(forward)
     }
 }
 
@@ -366,14 +371,24 @@ mod tests {
     #[test]
     fn precision_wheel_accumulates_and_bursts_do_not_flicker() {
         let mut gate = ScrollGate::default();
-        for (time, expected) in [(0.0, false), (0.01, false), (0.02, false), (0.03, true)] {
+        // Positive deltas are the wheel turned up: back a page.
+        for (time, expected) in [(0.0, None), (0.01, None), (0.02, None), (0.03, Some(false))] {
             assert_eq!(gate.push(30, time), expected);
         }
-        assert!(!gate.push(120, 0.05));
-        assert!(gate.push(-120, 0.3));
-        assert!(!gate.push(60, 1.0));
-        assert!(!gate.push(-60, 1.01));
-        assert!(gate.push(-60, 1.02));
+        assert_eq!(gate.push(120, 0.05), None);
+        // Down: the next page.
+        assert_eq!(gate.push(-120, 0.3), Some(true));
+        assert_eq!(gate.push(60, 1.0), None);
+        assert_eq!(gate.push(-60, 1.01), None);
+        assert_eq!(gate.push(-60, 1.02), Some(true));
+    }
+
+    #[test]
+    fn the_wheel_direction_picks_the_page_direction() {
+        let mut gate = ScrollGate::default();
+        assert_eq!(gate.push(120, 0.0), Some(false));
+        assert_eq!(gate.push(120, 0.5), Some(false));
+        assert_eq!(gate.push(-120, 1.0), Some(true));
     }
     #[test]
     fn arithmetic_precedence_errors_and_recovery() {
@@ -423,7 +438,9 @@ mod tests {
 }
 
 pub const STATS_WIDTH: f32 = 496.0;
-pub const STATS_HEIGHT: f32 = 150.0;
+/// The same height as the calculator, so paging between them keeps the
+/// island's size.
+pub const STATS_HEIGHT: f32 = CALCULATOR_HEIGHT;
 /// CPU samples kept for the sparkline (one a second).
 pub const STATS_HISTORY: usize = 40;
 /// Sustained load above this lights the glow round the pill.

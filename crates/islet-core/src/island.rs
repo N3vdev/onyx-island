@@ -964,7 +964,9 @@ pub enum IslandEvent {
         cpu: f32,
         memory: f32,
     },
-    CycleWidget,
+    /// Scroll between the pages of the open island: `forward` is the next
+    /// page (wheel down), otherwise the previous one (wheel up).
+    CycleWidget { forward: bool },
     CalculatorKey(crate::widgets::CalculatorKey),
     HoverEnter,
     HoverLeave,
@@ -1087,12 +1089,13 @@ pub fn reduce(state: &mut IslandState, event: IslandEvent, now: f64) -> Vec<Effe
             state.glance_info.memory = memory;
             glance_repaint(state)
         }
-        IslandEvent::CycleWidget => {
+        IslandEvent::CycleWidget { forward } => {
             if state.widget_navigation_available() {
                 let pages = state.pages();
                 let current = state.current_page();
                 let index = pages.iter().position(|page| *page == current).unwrap_or(0);
-                state.widget = pages[(index + 1) % pages.len()];
+                let step = if forward { 1 } else { pages.len() - 1 };
+                state.widget = pages[(index + step) % pages.len()];
                 Effect::changed()
             } else {
                 Vec::new()
@@ -1482,7 +1485,7 @@ mod tests {
         // Opened, it always starts on the music player (empty here).
         assert_eq!(state.layout().main, MEDIA);
         assert!(state.widget_navigation_available());
-        reduce(&mut state, IslandEvent::CycleWidget, 0.15);
+        reduce(&mut state, IslandEvent::CycleWidget { forward: true }, 0.15);
         assert_eq!(state.layout().main, CALCULATOR);
         assert!(!state.content().animates());
         reduce(&mut state, IslandEvent::SetMedia(Some(media())), 0.2);
@@ -1524,11 +1527,18 @@ mod tests {
         assert!(state.widget_navigation_available());
         // Music first, then the agent, then the widgets, and round again.
         assert_eq!(state.primary_kind(), Some(CardKind::Media));
-        reduce(&mut state, IslandEvent::CycleWidget, 0.0);
+        reduce(&mut state, IslandEvent::CycleWidget { forward: true }, 0.0);
         assert_eq!(state.primary_kind(), Some(CardKind::Agent));
-        reduce(&mut state, IslandEvent::CycleWidget, 0.5);
+        reduce(&mut state, IslandEvent::CycleWidget { forward: true }, 0.5);
         assert_eq!(state.primary_kind(), Some(CardKind::Calculator));
-        reduce(&mut state, IslandEvent::CycleWidget, 1.0);
+        reduce(&mut state, IslandEvent::CycleWidget { forward: true }, 1.0);
+        assert_eq!(state.primary_kind(), Some(CardKind::Media));
+        // Scrolling up goes back the same way, wrapping round.
+        reduce(&mut state, IslandEvent::CycleWidget { forward: false }, 1.1);
+        assert_eq!(state.primary_kind(), Some(CardKind::Calculator));
+        reduce(&mut state, IslandEvent::CycleWidget { forward: false }, 1.2);
+        assert_eq!(state.primary_kind(), Some(CardKind::Agent));
+        reduce(&mut state, IslandEvent::CycleWidget { forward: false }, 1.3);
         assert_eq!(state.primary_kind(), Some(CardKind::Media));
         // Collapsed, the agent keeps the pill as before.
         reduce(&mut state, IslandEvent::SetExpanded(false), 1.5);
@@ -2445,14 +2455,14 @@ mod tests {
         };
         assert_eq!(state.primary_kind(), Some(CardKind::Media));
         assert_eq!(state.content().widget_pages, 3);
-        reduce(&mut state, IslandEvent::CycleWidget, 0.0);
+        reduce(&mut state, IslandEvent::CycleWidget { forward: true }, 0.0);
         assert_eq!(state.primary_kind(), Some(CardKind::Calculator));
-        reduce(&mut state, IslandEvent::CycleWidget, 0.1);
+        reduce(&mut state, IslandEvent::CycleWidget { forward: true }, 0.1);
         assert_eq!(state.primary_kind(), Some(CardKind::Stats));
         assert_eq!(state.layout(), LayoutTarget::single(STATS));
         assert_eq!(state.content().widget_page, 2);
         assert!(state.stats_visible());
-        reduce(&mut state, IslandEvent::CycleWidget, 0.2);
+        reduce(&mut state, IslandEvent::CycleWidget { forward: true }, 0.2);
         assert_eq!(state.primary_kind(), Some(CardKind::Media));
     }
 
@@ -2468,7 +2478,7 @@ mod tests {
         assert!(reduce(&mut state, IslandEvent::SetStats(reading.clone()), 0.1).is_empty());
         reduce(&mut state, IslandEvent::SetExpanded(true), 0.2);
         assert_eq!(state.primary_kind(), Some(CardKind::Media));
-        reduce(&mut state, IslandEvent::CycleWidget, 0.25);
+        reduce(&mut state, IslandEvent::CycleWidget { forward: true }, 0.25);
         assert_eq!(state.primary_kind(), Some(CardKind::Stats));
         let busier = crate::widgets::SystemStats {
             cpu: 0.9,
@@ -2561,7 +2571,7 @@ mod tests {
         assert_eq!(state.primary_kind(), Some(CardKind::Media));
         assert_eq!(state.layout(), LayoutTarget::single(MEDIA));
         assert!(state.widget_navigation_available());
-        reduce(&mut state, IslandEvent::CycleWidget, 0.2);
+        reduce(&mut state, IslandEvent::CycleWidget { forward: true }, 0.2);
         assert_eq!(state.primary_kind(), Some(CardKind::Calculator));
         // The choice holds across closing and reopening.
         reduce(&mut state, IslandEvent::SetExpanded(false), 0.3);

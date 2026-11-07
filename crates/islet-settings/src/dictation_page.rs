@@ -154,6 +154,40 @@ impl DictationUi {
         self.devices_loaded = true;
     }
 
+    pub(crate) fn manager(&self) -> &ModelManager {
+        &self.manager
+    }
+
+    /// Bytes done and total of a running download, by model id.
+    pub(crate) fn download_progress(&self, id: &str) -> Option<(u64, u64)> {
+        self.job_for(id)
+            .filter(|job| matches!(job.kind, JobKind::Download))
+            .map(|job| job.progress.lock().map_or((0, 0), |p| *p))
+    }
+
+    /// Stops a running download; its partial files stay for a resume.
+    pub(crate) fn cancel_download(&self, id: &str) {
+        if let Some(job) = self.job_for(id) {
+            job.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// The last outcome for a model: its text and whether it went well.
+    pub(crate) fn message(&self, id: &str) -> Option<(String, bool)> {
+        self.messages
+            .iter()
+            .find(|(existing, _, _)| *existing == id)
+            .map(|(_, text, good)| (text.clone(), *good))
+    }
+
+    /// Microphones, listed on first use.
+    pub(crate) fn microphones(&mut self) -> &[InputDevice] {
+        if !self.devices_loaded {
+            self.refresh_devices();
+        }
+        &self.devices
+    }
+
     fn job_for(&self, id: &str) -> Option<&Job> {
         self.jobs
             .iter()
@@ -167,7 +201,7 @@ impl DictationUi {
     }
 
     /// Collects finished jobs into messages.
-    fn poll_jobs(&mut self) {
+    pub(crate) fn poll_jobs(&mut self) {
         let mut finished = Vec::new();
         for (index, (id, job)) in self.jobs.iter().enumerate() {
             if let Ok(mut result) = job.result.lock() {
@@ -186,7 +220,7 @@ impl DictationUi {
         }
     }
 
-    fn start_download(&mut self, spec: &'static ModelSpec) {
+    pub(crate) fn start_download(&mut self, spec: &'static ModelSpec) {
         let job = Job {
             kind: JobKind::Download,
             progress: Arc::new(Mutex::new((0, spec.total_size()))),
@@ -219,7 +253,7 @@ impl DictationUi {
         self.jobs.push((spec.id, job));
     }
 
-    fn start_addon_download(&mut self, addon: &'static AddOn) {
+    pub(crate) fn start_addon_download(&mut self, addon: &'static AddOn) {
         let job = Job {
             kind: JobKind::Download,
             progress: Arc::new(Mutex::new((0, addon.total_size()))),

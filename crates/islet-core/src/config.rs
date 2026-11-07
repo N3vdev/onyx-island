@@ -55,6 +55,9 @@ pub struct GeneralConfig {
     pub expand_on: ExpandTrigger,
     pub hide_in_fullscreen: bool,
     pub start_with_windows: bool,
+    /// The welcome tour ran (or was skipped). Until then the island opens
+    /// it once at startup.
+    pub onboarded: bool,
     /// Read only, from configs written before `ScreenPosition::Dynamic`
     /// existed: `top` with this on meant what `dynamic` means now.
     /// `normalize` folds it into `position`; it is never written back.
@@ -273,6 +276,7 @@ impl Default for GeneralConfig {
             expand_on: ExpandTrigger::Hover,
             hide_in_fullscreen: true,
             start_with_windows: false,
+            onboarded: false,
             tuck_behind_windows: None,
             stay_over_empty_space: true,
             top_margin_percent: 0.0,

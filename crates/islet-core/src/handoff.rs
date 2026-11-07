@@ -1,5 +1,10 @@
 //! Finite edge-to-surface handoff; no timers or work after it settles.
 
+/// The welcome tour's window title. It belongs to `islet-settings.exe`,
+/// whose windows normally refuse dictation, but the tour has a box for
+/// trying it out.
+pub const ONBOARDING_TITLE: &str = "Welcome to Onyx";
+
 pub const PREVIEW_ATTACH: u32 = 0x8000 + 40;
 pub const PREVIEW_DETACH: u32 = 0x8000 + 41;
 pub const PREVIEW_DEPARTED: u32 = 0x8000 + 42;

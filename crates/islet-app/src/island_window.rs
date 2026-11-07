@@ -751,10 +751,10 @@ impl IslandHost {
                     && self.widget_point(point).is_some()
                 {
                     let delta = ((wparam.0 >> 16) as u16 as i16) as i32;
-                    if self.widget_scroll.push(delta, clock_now()) {
+                    if let Some(forward) = self.widget_scroll.push(delta, clock_now()) {
                         self.set_widget_hover(None);
                         self.set_media_hover(None);
-                        self.dispatch(IslandEvent::CycleWidget);
+                        self.dispatch(IslandEvent::CycleWidget { forward });
                         self.focus_calculator();
                     }
                 }

@@ -8,7 +8,7 @@ pub mod inject;
 
 pub use hook::{HookEvent, KeyboardHook};
 pub use inject::{
-    foreground_exe, foreground_is_blocked_by_elevation, insert_text, insert_text_with_clipboard,
+    foreground_exe, foreground_is_blocked_by_elevation, foreground_title, insert_text, insert_text_with_clipboard,
     press_chord,
     suppress_start_menu, InjectError, InsertReport, Method,
 };
