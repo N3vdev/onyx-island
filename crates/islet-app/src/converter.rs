@@ -76,6 +76,7 @@ pub fn start(
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()?;
+    islet_asr::tie_to_app(&child);
     let request = json!({"command":if operation.is_some(){"convert"}else{"catalog"},"files":files,"operation":operation});
     if let Some(stdin) = child.stdin.as_mut() {
         writeln!(stdin, "{request}")?;

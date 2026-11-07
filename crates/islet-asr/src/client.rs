@@ -147,6 +147,7 @@ impl AsrClient {
             .stderr(Stdio::null())
             .creation_flags(CREATE_NO_WINDOW)
             .spawn()?;
+        crate::job::tie_to_app(&child);
         let stdin = child
             .stdin
             .take()

@@ -8,12 +8,14 @@
 
 mod chunks;
 pub mod client;
+pub mod job;
 pub mod manager;
 pub mod polish;
 pub mod protocol;
 pub mod registry;
 
 pub use client::{default_worker_path, AsrClient, AsrEvent};
+pub use job::tie_to_app;
 pub use manager::{ManagerError, ModelManager, ModelStatus, Progress};
 pub use polish::{PolishError, Polisher};
 pub use protocol::{LoadRequest, SAMPLE_RATE};

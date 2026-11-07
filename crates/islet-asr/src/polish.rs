@@ -203,6 +203,7 @@ fn start(exe: &Path, model: &Path, threads: usize) -> Result<Server, PolishError
         .creation_flags(CREATE_NO_WINDOW)
         .spawn()
         .map_err(|error| PolishError::Start(error.to_string()))?;
+    crate::job::tie_to_app(&child);
     let mut server = Server { child, port };
 
     let agent = ureq::AgentBuilder::new()

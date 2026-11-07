@@ -17,6 +17,7 @@ sha2 = "0.10"
 tracing.workspace = true
 ureq = "2"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 [dev-dependencies]
 hound = "3.5"
