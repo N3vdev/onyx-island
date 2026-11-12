@@ -37,6 +37,7 @@ impl Editor {
                 new_site: String::new(),
                 status: None,
                 dictation_ui: dictation_page::DictationUi::new(),
+                night_light_ui: crate::night_light_page::NightLightUi::default(),
                 initial_scroll: None,
             },
             time: 0.0,

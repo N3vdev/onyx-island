@@ -13,6 +13,7 @@ use eframe::egui::{self, Color32, RichText};
 use islet_asr::{AddOn, ModelManager, ModelSpec, ModelStatus, AI_CLEANUP, MODELS};
 use islet_audio::{list_input_devices, InputDevice};
 use islet_core::config::{InjectionMethod, Replacement};
+use islet_core::recordings;
 use islet_core::hotkey::{modifier_bit, name_for_vk, Combo, Modifiers, VK_ESCAPE};
 use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
 
@@ -67,6 +68,159 @@ pub struct DictationUi {
     new_snippet: Replacement,
     /// Saved corrections, re-read every few seconds while the page is open.
     learned: Learned,
+    /// How many recordings are saved and their size, re-read the same way.
+    recordings: RecordingsUsage,
+    /// The "choose a folder" dialog for recordings, while it is open.
+    folder_pick: Option<crate::folder_picker::FolderPick>,
+    folder_error: Option<String>,
+}
+
+#[derive(Default)]
+struct RecordingsUsage {
+    read_at: Option<std::time::Instant>,
+    dir: PathBuf,
+    count: usize,
+    bytes: u64,
+}
+
+impl RecordingsUsage {
+    fn refresh(&mut self, dir: PathBuf) {
+        if dir == self.dir && self.read_at.is_some_and(|at| at.elapsed() < Duration::from_secs(3)) {
+            return;
+        }
+        self.read_at = Some(std::time::Instant::now());
+        (self.count, self.bytes) = recordings::usage(&dir);
+        self.dir = dir;
+    }
+}
+
+/// Whether recordings can be written to `dir` (creating it if needed).
+fn writable(dir: &std::path::Path) -> bool {
+    let probe = dir.join(".onyx-write-check");
+    std::fs::create_dir_all(dir).is_ok()
+        && std::fs::write(&probe, b"").is_ok()
+        && std::fs::remove_file(&probe).is_ok()
+}
+
+fn size_text(bytes: u64) -> String {
+    const MB: f64 = 1024.0 * 1024.0;
+    let mb = bytes as f64 / MB;
+    if mb >= 1024.0 {
+        format!("{:.1} GB", mb / 1024.0)
+    } else if mb >= 10.0 {
+        format!("{mb:.0} MB")
+    } else {
+        format!("{mb:.1} MB")
+    }
+}
+
+fn keep_text(days: u32) -> String {
+    match days {
+        0 => "Never".to_owned(),
+        1 => "After 1 day".to_owned(),
+        days => format!("After {days} days"),
+    }
+}
+
+fn recordings_card(app: &mut SettingsApp, ui: &mut egui::Ui) {
+    let dictation = &mut app.config.dictation;
+    let state = &mut app.dictation_ui;
+    row(
+        ui,
+        "Save voice recordings",
+        "Keep the audio of each dictation as a WAV file, about 2 MB a minute. Only the sound is saved, never the text. Assistant commands and discarded dictations are not saved.",
+        |ui| {
+            toggle(ui, &mut dictation.save_recordings, "Save voice recordings");
+        },
+    );
+    let dir = recordings::dir(&dictation.recordings_folder);
+    state.recordings.refresh(dir.clone());
+    if !dictation.save_recordings && state.recordings.count == 0 {
+        return;
+    }
+    if let Some(pick) = &state.folder_pick {
+        if let Some(picked) = pick.take() {
+            state.folder_pick = None;
+            if let Some(folder) = picked {
+                if writable(&folder) {
+                    state.folder_error = None;
+                    dictation.recordings_folder = if folder == recordings::default_dir() {
+                        String::new()
+                    } else {
+                        folder.display().to_string()
+                    };
+                } else {
+                    state.folder_error = Some(format!(
+                        "Onyx can't save files in {}. Choose another folder.",
+                        folder.display()
+                    ));
+                }
+            }
+        }
+    }
+    divider(ui);
+    let custom = !dictation.recordings_folder.trim().is_empty();
+    let location = if custom {
+        dir.display().to_string()
+    } else {
+        format!("Onyx's data folder ({})", dir.display())
+    };
+    row(ui, "Save recordings in", &location, |ui| {
+        let picking = state.folder_pick.is_some();
+        let label = if picking { "Choosing\u{2026}" } else { "Change\u{2026}" };
+        if ui
+            .add_enabled(!picking, egui::Button::new(label))
+            .on_hover_text("Recordings can get large, so pick a drive with room to spare")
+            .clicked()
+        {
+            state.folder_pick = Some(crate::folder_picker::FolderPick::open(
+                "Choose where to save voice recordings",
+                &dir,
+            ));
+        }
+        if custom && ui.button("Use default").clicked() {
+            dictation.recordings_folder.clear();
+            state.folder_error = None;
+        }
+        if ui.button("Open").clicked() {
+            let _ = std::fs::create_dir_all(&dir);
+            let _ = std::process::Command::new("explorer").arg(&dir).spawn();
+        }
+    });
+    if let Some(error) = &state.folder_error {
+        ui.label(RichText::new(error).small().color(DANGER));
+    }
+    divider(ui);
+    row(
+        ui,
+        "Delete recordings",
+        "Older recordings are deleted automatically. Only recordings Onyx saved are ever deleted, never your other files.",
+        |ui| {
+            egui::ComboBox::from_id_salt("delete_recordings_after")
+                .selected_text(keep_text(dictation.delete_recordings_after_days))
+                .width(140.0)
+                .show_ui(ui, |ui| {
+                    for days in [1, 3, 7, 30, 90, 0] {
+                        ui.selectable_value(
+                            &mut dictation.delete_recordings_after_days,
+                            days,
+                            keep_text(days),
+                        );
+                    }
+                });
+        },
+    );
+    let usage = &state.recordings;
+    ui.add_space(4.0);
+    ui.label(
+        RichText::new(match usage.count {
+            0 => "No recordings saved yet.".to_owned(),
+            1 => format!("1 recording, {}", size_text(usage.bytes)),
+            count => format!("{count} recordings, {}", size_text(usage.bytes)),
+        })
+        .small()
+        .color(MUTED),
+    );
 }
 
 /// What the corrections file holds: how many, and the word swaps you made
@@ -137,6 +291,9 @@ impl DictationUi {
             new_word: Replacement::default(),
             new_snippet: Replacement::default(),
             learned: Learned::default(),
+            recordings: RecordingsUsage::default(),
+            folder_pick: None,
+            folder_error: None,
         }
     }
 
@@ -804,7 +961,10 @@ pub fn show(app: &mut SettingsApp, ui: &mut egui::Ui) {
             HotkeyTarget::Assistant => app.config.dictation.assistant_hotkey = text,
         }
     }
-    if app.dictation_ui.capture.is_some() || !app.dictation_ui.jobs.is_empty() {
+    if app.dictation_ui.capture.is_some()
+        || !app.dictation_ui.jobs.is_empty()
+        || app.dictation_ui.folder_pick.is_some()
+    {
         ctx.request_repaint_after(Duration::from_millis(50));
     }
     if !app.dictation_ui.devices_loaded {
@@ -992,6 +1152,8 @@ pub fn show(app: &mut SettingsApp, ui: &mut egui::Ui) {
             }
         }
     });
+
+    card(ui, "Recordings", |ui| recordings_card(app, ui));
 
     card(ui, "Microphone", |ui| {
         row(

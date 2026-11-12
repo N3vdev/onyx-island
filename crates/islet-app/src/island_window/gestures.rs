@@ -1,5 +1,6 @@
 //! Collapsed-island pointer gestures, using screen coordinates across captures.
 use super::*;
+use islet_core::config::IslandCorner;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Axis { Horizontal, Vertical }
@@ -20,7 +21,7 @@ fn push_threshold(room: f32) -> f32 { (room * 0.6).clamp(4.0, 24.0) }
 
 impl IslandHost {
     pub(super) fn begin_gesture(&mut self) -> bool {
-        if self.cursor_on_media_bubble() || self.state.expanded || self.traveling || self.state.dictation.is_some()
+        if self.cursor_on_media_bubble() || self.state.expanded || self.traveling || self.relocating || self.state.dictation.is_some()
             || self.state.needs_input.is_some() || self.state.done.is_some()
             || self.state.converter.is_some() { return false; }
         let mut start = POINT::default();
@@ -87,18 +88,27 @@ impl IslandHost {
             Some(Axis::Vertical) if drag.media && outward && drag.dy.abs() >= push_threshold(drag.room) => {
                 self.media_action(MediaAction::PlayPause);
             }
+            // Only the eyes: off to a corner of this edge as a circle, or
+            // back to the middle from one.
+            Some(Axis::Horizontal) if drag.dx.abs() >= 48.0 && self.state.shows_only_eyes() && self.preview.is_none() => {
+                if let Some(corner) = swiped_corner(self.state.corner, drag.dx < 0.0) {
+                    self.set_corner(corner);
+                }
+            }
             Some(Axis::Horizontal) if drag.dx.abs() >= 48.0 => {
                 let page: i32 = match self.state.compact_widget {
-                    None => 0, Some(IdleGlance::Clock) => 1, Some(IdleGlance::Stats) => 2,
+                    None => 0, Some(IdleGlance::Clock) => 1, Some(IdleGlance::Stats) => 2, Some(IdleGlance::Eyes) => 3,
                 };
-                let mut next = (page + if drag.dx < 0.0 { 1 } else { -1 }).rem_euclid(3);
+                let mut next = (page + if drag.dx < 0.0 { 1 } else { -1 }).rem_euclid(4);
                 // Do not navigate to an invisible "normal" page on an idle PC.
                 let mut normal = self.state.clone();
                 normal.compact_widget = None;
                 if next == 0 && normal.primary_card().is_none() {
-                    next = if drag.dx < 0.0 { 1 } else { 2 };
+                    next = if drag.dx < 0.0 { 1 } else { 3 };
                 }
-                self.state.compact_widget = match next { 1 => Some(IdleGlance::Clock), 2 => Some(IdleGlance::Stats), _ => None };
+                self.state.compact_widget = match next {
+                    1 => Some(IdleGlance::Clock), 2 => Some(IdleGlance::Stats), 3 => Some(IdleGlance::Eyes), _ => None,
+                };
                 if next == 2 && self.stats_sampler.is_none() { self.stats_sampler = Some(crate::sysstats::Sampler::new()); }
                 if next != 2 && !needs_sampler(&read_config(&self.shared)) { self.stats_sampler = None; }
                 self.update_clock();
@@ -118,10 +128,46 @@ impl IslandHost {
                     }
                 }
             }
-            None if drag.dx.abs().max(drag.dy.abs()) < 8.0 => { self.dispatch(IslandEvent::Click); }
+            None if drag.dx.abs().max(drag.dy.abs()) < 8.0 => self.click_island(),
             _ => {}
         }
         self.send_snapshot();
+    }
+
+    /// A click: the eyes attached to a screen side come back to the middle;
+    /// anywhere else it is the island's usual click.
+    pub(super) fn click_island(&mut self) {
+        if self.state.cornered() && self.preview.is_none() {
+            self.set_corner(IslandCorner::Middle);
+            self.send_snapshot();
+        } else {
+            self.dispatch(IslandEvent::Click);
+        }
+    }
+
+    /// Remembers the corner (kept across restarts); the next snapshot moves
+    /// the island there.
+    fn set_corner(&mut self, corner: IslandCorner) {
+        self.state.corner = corner;
+        let path = crate::paths::Paths::discover().config_file;
+        if let Ok(mut config) = Config::load(&path) {
+            config.general.corner = corner;
+            if config.save_atomic(&path).is_ok() {
+                *self.shared.write().unwrap_or_else(std::sync::PoisonError::into_inner) = config;
+            }
+        }
+    }
+}
+
+/// Where a sideways swipe of the eyes takes them: from the middle to the
+/// corner it points at, from a corner back to the middle. Swiping further
+/// into a corner it is already in does nothing.
+fn swiped_corner(from: IslandCorner, left: bool) -> Option<IslandCorner> {
+    match (from, left) {
+        (IslandCorner::Middle, true) => Some(IslandCorner::Left),
+        (IslandCorner::Middle, false) => Some(IslandCorner::Right),
+        (IslandCorner::Left, false) | (IslandCorner::Right, true) => Some(IslandCorner::Middle),
+        _ => None,
     }
 }
 
@@ -144,5 +190,13 @@ mod tests {
         assert_eq!(rubber(-50.0), -rubber(50.0));
         assert!(rubber(200.0) > rubber(50.0));
         assert!(rubber(10000.0) < 120.0);
+    }
+    #[test] fn the_eyes_swipe_to_a_corner_and_back_to_the_middle() {
+        assert_eq!(swiped_corner(IslandCorner::Middle, true), Some(IslandCorner::Left));
+        assert_eq!(swiped_corner(IslandCorner::Middle, false), Some(IslandCorner::Right));
+        assert_eq!(swiped_corner(IslandCorner::Left, false), Some(IslandCorner::Middle));
+        assert_eq!(swiped_corner(IslandCorner::Right, true), Some(IslandCorner::Middle));
+        assert_eq!(swiped_corner(IslandCorner::Left, true), None);
+        assert_eq!(swiped_corner(IslandCorner::Right, false), None);
     }
 }

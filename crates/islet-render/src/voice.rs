@@ -3,7 +3,12 @@
 //! the display's frame rate, wobble a little as they settle, and never all
 //! move as one.
 
+use islet_core::island::{DictationCard, DictationPhase};
+
 pub(super) const BARS: usize = 6;
+/// Bar spacing and width on the pill, in logical pixels.
+pub(super) const BAR_PITCH: f32 = 9.0;
+pub(super) const BAR_WIDTH: f32 = 3.0;
 
 /// How many meter readings (33 ms each) behind the newest each bar looks,
 /// and how tall it can get: the middle leads and stands tallest, the edges
@@ -44,6 +49,30 @@ pub(super) fn targets(levels: &[u8], now: f64) -> [f32; BARS] {
         *target = (level * REACH[index] + shimmer).min(1.0);
     }
     out
+}
+
+/// Where the bars are heading for this dictation: the live mic, or a slow
+/// wave while the speech is being turned into text.
+pub(super) fn card_targets(dictation: &DictationCard, now: f64) -> [f32; BARS] {
+    match dictation.phase {
+        DictationPhase::Transcribing => {
+            let mut wave = [0.0; BARS];
+            for (index, value) in wave.iter_mut().enumerate() {
+                let phase = (now * 6.0 - index as f64 * 0.8).sin() * 0.5 + 0.5;
+                *value = 0.12 + 0.34 * phase as f32;
+            }
+            wave
+        }
+        _ => targets(&dictation.bars, now),
+    }
+}
+
+/// How strongly each bar is drawn: the middle brightest while listening.
+pub(super) fn bar_alpha(dictation: &DictationCard, index: usize) -> f32 {
+    match dictation.phase {
+        DictationPhase::Transcribing => 0.9,
+        _ => 0.7 + 0.25 * (1.0 - (index as f32 - 2.5).abs() / 2.5),
+    }
 }
 
 impl VoiceBars {

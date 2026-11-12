@@ -282,3 +282,244 @@ fn capture_pull_previews() {
         DestroyWindow(hwnd).unwrap();
     }
 }
+
+#[test]
+#[ignore = "requires Windows GPU; writes eye render evidence"]
+fn capture_eye_previews() {
+    use islet_core::config::IdleGlance;
+    use windows::Win32::UI::WindowsAndMessaging::{CreateWindowExW,DestroyWindow,WINDOW_EX_STYLE,WS_POPUP};
+    let directory = std::path::PathBuf::from(std::env::var_os("ISLET_WIDGET_CAPTURE_DIR").unwrap());
+    std::fs::create_dir_all(&directory).unwrap();
+    unsafe {
+        let hwnd = CreateWindowExW(WINDOW_EX_STYLE(0),w!("STATIC"),w!("Eye capture"),WS_POPUP,0,0,720,248,None,None,None,None).unwrap();
+        let mut renderer = calculator_renderer(hwnd, 1.0);
+        let state = IslandState { compact_widget: Some(IdleGlance::Eyes), ..Default::default() };
+        let target = state.layout(); let content = state.content();
+        renderer.set_snapshot(target, content.clone(), 0.0);
+        renderer.render(5.0, true).unwrap();
+        renderer.animator.jump_to(target, 8.0);
+        let sample = renderer.animator.sample(8.0);
+        let base = renderer.frame_geometry(&sample);
+        let gfx = renderer.gfx.as_mut().unwrap();
+        gfx.main_spring_height = sample.main_height;
+        let hop = |t| Some((eyes::Reaction::Hop, t));
+        for (name, x, y, open, reaction) in [
+            ("rest", 0.0, 0.0, 1.0, None), ("shut", 0.0, 0.0, 0.0, None),
+            ("look-right", 30.0, 0.0, 1.0, None), ("squeeze", 100.0, 0.0, 1.0, None),
+            ("lift-half", 0.0, -22.0, 1.0, None), ("lift", 0.0, -50.0, 1.0, None),
+            ("strain", 0.0, 4.0, 1.0, None), ("hop", 0.0, 0.0, 1.0, hop(0.15)),
+            ("pop", 0.0, 0.0, 1.0, Some((eyes::Reaction::Pop, 0.1))),
+        ] {
+            let (shell, mut content_geometry) = pull_frames(base, x, f32::abs(y));
+            content_geometry.content_alpha = base.content_alpha;
+            // The capture island sits at the top: lifting is pulling down.
+            let lift = -y;
+            let pose = eyes::EyePose::new(x, y, lift, open, 0.01);
+            gfx.eyes = match reaction { Some((r, t)) => pose.react(r, t), None => pose };
+            gfx.draw(8.0,&shell,&content_geometry,target,&content,None,1.0).unwrap();
+            save_buffer(gfx,&directory.join(format!("eyes-{name}.tga"))).unwrap();
+        }
+        DestroyWindow(hwnd).unwrap();
+    }
+}
+
+#[test]
+#[ignore = "requires Windows GPU; writes eye morph render evidence"]
+fn capture_eye_morphs() {
+    use islet_core::config::IdleGlance;
+    use islet_core::island::DictationCard;
+    use windows::Win32::UI::WindowsAndMessaging::{CreateWindowExW,DestroyWindow,WINDOW_EX_STYLE,WS_POPUP};
+    let directory = std::path::PathBuf::from(std::env::var_os("ISLET_WIDGET_CAPTURE_DIR").unwrap());
+    std::fs::create_dir_all(&directory).unwrap();
+    unsafe {
+        let hwnd = CreateWindowExW(WINDOW_EX_STYLE(0),w!("STATIC"),w!("Eye morph capture"),WS_POPUP,0,0,720,248,None,None,None,None).unwrap();
+        let mut renderer = calculator_renderer(hwnd, 1.0);
+        let state = IslandState { compact_widget: Some(IdleGlance::Eyes), ..Default::default() };
+        let target = state.layout(); let content = state.content();
+        renderer.set_snapshot(target, content.clone(), 0.0);
+        renderer.render(5.0, true).unwrap();
+        renderer.animator.jump_to(target, 8.0);
+        let sample = renderer.animator.sample(8.0);
+        let base = renderer.frame_geometry(&sample);
+        let gfx = renderer.gfx.as_mut().unwrap();
+        gfx.main_spring_height = sample.main_height;
+        // A sideways pull growing, and a lift growing (no trembling: t = 0).
+        let mut frames: Vec<(String, f32, f32)> = [40.0, 56.0, 64.0, 72.0, 80.0, 88.0, 100.0]
+            .iter().map(|x| (format!("squeeze-{x}"), *x, 0.0)).collect();
+        frames.extend([6.0, 14.0, 20.0, 24.0, 28.0, 34.0, 44.0].iter().map(|y| (format!("lift-{y}"), 0.0, *y)));
+        for (name, x, lift) in frames {
+            let (shell, mut content_geometry) = pull_frames(base, x, lift);
+            content_geometry.content_alpha = base.content_alpha;
+            gfx.eyes = eyes::EyePose::new(x, -lift, lift, 1.0, 0.0);
+            gfx.draw(8.0,&shell,&content_geometry,target,&content,None,1.0).unwrap();
+            save_buffer(gfx,&directory.join(format!("morph-{name}.tga"))).unwrap();
+        }
+        // A right wink closing, and a left one shut.
+        for wink in [0.25f32, 0.5, 0.75, 1.0, -1.0] {
+            gfx.eyes = eyes::EyePose::REST.wink(wink);
+            gfx.draw(8.0,&base,&base,target,&content,None,1.0).unwrap();
+            save_buffer(gfx,&directory.join(format!("wink-{}.tga", (wink * 100.0) as i32))).unwrap();
+        }
+        // Eyes into dictation bars, partway, with a voice on the mic.
+        gfx.eyes = eyes::EyePose::REST;
+        let dictation = IslandState {
+            dictation: Some(DictationCard { bars: [200; islet_core::island::DICTATION_BARS], ..Default::default() }),
+            ..Default::default()
+        };
+        let speaking = dictation.content();
+        let mut now = 20.0;
+        for step in 0..60 { now += 1.0 / 120.0; gfx.voice_bars.step(now, [0.7; voice::BARS]); let _ = step; }
+        for amount in [0.0f32, 0.2, 0.4, 0.6, 0.8, 1.0] {
+            // The real path: a content transition from the eyes to dictation.
+            gfx.draw(now,&base,&base,target,&speaking,Some(&content),amount).unwrap();
+            save_buffer(gfx,&directory.join(format!("bars-{}.tga", (amount * 100.0) as u32))).unwrap();
+        }
+        DestroyWindow(hwnd).unwrap();
+    }
+}
+
+/// Opt-in native evidence: the AI dictation offer and its download.
+#[test]
+#[ignore = "requires Windows GPU; writes notice render evidence"]
+fn capture_notice_previews() {
+    use islet_core::island::{AlertLevel, NoticeAction, NotificationCard};
+    use windows::Win32::UI::WindowsAndMessaging::{CreateWindowExW, DestroyWindow, WINDOW_EX_STYLE, WS_POPUP};
+    let directory = std::path::PathBuf::from(std::env::var_os("ISLET_WIDGET_CAPTURE_DIR").unwrap());
+    std::fs::create_dir_all(&directory).unwrap();
+    let card = |title: &str, body: &str, level, action, progress| NotificationCard {
+        source: String::new(),
+        title: title.to_owned(),
+        body: body.to_owned(),
+        level,
+        icon: None,
+        action,
+        progress,
+    };
+    let offer = Some(NoticeAction::DownloadAiCleanup);
+    let cards = [
+        ("offer", card("Use AI dictation", "Improves accuracy \u{b7} 290 MB", AlertLevel::Info, offer, None)),
+        ("progress", card("Getting AI dictation", "117 of 290 MB \u{b7} 40%", AlertLevel::Info, None, Some(0.4))),
+        ("failed", card("Download failed", "download failed: connection reset", AlertLevel::Error, offer, None)),
+        ("ready", card("AI dictation is ready", "Your next dictation is cleaned up on this PC.", AlertLevel::Success, None, None)),
+    ];
+    unsafe {
+        let hwnd = CreateWindowExW(WINDOW_EX_STYLE(0), w!("STATIC"), w!("Islet Notice Capture"), WS_POPUP, 0, 0, 720, 248, None, None, None, None).unwrap();
+        for (name, notice) in cards {
+            for expanded in [false, true] {
+                let mut renderer = calculator_renderer(hwnd, 1.0);
+                let state = IslandState { done: Some(notice.clone()), expanded, ..Default::default() };
+                let target = state.layout();
+                renderer.set_snapshot(target, state.content(), 0.0);
+                renderer.animator.jump_to(target, 0.0);
+                renderer.render(5.0, true).unwrap();
+                renderer.render(8.0, true).unwrap();
+                renderer.render(8.1, true).unwrap();
+                let size = if expanded { "open" } else { "pill" };
+                save_buffer(renderer.gfx.as_ref().unwrap(), &directory.join(format!("notice-{name}-{size}.tga"))).unwrap();
+            }
+        }
+        DestroyWindow(hwnd).unwrap();
+    }
+}
+
+/// Opt-in native evidence: the eyes as the night light comes on.
+#[test]
+#[ignore = "requires Windows GPU; writes night eye render evidence"]
+fn capture_night_eyes() {
+    use windows::Win32::UI::WindowsAndMessaging::{CreateWindowExW, DestroyWindow, WINDOW_EX_STYLE, WS_POPUP};
+    let directory = std::path::PathBuf::from(std::env::var_os("ISLET_WIDGET_CAPTURE_DIR").unwrap());
+    std::fs::create_dir_all(&directory).unwrap();
+    unsafe {
+        let hwnd = CreateWindowExW(WINDOW_EX_STYLE(0), w!("STATIC"), w!("Islet Night Capture"), WS_POPUP, 0, 0, 720, 248, None, None, None, None).unwrap();
+        use islet_core::island::NightGreeting;
+        let times: [(NightGreeting, &str, &[f64]); 2] = [
+            (NightGreeting::Evening, "evening", &[1.2, 1.4, 2.0, 2.4, 3.0, 3.6, 5.0]),
+            (NightGreeting::Morning, "morning", &[1.6, 2.0, 2.6, 3.0, 3.3, 3.6, 4.1]),
+        ];
+        for (greeting, name, frames) in times {
+            let mut renderer = calculator_renderer(hwnd, 1.0);
+            let state = IslandState { night_greeting: Some(greeting), ..Default::default() };
+            let target = state.layout();
+            renderer.set_snapshot(target, state.content(), 10.0);
+            renderer.animator.jump_to(target, 10.0);
+            renderer.previous_content = None;
+            // The reaction starts on the first frame the eyes are shown.
+            renderer.render(10.0, true).unwrap();
+            for t in frames {
+                renderer.render(10.0 + t, true).unwrap();
+                save_buffer(renderer.gfx.as_ref().unwrap(), &directory.join(format!("{name}-eyes-{:02}.tga", (t * 10.0) as u32))).unwrap();
+            }
+            drop(renderer);
+        }
+        DestroyWindow(hwnd).unwrap();
+    }
+}
+
+/// Opt-in native evidence: resting eyes with the night light on and off.
+#[test]
+#[ignore = "requires Windows GPU; writes night eye render evidence"]
+fn capture_resting_night_eyes() {
+    use islet_core::config::IdleGlance;
+    use windows::Win32::UI::WindowsAndMessaging::{CreateWindowExW, DestroyWindow, WINDOW_EX_STYLE, WS_POPUP};
+    let directory = std::path::PathBuf::from(std::env::var_os("ISLET_WIDGET_CAPTURE_DIR").unwrap());
+    std::fs::create_dir_all(&directory).unwrap();
+    unsafe {
+        let hwnd = CreateWindowExW(WINDOW_EX_STYLE(0), w!("STATIC"), w!("Islet Resting Eyes"), WS_POPUP, 0, 0, 720, 248, None, None, None, None).unwrap();
+        for (name, on) in [("day", false), ("night", true)] {
+            let mut renderer = calculator_renderer(hwnd, 1.0);
+            let mut state = IslandState { glance: Some(IdleGlance::Eyes), ..Default::default() };
+            state.glance_info.night_light = on;
+            let target = state.layout();
+            renderer.set_snapshot(target, state.content(), 10.0);
+            renderer.animator.jump_to(target, 10.0);
+            renderer.previous_content = None;
+            for step in 0..=40 {
+                renderer.render(10.0 + f64::from(step) * 0.1, true).unwrap();
+            }
+            save_buffer(renderer.gfx.as_ref().unwrap(), &directory.join(format!("resting-{name}.tga"))).unwrap();
+            drop(renderer);
+        }
+        DestroyWindow(hwnd).unwrap();
+    }
+}
+
+/// Opt-in native evidence: the eyes pill attached to the left screen side
+/// at the top, and to the right side at the bottom.
+#[test]
+#[ignore = "requires Windows GPU; writes corner eye render evidence"]
+fn capture_corner_eyes() {
+    use islet_core::config::{IdleGlance, IslandCorner};
+    use windows::Win32::UI::WindowsAndMessaging::{CreateWindowExW, DestroyWindow, WINDOW_EX_STYLE, WS_POPUP};
+    let directory = std::path::PathBuf::from(std::env::var_os("ISLET_WIDGET_CAPTURE_DIR").unwrap());
+    std::fs::create_dir_all(&directory).unwrap();
+    unsafe {
+        let hwnd = CreateWindowExW(WINDOW_EX_STYLE(0), w!("STATIC"), w!("Islet Corner Eyes"), WS_POPUP, 0, 0, 720, 248, None, None, None, None).unwrap();
+        for (name, corner, top) in [("left-top", IslandCorner::Left, true), ("right-bottom", IslandCorner::Right, false)] {
+            let mut renderer = calculator_renderer(hwnd, 1.0);
+            renderer.set_anchor(top, 0.0);
+            renderer.animator = Animator::new(LayoutTarget::HIDDEN, if top { 0.0 } else { 1.0 }, 10.0);
+            let state = IslandState { glance: Some(IdleGlance::Eyes), corner, ..Default::default() };
+            let target = state.layout();
+            renderer.set_snapshot(target, state.content(), 10.0);
+            renderer.animator.jump_to(target, 10.0);
+            renderer.previous_content = None;
+            for step in 0..=40 {
+                renderer.render(10.0 + f64::from(step) * 0.1, true).unwrap();
+            }
+            save_buffer(renderer.gfx.as_ref().unwrap(), &directory.join(format!("corner-{name}.tga"))).unwrap();
+            // Brought back to the middle: a happy hop once grown in.
+            let middle = IslandState { glance: Some(IdleGlance::Eyes), ..Default::default() };
+            let target = middle.layout();
+            renderer.set_snapshot(target, middle.content(), 15.0);
+            renderer.animator = Animator::new(target, if top { 0.0 } else { 1.0 }, 15.0);
+            renderer.animator.jump_to(target, 15.0);
+            renderer.previous_content = None;
+            for step in 0..=12 {
+                renderer.render(15.0 + (CHEER_DELAY + 0.2) * f64::from(step) / 12.0, true).unwrap();
+            }
+            save_buffer(renderer.gfx.as_ref().unwrap(), &directory.join(format!("back-{name}.tga"))).unwrap();
+            drop(renderer);
+        }
+        DestroyWindow(hwnd).unwrap();
+    }
+}

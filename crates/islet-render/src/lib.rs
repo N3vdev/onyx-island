@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use islet_core::geometry::{point_in_rounded_rect, Rect};
 use islet_core::handoff::Handoff;
 use islet_core::island::{
-    arrange_at, AgentCard, AgentState, AlertLevel, ContentCard, ContentSnapshot, DictationCard,
+    arrange_on, AgentCard, AgentState, AlertLevel, ContentCard, ContentSnapshot, DictationCard,
     DictationPhase, LayoutTarget, MediaCard, NotificationCard, PillSize, COMPACT,
     DEFAULT_MEDIA_ACCENT,
 };
@@ -215,8 +215,28 @@ mod widgets;
 mod intro;
 mod voice;
 mod converter;
+mod eyes;
+
+/// How long the pill takes to grow in before the night light's eyes react.
+const NIGHT_EYES_DELAY: f64 = 1.0;
+/// Arrived at a screen side, the pill grows in before the eyes turn cross.
+const SULK_DELAY: f64 = 0.35;
+/// Back in the middle, the pill grows in before the eyes hop for joy.
+const CHEER_DELAY: f64 = 0.4;
 
 pub struct Renderer {
+    /// When the resting eyes next blink, and whether they were on screen
+    /// last frame (they blink hello when they appear).
+    blinker: eyes::Blinker,
+    /// The night light's eyes on screen last frame.
+    night_shown: Option<islet_core::island::NightGreeting>,
+    eyes_shown: bool,
+    /// When the eyes arrived at a screen side, where they sulk.
+    sulk_since: Option<f64>,
+    /// Where the pointer last held the island while it is held, and the
+    /// eyes' reaction to the last pull being let go (with when it began).
+    held_pull: Option<(f32, f32)>,
+    reaction: Option<(eyes::Reaction, f64)>,
     pull_x: Spring,
     pull_y: Spring,
     widget_hover: Option<islet_core::widgets::WidgetHover>,
@@ -266,6 +286,12 @@ impl Renderer {
         let anchor = if config.anchor_top { 0.0 } else { 1.0 };
         let animator = Animator::new(LayoutTarget::HIDDEN, anchor, now);
         Ok(Self {
+            blinker: eyes::Blinker::new(now),
+            eyes_shown: false,
+            sulk_since: None,
+            night_shown: None,
+            held_pull: None,
+            reaction: None,
             pull_x: Spring::new(0.0, 0.0, SpringParams::COLLAPSE, now),
             pull_y: Spring::new(0.0, 0.0, SpringParams::COLLAPSE, now),
             handoff: None,
@@ -381,6 +407,16 @@ impl Renderer {
 
     /// A fast tracking spring smooths pointer samples; release softly settles home.
     pub fn set_pull(&mut self, x: f32, y: f32, held: bool, now: f64) {
+        if held {
+            self.held_pull = Some((x, y));
+            self.reaction = None;
+        } else if let Some((x, y)) = self.held_pull.take() {
+            self.reaction = eyes::Reaction::for_pull(x, self.lift(y)).map(|reaction| (reaction, now));
+            if let Some((reaction @ (eyes::Reaction::Pop | eyes::Reaction::Shake), _)) = self.reaction {
+                // Round the reaction off with a blink.
+                self.blinker.blink_at(now + reaction.length() - 0.05);
+            }
+        }
         for (spring, value) in [(&mut self.pull_x, x), (&mut self.pull_y, y)] {
             let params = if held {
                 SpringParams::new(0.09, 1.0)
@@ -475,6 +511,7 @@ impl Renderer {
         }
         !self.pull_x.is_settled(now) || !self.pull_y.is_settled(now) || !self.animator.is_settled(now)
             || self.transition_progress(now).is_some()
+            || (self.eyes_visible() && (self.blinker.due(now) || self.eyes_reacting(now)))
             || self.content.animates()
             || self
                 .previous_content
@@ -573,7 +610,76 @@ impl Renderer {
         let base_geometry = self.frame_geometry(&sample);
         let x = self.pull_x.sample(now).0 as f32;
         let y = self.pull_y.sample(now).0 as f32;
-        let (geometry, content_geometry) = pull_frames(base_geometry, x, y);
+        let (geometry, mut content_geometry) = pull_frames(base_geometry, x, y);
+        if sample.side != 0.0 {
+            // Attached to a screen side, the pill reaches past the window
+            // edge: centre the content in the part that shows.
+            content_geometry.main = within_width(content_geometry.main, self.logical_width);
+        }
+        let eyes = self.eyes_visible();
+        if eyes {
+            // Other cards fade while pulled; the eyes are the point of it.
+            content_geometry.content_alpha = base_geometry.content_alpha;
+        }
+        if eyes && !self.eyes_shown {
+            self.blinker.greet(now);
+        }
+        self.eyes_shown = eyes;
+        // The night light turned on or off: the eyes react, once each time.
+        let night = self.night_eyes().filter(|_| eyes);
+        if night.is_some() && night != self.night_shown {
+            let reaction = match night {
+                Some(islet_core::island::NightGreeting::Morning) => eyes::Reaction::Wake,
+                _ => eyes::Reaction::Sleepy,
+            };
+            // After the pill has grown in, so the start is seen.
+            self.reaction = Some((reaction, now + NIGHT_EYES_DELAY));
+        }
+        self.night_shown = night;
+        if eyes {
+            self.blinker.advance(now);
+        }
+        if self.reaction.is_some_and(|(reaction, start)| now - start >= reaction.length()) {
+            self.reaction = None;
+        }
+        // Pushed off to a screen side, the eyes sulk there.
+        if eyes && sample.side != 0.0 {
+            self.sulk_since.get_or_insert(now);
+        } else {
+            // Brought back to the middle: cheered up, they hop for joy once
+            // the pill has grown in.
+            if eyes && self.sulk_since.is_some() {
+                self.reaction = Some((eyes::Reaction::Hop, now + CHEER_DELAY));
+                self.blinker.blink_at(now + CHEER_DELAY + eyes::Reaction::Hop.length());
+            }
+            self.sulk_since = None;
+        }
+        let eye_pose = if eyes {
+            // A cross face does not wink.
+            let wink = if self.sulk_since.is_some() { 0.0 } else { self.blinker.wink(now) };
+            let mut pose = eyes::EyePose::new(x, y, self.lift(y), self.blinker.open(now), now).wink(wink);
+            if let Some(since) = self.sulk_since {
+                pose = pose.sulk(now - since - SULK_DELAY);
+            }
+            // Yellow while the night light is on, and as it comes on; going
+            // off, only until they wake.
+            let waking = night == Some(islet_core::island::NightGreeting::Morning);
+            if self.night_light_on() || (night.is_some() && (!waking || self.reaction.is_some())) {
+                pose.warm = 1.0;
+            }
+            // Waiting to wake up: drowsy, as the night left them.
+            if night == Some(islet_core::island::NightGreeting::Morning)
+                && self.reaction.is_some_and(|(_, start)| now < start)
+            {
+                pose.open = pose.open.min(0.3);
+            }
+            match self.reaction {
+                Some((reaction, start)) => pose.react(reaction, now - start),
+                None => pose,
+            }
+        } else {
+            eyes::EyePose::REST
+        };
 
         let levels = self.bar_smoother.sample(
             self.bars
@@ -584,7 +690,7 @@ impl Renderer {
         // Most vblanks change none of them by a visible step (the expanded
         // seekbar crawls about a pixel a second), so those frames are skipped.
         let key = if self.handoff.is_none() && previous.is_none() && !self.is_morphing(now) {
-            self.content_key(now, &geometry, levels)
+            self.content_key(now, &geometry, levels, eye_pose)
         } else {
             None
         };
@@ -615,6 +721,7 @@ impl Renderer {
             gfx.bar_levels = levels;
             gfx.content_scale = sample.content_scale;
             gfx.widget_hover = self.widget_hover;
+            gfx.eyes = eye_pose;
             gfx.draw(
                 now,
                 &geometry,
@@ -643,6 +750,7 @@ impl Renderer {
         now: f64,
         geometry: &FrameGeometry,
         levels: Option<[f32; BAR_COUNT]>,
+        eyes: eyes::EyePose,
     ) -> Option<u64> {
         use std::hash::{Hash, Hasher};
         let steps_per_px = f64::from(self.dpi / 96.0) * 2.0;
@@ -676,7 +784,12 @@ impl Renderer {
                     card.preview.as_ref().map(|art| art.id).hash(&mut hasher);
                 },
                 ContentCard::Stats(stats) => format!("{stats:?}").hash(&mut hasher),
-                ContentCard::Glance(glance) => format!("{glance:?}").hash(&mut hasher),
+                ContentCard::Glance(glance) => {
+                    format!("{glance:?}").hash(&mut hasher);
+                    if glance.kind == islet_core::config::IdleGlance::Eyes {
+                        eyes.key().hash(&mut hasher);
+                    }
+                }
                 ContentCard::Agent(_) | ContentCard::Dictation(_) | ContentCard::Intro => return None,
                 ContentCard::Media(media) => {
                     // Mirrors `Gfx::draw_card`'s layout choice.
@@ -721,6 +834,45 @@ impl Renderer {
             && self.transition_progress(now).is_none()
             && self.animator.is_settled(now))
         .then(|| (hidden_since + GRAPHICS_RELEASE_DELAY - now).max(0.0))
+    }
+
+    /// Seconds until the resting eyes next blink, while they are on screen:
+    /// the render thread can sleep until then.
+    #[must_use]
+    pub fn wake_in(&self, now: f64) -> Option<f64> {
+        self.eyes_visible().then(|| self.blinker.wake_in(now))
+    }
+
+    /// How far a vertical pull of `y` lifts the island away from its edge
+    /// (negative: pushed into it).
+    fn lift(&self, y: f32) -> f32 {
+        if self.anchor_top { y } else { -y }
+    }
+
+    /// The eyes are moving on their own: trembling while held, or playing a
+    /// let-go reaction.
+    fn eyes_reacting(&self, now: f64) -> bool {
+        self.held_pull.is_some()
+            || self.reaction.is_some_and(|(reaction, start)| now - start < reaction.length() + 0.05)
+            || self.sulk_since.is_some_and(|since| now - since < SULK_DELAY + 1.0)
+    }
+
+    /// The night light is warming the screen.
+    fn night_light_on(&self) -> bool {
+        matches!(&self.content.primary, Some(ContentCard::Glance(glance)) if glance.night_light)
+    }
+
+    /// The eyes are showing for the night light turning on or off.
+    fn night_eyes(&self) -> Option<islet_core::island::NightGreeting> {
+        match &self.content.primary {
+            Some(ContentCard::Glance(glance)) => glance.night,
+            _ => None,
+        }
+    }
+
+    fn eyes_visible(&self) -> bool {
+        self.target.visible
+            && matches!(&self.content.primary, Some(ContentCard::Glance(glance)) if glance.kind == islet_core::config::IdleGlance::Eyes)
     }
 
     pub fn release_graphics(&mut self) {
@@ -789,6 +941,8 @@ struct Sample {
     /// 0 = drawn into the screen edge (hidden), 1 = the resting pill. Above 1
     /// while an appearing pill overshoots, which swells it slightly.
     presence: f32,
+    /// Where along the edge (`LayoutTarget::side`).
+    side: f32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -812,6 +966,9 @@ struct Animator {
     anchor: Tween,
     /// 0 drawn into the edge (hidden), 1 the resting pill.
     presence: Tween,
+    /// Where along the edge. It only changes while the island is hidden
+    /// (the window moves to a corner then), so it is not animated.
+    side: f32,
 }
 
 /// Below this the droplet is invisible, so the pill's size can jump to a new
@@ -853,6 +1010,7 @@ impl Animator {
             // configured edge, not fly there from the other one.
             anchor: Tween::new(anchor, now),
             presence: Tween::new(0.0, now),
+            side: target.side,
         };
         animator.set_target(target, now);
         animator
@@ -901,6 +1059,7 @@ impl Animator {
             self.set_presence(0.0, now);
             return;
         }
+        self.side = target.side;
         if self.presence.position(now) < PRESENCE_UNSEEN {
             // Coming back from hidden: start at the new shape, so the only
             // motion is the droplet growing out of the edge.
@@ -1019,6 +1178,7 @@ impl Animator {
             inset: self.inset.position(now).max(0.0) as f32,
             anchor: self.anchor.position(now).clamp(0.0, 1.0) as f32,
             presence: self.presence.position(now).clamp(0.0, 1.0) as f32,
+            side: self.side,
         }
     }
 
@@ -1136,6 +1296,10 @@ fn compact_art(pill: PillSize) -> (Rect, f32) {
 
 /// Shell elasticity and content layout are independent: artwork, text and bars
 /// translate as one intact group, fading gently as the shell stretches around them.
+fn is_eyes(card: &ContentCard) -> bool {
+    matches!(card, ContentCard::Glance(glance) if glance.kind == islet_core::config::IdleGlance::Eyes)
+}
+
 fn pull_frames(base: FrameGeometry, x: f32, y: f32) -> (FrameGeometry, FrameGeometry) {
     let mut shell = base;
     shell.main = pulled_rect(base.main, x, y);
@@ -1151,6 +1315,16 @@ fn pull_frames(base: FrameGeometry, x: f32, y: f32) -> (FrameGeometry, FrameGeom
     }
     content.bubble = shell.bubble;
     (shell, content)
+}
+
+/// The part of `rect` between x = 0 and `width`.
+fn within_width(rect: Rect, width: f32) -> Rect {
+    let left = rect.x.max(0.0);
+    let right = rect.right().min(width);
+    if right - left < 1.0 {
+        return rect;
+    }
+    Rect::new(left, rect.y, right - left, rect.height)
 }
 
 /// The far edge follows the hand more than the trailing edge. Rounded magnitude
@@ -1244,7 +1418,7 @@ fn droplet_geometry(sample: &Sample, window_width: f32, window_height: f32) -> F
     // Appearing and travelling are the same droplet: both scale how far the
     // pill has come out of its edge.
     let fullness = travel * sample.presence.clamp(0.0, 1.0);
-    let frame = arrange_at(
+    let frame = arrange_on(
         PillSize::new(sample.main_width, sample.main_height, sample.main_corner),
         Some(PillSize::new(
             sample.bubble_width,
@@ -1256,6 +1430,7 @@ fn droplet_geometry(sample: &Sample, window_width: f32, window_height: f32) -> F
         window_width,
         window_height,
         if top { 0.0 } else { 1.0 },
+        sample.side,
     );
     if fullness >= 1.0 {
         return FrameGeometry {
@@ -1402,6 +1577,11 @@ struct Gfx {
     intro_stroke: Option<ID2D1StrokeStyle>,
     /// The dictation bars' springs, carried from frame to frame.
     voice_bars: voice::VoiceBars,
+    /// How the resting eyes look this frame, set by the renderer.
+    eyes: eyes::EyePose,
+    /// While the eyes and the dictation bars change into each other: how
+    /// far along, 0 (eyes) to 1 (bars).
+    eyes_to_bars: Option<f32>,
     pixel_width: u32,
     pixel_height: u32,
     dpi: f32,
@@ -1576,6 +1756,8 @@ impl Gfx {
             intro_sheen: None,
             intro_stroke: None,
             voice_bars: voice::VoiceBars::default(),
+            eyes: eyes::EyePose::REST,
+            eyes_to_bars: None,
             pixel_width: config.pixel_width,
             pixel_height: config.pixel_height,
             dpi: config.dpi,
@@ -1616,7 +1798,22 @@ impl Gfx {
         previous: Option<&ContentSnapshot>,
         progress: f32,
     ) -> RenderResult<()> {
-        let transitioning = previous.is_some() && progress < 1.0;
+        let mut transitioning = previous.is_some() && progress < 1.0;
+        // The eyes and the dictation bars turn into each other directly
+        // instead of cross-fading.
+        self.eyes_to_bars = None;
+        if transitioning {
+            let from = previous.and_then(|snapshot| snapshot.primary.as_ref());
+            let amount = match (from, content.primary.as_ref()) {
+                (Some(card), Some(ContentCard::Dictation(_))) if is_eyes(card) => Some(progress),
+                (Some(ContentCard::Dictation(_)), Some(card)) if is_eyes(card) => Some(1.0 - progress),
+                _ => None,
+            };
+            if amount.is_some() {
+                self.eyes_to_bars = amount;
+                transitioning = false;
+            }
+        }
         self.widget_navigation = content.widget_navigation;
         self.widget_pages = content.widget_pages;
         self.widget_page = content.widget_page;
@@ -2157,6 +2354,13 @@ impl Gfx {
         if let ContentCard::Intro = card {
             return self.draw_intro(width, height, corner, accent, alpha);
         }
+        if let Some(amount) = self.eyes_to_bars.filter(|_| is_eyes(card) || matches!(card, ContentCard::Dictation(_))) {
+            let dictation = match card {
+                ContentCard::Dictation(dictation) => Some(dictation),
+                _ => None,
+            };
+            return self.draw_eyes_to_bars(now, width, height, amount, dictation, accent, alpha);
+        }
         if width < 60.0 && height < 60.0 && !matches!(card, ContentCard::Dictation(_)) {
             return self.draw_bubble(now, width, height, corner, card, accent, alpha);
         }
@@ -2417,6 +2621,9 @@ impl Gfx {
                     format!("{}  \u{b7}  {}", agent.project, agent.activity),
                     None,
                 )
+            }
+            ContentCard::Glance(glance) if glance.kind == islet_core::config::IdleGlance::Eyes => {
+                return self.draw_eyes(width, height, alpha);
             }
             ContentCard::Glance(glance) => (glance_line(glance), None),
             ContentCard::Converter(_) | ContentCard::Calculator(_) | ContentCard::Stats(_) => return Ok(()),
@@ -2983,7 +3190,11 @@ impl Gfx {
         self.draw_notice_icon(Rect::new(16.0, icon_y, icon, icon), 12.0, notification, accent, alpha)?;
 
         let text_x = 64.0;
-        let text_w = (width - text_x - 24.0).max(40.0);
+        let button = notification
+            .action_label()
+            .map(|label| (label, islet_core::island::notice_button(width, height)));
+        let right = button.map_or(24.0, |(_, rect)| width - rect.x + 12.0);
+        let text_w = (width - text_x - right).max(40.0);
         // Without a source line the title and body sit centred.
         let lift = if notification.source.is_empty() { 7.0 } else { 0.0 };
         self.draw_text(
@@ -3013,8 +3224,33 @@ impl Gfx {
             17.0,
             color([177, 185, 204], 0.92 * alpha),
         )?;
+        if let Some(progress) = notification.progress {
+            self.draw_progress(text_x, height - 13.0, text_w, 4.0, progress, accent, alpha)?;
+        }
+        if let Some((label, rect)) = button {
+            self.fill_round_rect(rect.x, rect.y, rect.width, rect.height, rect.height * 0.5, color(accent, 0.92 * alpha))?;
+            return self.draw_text(label, FormatId::Button, rect.x, rect.y, rect.width, rect.height, color([8, 10, 16], alpha));
+        }
 
         self.draw_alert_dot(width - 19.0, 19.0, notification.level, accent, alpha)
+    }
+
+    /// A thin bar filled to `progress` (0..=1) in the accent colour.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn draw_progress(
+        &mut self,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        progress: f32,
+        accent: [u8; 3],
+        alpha: f32,
+    ) -> RenderResult<()> {
+        let radius = height * 0.5;
+        self.fill_round_rect(x, y, width, height, radius, color([255, 255, 255], 0.12 * alpha))?;
+        let filled = (width * progress.clamp(0.0, 1.0)).max(height);
+        self.fill_round_rect(x, y, filled, height, radius, color(accent, 0.95 * alpha))
     }
 
     /// The square beside a notice: the app's own icon when there is one,
@@ -3088,6 +3324,9 @@ impl Gfx {
             13.0,
             color([173, 180, 199], 0.88 * alpha),
         )?;
+        if let Some(progress) = notification.progress {
+            self.draw_progress(text_x, height - 4.0, text_w, 2.0, progress, accent, alpha)?;
+        }
 
         self.draw_alert_dot(
             width - 13.0,
@@ -3181,6 +3420,8 @@ impl Gfx {
                     AgentState::Done => AlertLevel::Success,
                 },
                 icon: None,
+                action: None,
+                progress: None,
             },
             accent,
             alpha,
@@ -3200,9 +3441,7 @@ impl Gfx {
         accent: [u8; 3],
         alpha: f32,
     ) -> RenderResult<()> {
-        use voice::BARS;
-        const PITCH: f32 = 9.0;
-        const BAR_WIDTH: f32 = 3.0;
+        use voice::{BARS, BAR_PITCH as PITCH, BAR_WIDTH};
 
         let mid = height * 0.5;
 
@@ -3211,23 +3450,9 @@ impl Gfx {
         let max_h = (height - 12.0).max(6.0);
         // Loading shows the live mic too: the audio is already being kept,
         // and the model catches up on it once it is ready.
-        let targets = match dictation.phase {
-            DictationPhase::Transcribing => {
-                let mut wave = [0.0; BARS];
-                for (index, value) in wave.iter_mut().enumerate() {
-                    let phase = (now * 6.0 - index as f64 * 0.8).sin() * 0.5 + 0.5;
-                    *value = 0.12 + 0.34 * phase as f32;
-                }
-                wave
-            }
-            _ => voice::targets(&dictation.bars, now),
-        };
-        let heights = self.voice_bars.step(now, targets);
+        let heights = self.voice_bars.step(now, voice::card_targets(dictation, now));
         for (index, level) in heights.iter().enumerate() {
-            let bar_alpha = match dictation.phase {
-                DictationPhase::Transcribing => 0.9,
-                _ => 0.7 + 0.25 * (1.0 - (index as f32 - 2.5).abs() / 2.5),
-            };
+            let bar_alpha = voice::bar_alpha(dictation, index);
             let bar_h = 3.0 + level.max(0.0) * (max_h - 3.0);
             self.fill_round_rect(
                 left + index as f32 * PITCH,
@@ -3584,6 +3809,7 @@ enum FormatId {
     Chip,
     Tucked,
     Bubble,
+    Button,
 }
 
 struct TextFormats {
@@ -3602,6 +3828,7 @@ struct TextFormats {
     chip: IDWriteTextFormat,
     tucked: IDWriteTextFormat,
     bubble: IDWriteTextFormat,
+    button: IDWriteTextFormat,
 }
 
 impl TextFormats {
@@ -3712,6 +3939,13 @@ impl TextFormats {
                 DWRITE_TEXT_ALIGNMENT_CENTER,
                 DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
             )?,
+            button: create_format(
+                factory,
+                12.5,
+                DWRITE_FONT_WEIGHT_DEMI_BOLD,
+                DWRITE_TEXT_ALIGNMENT_CENTER,
+                DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
+            )?,
         })
     }
 
@@ -3732,6 +3966,7 @@ impl TextFormats {
             FormatId::Chip => &self.chip,
             FormatId::Tucked => &self.tucked,
             FormatId::Bubble => &self.bubble,
+            FormatId::Button => &self.button,
         }
     }
 }
@@ -4362,6 +4597,7 @@ mod tests {
             inset: 8.0,
             anchor,
             presence: 1.0,
+            side: 0.0,
         }
     }
 

@@ -29,6 +29,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::dictation_page::DictationUi;
+use crate::practice::Practice;
 use crate::showcase::{self, Gesture, LAVENDER};
 use crate::ui::{bold_font, toggle, ACCENT, BG, CARD, CARD_LINE, DANGER, MUTED, TEXT};
 
@@ -73,14 +74,17 @@ pub fn run(config_file: PathBuf, icon: Arc<egui::IconData>) -> eframe::Result {
 enum Step {
     Welcome,
     Island,
+    /// Practising the swipes on a pretend island. Not skippable.
+    Gestures,
     Models,
     Try,
     Done,
 }
 
-const STEPS: [Step; 5] = [
+const STEPS: [Step; 6] = [
     Step::Welcome,
     Step::Island,
+    Step::Gestures,
     Step::Models,
     Step::Try,
     Step::Done,
@@ -124,6 +128,7 @@ struct Tour {
     island_running: bool,
     island_checked: Option<Instant>,
     status: Option<String>,
+    practice: Practice,
 }
 
 impl Tour {
@@ -139,6 +144,7 @@ impl Tour {
             .as_deref()
         {
             Some("island") => Step::Island,
+            Some("gestures") => Step::Gestures,
             Some("models") => Step::Models,
             Some("try") => Step::Try,
             Some("done") => Step::Done,
@@ -158,10 +164,11 @@ impl Tour {
             island_running: true,
             island_checked: None,
             status: None,
+            practice: Practice::default(),
         };
-        // Seen once is enough: closing the window counts as done. The tour
+        // The tour counts as done once the gestures have been practised
+        // (see `update`); until then the island opens it at every start. It
         // stays a click away in Settings, under About.
-        tour.change(|config| config.general.onboarded = true);
         // `--tour-download` starts both downloads (for development).
         if std::env::args().any(|arg| arg == "--tour-download") {
             let speech = tour.speech_model().id;
@@ -265,6 +272,9 @@ impl Tour {
 impl eframe::App for Tour {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.models.poll_jobs();
+        if self.practice.complete() && !self.config.general.onboarded {
+            self.change(|config| config.general.onboarded = true);
+        }
         let mut next_step = None;
         let mut close = false;
 
@@ -323,6 +333,7 @@ impl eframe::App for Tour {
                         .show(ui, |ui| match self.step {
                             Step::Welcome => welcome(self, ui),
                             Step::Island => island_page(self, ui),
+                            Step::Gestures => gestures_page(self, ui),
                             Step::Models => models_page(self, ui),
                             Step::Try => {
                                 if let Some(step) = try_page(self, ui) {
@@ -387,8 +398,20 @@ fn top_bar(tour: &Tour, ui: &mut egui::Ui) {
 fn footer(tour: &mut Tour, ui: &mut egui::Ui) -> (Option<Step>, bool) {
     let mut step = None;
     let mut close = false;
+    // The gesture practice cannot be skipped: until it is done, skipping
+    // goes to it, and it holds Continue back.
+    let practised = tour.practice.complete();
+    let held_back = tour.step == Step::Gestures && !practised;
     ui.horizontal_centered(|ui| {
-        if tour.step != Step::Done
+        if !practised {
+            if tour.step.index() < Step::Gestures.index()
+                && button(ui, "Skip to gestures", Kind::Quiet, true)
+                    .on_hover_text("Try the island's gestures, then you can skip the rest")
+                    .clicked()
+            {
+                step = Some(Step::Gestures);
+            }
+        } else if tour.step != Step::Done
             && button(ui, "Skip tour", Kind::Quiet, true)
                 .on_hover_text("You can open it again from Settings, under About")
                 .clicked()
@@ -404,7 +427,9 @@ fn footer(tour: &mut Tour, ui: &mut egui::Ui) -> (Option<Step>, bool) {
                 Step::Done => "Finish",
                 _ => "Continue",
             };
-            if button(ui, label, Kind::Primary, true).clicked() {
+            let next = button(ui, label, Kind::Primary, !held_back);
+            let next = if held_back { next.on_hover_text("Try all four gestures to continue") } else { next };
+            if next.clicked() {
                 match tour.step.next() {
                     Some(next) => step = Some(next),
                     None => close = true,
@@ -658,6 +683,15 @@ fn island_page(tour: &mut Tour, ui: &mut egui::Ui) {
     if tour.animations {
         ui.ctx().request_repaint();
     }
+}
+
+fn gestures_page(tour: &mut Tour, ui: &mut egui::Ui) {
+    heading(
+        ui,
+        "Try the gestures",
+        "Drag the island with your mouse: left, right, down and up. Each does here what it does on your screen.",
+    );
+    tour.practice.show(ui, tour.animations);
 }
 
 fn megabytes(bytes: u64) -> String {
@@ -1320,9 +1354,10 @@ mod tests {
     fn steps_run_in_order_and_stop_at_the_ends() {
         assert_eq!(Step::Welcome.previous(), None);
         assert_eq!(Step::Welcome.next(), Some(Step::Island));
+        assert_eq!(Step::Island.next(), Some(Step::Gestures));
         assert_eq!(Step::Try.next(), Some(Step::Done));
         assert_eq!(Step::Done.next(), None);
-        assert_eq!(Step::Models.previous(), Some(Step::Island));
+        assert_eq!(Step::Models.previous(), Some(Step::Gestures));
     }
 
     #[test]

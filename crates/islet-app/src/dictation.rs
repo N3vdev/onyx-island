@@ -20,7 +20,7 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crossbeam_channel::{unbounded, Receiver, Select, Sender};
 use islet_asr::{
@@ -30,8 +30,9 @@ use islet_audio::{tone, MicError, Microphone, Tone};
 use islet_core::config::{DictationConfig, InjectionMethod};
 use islet_core::hotkey::Action;
 use islet_core::island::{
-    AlertLevel, DictationCard, DictationPhase, NotificationCard, DICTATION_BARS,
+    AlertLevel, DictationCard, DictationPhase, NoticeAction, NotificationCard, DICTATION_BARS,
 };
+use islet_core::recordings::{self, WavWriter};
 use islet_core::transcript::{self, TextOptions};
 use islet_input::{HookEvent, KeyboardHook, Method};
 
@@ -48,6 +49,15 @@ pub enum UiUpdate {
     Notice(NotificationCard),
     /// A music control said to the assistant.
     Media(islet_core::command::MediaVerb),
+    /// The AI dictation download started from the island.
+    AiDownload(AiDownload),
+}
+
+/// How the AI dictation download started from the island is going.
+#[derive(Clone, Debug)]
+pub enum AiDownload {
+    Progress { done: u64, total: u64 },
+    Finished(Result<(), String>),
 }
 
 enum Command {
@@ -159,6 +169,10 @@ const POLISH_MAX: Duration = Duration::from_secs(15);
 const NOTICE_COOLDOWN: Duration = Duration::from_secs(8);
 /// How long "open X and type ..." waits for X's window.
 const OPEN_WAIT: Duration = Duration::from_secs(8);
+/// The offer to download AI dictation shows at most this often.
+const AI_OFFER_INTERVAL: Duration = Duration::from_secs(60 * 60);
+/// How often old saved recordings are looked for while Onyx keeps running.
+const PRUNE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
@@ -198,6 +212,9 @@ struct Session {
     stopped_at: Option<Instant>,
     /// When `End` was sent to the worker.
     end_sent_at: Option<Instant>,
+    /// The audio being saved, when saving recordings is on. Dropping it
+    /// (a discarded dictation) deletes the file.
+    recording: Option<WavWriter>,
 }
 
 /// Timings of one dictation, logged when its text is inserted.
@@ -252,7 +269,11 @@ struct Controller {
     /// What the dictation being typed was heard as and cleaned to, for
     /// learning from corrections (only kept while that is on).
     last_dictated: Option<(String, String)>,
+    /// When the AI dictation offer last showed.
+    last_ai_offer: Option<Instant>,
     next_tick: Instant,
+    /// When to next delete saved recordings past their keep time.
+    next_prune: Instant,
 }
 
 /// Tracks the background noise and the loudness of recent speech, in dB.
@@ -330,11 +351,14 @@ impl Controller {
             loudness: Loudness::default(),
             assistant: None,
             last_dictated: None,
+            last_ai_offer: None,
             next_tick: Instant::now(),
+            next_prune: Instant::now(),
         };
         controller.update_assistant();
         controller.update_hook_enabled();
         controller.maybe_preload();
+        controller.prune_recordings();
         controller
     }
 
@@ -444,11 +468,55 @@ impl Controller {
     fn next_deadline(&self) -> Option<Instant> {
         match self.phase {
             Phase::Recording | Phase::Transcribing => Some(self.next_tick),
-            Phase::Idle if self.models_running() && !self.config.keep_warm => {
-                Some(self.last_used + self.unload_after())
+            Phase::Idle => {
+                let unload = (self.models_running() && !self.config.keep_warm)
+                    .then(|| self.last_used + self.unload_after());
+                // Idle otherwise blocks: only wake for cleanup while saving.
+                let prune = (self.config.save_recordings
+                    && self.config.delete_recordings_after_days > 0)
+                    .then_some(self.next_prune);
+                match (unload, prune) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                }
             }
-            Phase::Idle => None,
         }
+    }
+
+    /// Starts saving this dictation's audio, if that is turned on.
+    fn new_recording(&self) -> Option<WavWriter> {
+        if !self.config.save_recordings {
+            return None;
+        }
+        let now = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
+        let name = recordings::file_name([
+            now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute, now.wSecond,
+        ]);
+        let dir = recordings::dir(&self.config.recordings_folder);
+        match WavWriter::create(&dir, &name) {
+            Ok(writer) => Some(writer),
+            Err(error) => {
+                tracing::warn!(%error, "could not start saving the recording");
+                None
+            }
+        }
+    }
+
+    /// Deletes saved recordings older than the chosen number of days, off
+    /// this thread so a slow or network folder never delays dictation.
+    fn prune_recordings(&mut self) {
+        self.next_prune = Instant::now() + PRUNE_INTERVAL;
+        let days = self.config.delete_recordings_after_days;
+        if days == 0 {
+            return;
+        }
+        let dir = recordings::dir(&self.config.recordings_folder);
+        std::thread::spawn(move || {
+            let removed = recordings::prune(&dir, days, SystemTime::now());
+            if removed > 0 {
+                tracing::info!(removed, "deleted old recordings");
+            }
+        });
     }
 
     fn models_running(&self) -> bool {
@@ -489,9 +557,14 @@ impl Controller {
 
         let model_changed = config.model != self.config.model;
         let mic_changed = config.microphone != self.config.microphone;
+        let keep_changed = config.recordings_folder != self.config.recordings_folder
+            || config.delete_recordings_after_days != self.config.delete_recordings_after_days;
         self.config = config;
         self.update_assistant();
         self.update_hook_enabled();
+        if keep_changed {
+            self.prune_recordings();
+        }
 
         if mic_changed && self.phase == Phase::Idle {
             self.mic = None;
@@ -641,6 +714,8 @@ impl Controller {
             peak: 0.0,
             stopped_at: None,
             end_sent_at: None,
+            // Assistant commands are not dictation and are never saved.
+            recording: if command { None } else { self.new_recording() },
         };
         if self.model == ModelState::Ready && self.loaded_model == spec.id {
             if self.asr.begin().is_err() {
@@ -722,6 +797,15 @@ impl Controller {
         if (session.samples as f32) < MIN_SPEECH_SECONDS * 16_000.0 {
             self.discard();
             return;
+        }
+        // The audio is complete: keep the file, unless the mic was silent.
+        if let Some(recording) = session.recording.take() {
+            if session.peak >= SILENCE_PEAK {
+                match recording.finish() {
+                    Ok(_) => self.prune_recordings(),
+                    Err(error) => tracing::warn!(%error, "could not save the recording"),
+                }
+            }
         }
         if !revealed && !self.reveal() {
             return;
@@ -836,6 +920,9 @@ impl Controller {
         }
         self.sample_count += chunk.len();
         session.samples += chunk.len();
+        if let Some(recording) = &mut session.recording {
+            recording.write(chunk);
+        }
         session.peak = chunk
             .iter()
             .fold(session.peak, |peak, sample| peak.max(sample.abs()));
@@ -915,6 +1002,9 @@ impl Controller {
             }
             Phase::Transcribing => self.send_card(),
             Phase::Idle => {
+                if now >= self.next_prune {
+                    self.prune_recordings();
+                }
                 if self.models_running()
                     && !self.config.keep_warm
                     && now.duration_since(self.last_used) >= self.unload_after()
@@ -1259,6 +1349,8 @@ impl Controller {
                         "Could not copy it to the clipboard.",
                         AlertLevel::Error,
                     );
+                } else {
+                    self.offer_ai_cleanup();
                 }
             }
             Err(error) => {
@@ -1335,6 +1427,31 @@ impl Controller {
             body: body.to_owned(),
             level,
             icon,
+            action: None,
+            progress: None,
+        }));
+    }
+
+    /// After a dictation without AI cleanup (its model not downloaded),
+    /// suggests it; opening the notice shows a Download button. Not when the
+    /// user turned AI cleanup off, and at most once an hour.
+    fn offer_ai_cleanup(&mut self) {
+        if !self.config.ai_cleanup
+            || self.manager.addon_status(&AI_CLEANUP) == ModelStatus::Installed
+            || self.last_ai_offer.is_some_and(|at| at.elapsed() < AI_OFFER_INTERVAL)
+        {
+            return;
+        }
+        self.last_ai_offer = Some(Instant::now());
+        let size_mb = self.manager.addon_download_size(&AI_CLEANUP) / (1024 * 1024);
+        self.send(UiUpdate::Notice(NotificationCard {
+            source: String::new(),
+            title: "Use AI dictation".to_owned(),
+            body: format!("Improves accuracy \u{b7} {size_mb} MB"),
+            level: AlertLevel::Info,
+            icon: None,
+            action: Some(NoticeAction::DownloadAiCleanup),
+            progress: None,
         }));
     }
 
@@ -1401,8 +1518,88 @@ mod tests {
             loudness: Loudness::default(),
             assistant: None,
             last_dictated: None,
+            last_ai_offer: None,
             next_tick: Instant::now(),
+            next_prune: Instant::now(),
         }
+    }
+
+    fn quiet_session() -> Session {
+        Session {
+            started: Instant::now(),
+            reveal_at: Instant::now(),
+            revealed: true,
+            hands_free: false,
+            command: false,
+            began: false,
+            stop_requested: false,
+            pending: Vec::new(),
+            outgoing: Vec::new(),
+            samples: 0,
+            peak: 0.0,
+            stopped_at: None,
+            end_sent_at: None,
+            recording: None,
+        }
+    }
+
+    #[test]
+    fn ai_dictation_is_offered_when_missing_at_most_hourly_and_never_when_turned_off() {
+        let (tx, rx) = unbounded();
+        let mut controller = controller(tx);
+        let offers = |rx: &Receiver<UiUpdate>| {
+            rx.try_iter()
+                .filter(|update| matches!(update, UiUpdate::Notice(card) if card.action == Some(NoticeAction::DownloadAiCleanup)))
+                .count()
+        };
+        // The test models folder has no AI cleanup model.
+        controller.config.ai_cleanup = false;
+        controller.offer_ai_cleanup();
+        assert_eq!(offers(&rx), 0, "turned off: never offered");
+        controller.config.ai_cleanup = true;
+        controller.offer_ai_cleanup();
+        controller.offer_ai_cleanup();
+        assert_eq!(offers(&rx), 1, "once, then not again within the hour");
+        controller.last_ai_offer = Some(Instant::now() - AI_OFFER_INTERVAL);
+        controller.offer_ai_cleanup();
+        assert_eq!(offers(&rx), 1);
+    }
+
+    #[test]
+    fn recordings_are_saved_only_when_on_and_kept_only_when_used() {
+        let dir = std::env::temp_dir().join(format!("onyx-dictation-recordings-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (tx, _rx) = unbounded();
+        let mut controller = controller(tx);
+        controller.config.tones = false;
+        controller.config.recordings_folder = dir.display().to_string();
+        controller.model = ModelState::Ready;
+        controller.loaded_model = controller.config.model.clone();
+        assert!(controller.new_recording().is_none(), "off by default");
+        controller.config.save_recordings = true;
+
+        let speech = vec![0.1f32; 16_000];
+        let count = || recordings::usage(&dir).0;
+        // A dictation that is used is kept.
+        controller.phase = Phase::Recording;
+        controller.session = Some(Session { recording: controller.new_recording(), ..quiet_session() });
+        controller.on_audio(&speech);
+        controller.stop();
+        assert_eq!(count(), 1);
+        // One thrown away with Esc leaves nothing behind.
+        controller.discard();
+        controller.phase = Phase::Recording;
+        controller.session = Some(Session { recording: controller.new_recording(), ..quiet_session() });
+        controller.on_audio(&speech);
+        controller.discard();
+        assert_eq!(count(), 1);
+        // Nor does a silent microphone.
+        controller.phase = Phase::Recording;
+        controller.session = Some(Session { recording: controller.new_recording(), ..quiet_session() });
+        controller.on_audio(&[0.0; 16_000]);
+        controller.stop();
+        assert_eq!(count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1445,6 +1642,7 @@ mod tests {
                 peak: 0.0,
                 stopped_at: None,
                 end_sent_at: None,
+                recording: None,
             });
             assert!(rx.is_empty());
             assert!(controller.reveal());

@@ -10,7 +10,7 @@ use crossbeam_channel::{unbounded, Receiver, RecvTimeoutError, Sender};
 use islet_audio::{Loopback, VolumeHandle};
 use islet_core::config::{IdleGlance, IdleStyle, MonitorChoice};
 use islet_core::island::{
-    arrange, reduce, AgentCard, AgentState, AlertLevel, ContentSnapshot, DictationCard,
+    reduce, AgentCard, AgentState, AlertLevel, ContentSnapshot, DictationCard,
     DictationPhase, Effect, IslandEvent, IslandState, LayoutTarget, MediaCard, NotificationCard,
     TimerKind,
 };
@@ -24,7 +24,7 @@ use islet_core::{Config, Rect};
 use islet_media::{MediaCommand, MediaInfo, MediaService};
 use islet_render::{HitRegion, Renderer, RendererConfig};
 
-use crate::dictation::{self, DictationHandle, UiUpdate};
+use crate::dictation::{self, AiDownload, DictationHandle, UiUpdate};
 use crate::occlusion;
 use islet_core::handoff::{PREVIEW_ATTACH, PREVIEW_DEPARTED, PREVIEW_DETACH};
 use windows::core::{s, w, Result as WinResult, PCWSTR};
@@ -48,7 +48,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::Shell::{
     SHAppBarMessage, SHQueryUserNotificationState, ShellExecuteW, ABM_NEW, ABM_REMOVE,
-    ABN_FULLSCREENAPP, APPBARDATA, QUNS_BUSY, QUNS_RUNNING_D3D_FULL_SCREEN,
+    ABN_FULLSCREENAPP, APPBARDATA, QUNS_APP, QUNS_BUSY, QUNS_RUNNING_D3D_FULL_SCREEN,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, DefWindowProcW, EnumWindows, GetCursorPos, GetForegroundWindow,
@@ -63,7 +63,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetAncestor, IsWindow, RemovePropW, SetPropW, GA_ROOT, HWND_NOTOPMOST,
+    GetAncestor, GetClassNameW, IsWindow, IsZoomed, RemovePropW, SetPropW, GA_ROOT, GWL_STYLE,
+    HWND_NOTOPMOST, WS_CAPTION, WS_THICKFRAME,
 };
 
 /// Room for the expanded player plus the second player's bubble beside it.
@@ -84,6 +85,10 @@ const TIMER_CLOCK: usize = 12;
 const TIMER_RESUME: usize = 13;
 const TIMER_GESTURE: usize = 14;
 const TIMER_INTRO: usize = 15;
+/// The sleepy eyes shown as the night light comes on.
+const TIMER_NIGHT_GREETING: usize = 16;
+/// How long the night light's sleepy eyes stay (their animation's length).
+const NIGHT_GREETING_MS: u32 = 5_800;
 /// How long the startup greeting stays before the island moves on. Its
 /// beats finish by about 2.3 s after the pill appears (islet-render intro).
 const INTRO_MS: u32 = 2_900;
@@ -121,6 +126,12 @@ const WM_APP_MEDIA: u32 = WM_APP + 22;
 const WM_APP_WINDOWS_CHANGED: u32 = WM_APP + 23;
 /// Posted by the dictation controller when it queued island updates.
 const WM_APP_DICTATION: u32 = WM_APP + 30;
+/// The night light turned on (`wparam` 1) or off (0), or Settings asks
+/// for a preview of its eyes.
+const WM_APP_NIGHT_LIGHT: u32 = islet_core::handoff::NIGHT_LIGHT_GREETING;
+/// The night light is on (`wparam` 1) or off (0): the eyes are yellow
+/// while it is on.
+const WM_APP_NIGHT_STATE: u32 = WM_APP + 32;
 /// Extra room around a morphing island's window region for spring overshoot.
 const REGION_MORPH_MARGIN_DP: f32 = 12.0;
 
@@ -272,6 +283,12 @@ pub struct IslandHost {
     /// The pill is between the top and bottom edges; the window is
     /// click-through until it arrives.
     traveling: bool,
+    /// Where along the edge the window sits (`IslandState::side`): in the
+    /// middle, or at the screen's left or right end.
+    window_side: f32,
+    /// The pill is sinking into the edge so the window can move to another
+    /// corner; snapshots wait until it has.
+    relocating: bool,
     region: Option<WindowRegion>,
     bars: Arc<BarLevels>,
     media: Option<MediaService>,
@@ -291,6 +308,9 @@ pub struct IslandHost {
     dictation: Option<DictationHandle>,
     dictation_tx: Sender<UiUpdate>,
     dictation_rx: Receiver<UiUpdate>,
+    /// The AI dictation model is downloading (started from the island).
+    ai_downloading: bool,
+    night_light: Option<crate::night_light::NightLight>,
     loopback: Option<Loopback>,
     volume: Option<VolumeHandle>,
     real_bars: bool,
@@ -332,7 +352,7 @@ impl IslandHost {
         demo_state: Option<usize>,
     ) -> WinResult<Box<Self>> {
         let config = read_config(&shared);
-        let layout = compute_window_layout(&config)?;
+        let layout = compute_window_layout(&config, 0.0)?;
         apply_window_layout(hwnd, layout)?;
         let file_drop = crate::file_drop::Registration::new(hwnd)?;
         file_drop.set_enabled(config.widgets.file_converter);
@@ -389,6 +409,7 @@ impl IslandHost {
                 idle_style: config.general.idle_style,
                 expand_on: config.general.expand_on,
                 glance: config.general.always_on.then_some(config.general.glance),
+                corner: config.general.corner,
                 ..IslandState::default()
             },
             hit,
@@ -416,6 +437,8 @@ impl IslandHost {
             last_target_anchor_top: None,
             last_sent_anchor_top: Some(layout.anchor_top),
             traveling: false,
+            window_side: 0.0,
+            relocating: false,
             region: None,
             bars,
             media: None,
@@ -428,6 +451,8 @@ impl IslandHost {
             dictation: None,
             dictation_tx,
             dictation_rx,
+            ai_downloading: false,
+            night_light: None,
             loopback: None,
             volume,
             real_bars: config.media.real_bars,
@@ -483,6 +508,20 @@ impl IslandHost {
         }
         if !demo && demo_state.is_none() {
             host.start_dictation(&config);
+            let hwnd = hwnd.0 as isize;
+            host.night_light = Some(crate::night_light::NightLight::spawn(
+                &config.night_light,
+                Box::new(move |on, announce| {
+                    let island = Some(HWND(hwnd as *mut _));
+                    // SAFETY: non-blocking posts to the island window.
+                    unsafe {
+                        let _ = PostMessageW(island, WM_APP_NIGHT_STATE, WPARAM(usize::from(on)), LPARAM(0));
+                        if announce {
+                            let _ = PostMessageW(island, WM_APP_NIGHT_LIGHT, WPARAM(usize::from(on)), LPARAM(0));
+                        }
+                    }
+                }),
+            ));
         }
         // After the demo is set up: the demo never tucks.
         host.update_window_events();
@@ -515,6 +554,8 @@ impl IslandHost {
         self.stats_sampler = None;
         self.window_events = None;
         self.dictation = None;
+        // Puts the screens' colours back.
+        self.night_light = None;
         self.loopback = None;
         self.media = None;
         self.poll_interval = None;
@@ -542,6 +583,9 @@ impl IslandHost {
         if let Some(dictation) = &self.dictation {
             dictation.configure(&config.dictation);
         }
+        if let Some(night_light) = &self.night_light {
+            night_light.configure(&config.night_light);
+        }
         self.anchor_top = config.general.position.home_is_top();
         self.hide_in_fullscreen = config.general.hide_in_fullscreen;
         self.follow_cursor = config.general.monitor == MonitorChoice::FollowCursor;
@@ -551,6 +595,7 @@ impl IslandHost {
             self.stats_sampler = needs_sampler(&config).then(crate::sysstats::Sampler::new);
         }
         self.dispatch(IslandEvent::SetStatsEnabled(config.widgets.system_stats));
+        self.state.corner = config.general.corner;
         self.dispatch(IslandEvent::SetGlance(
             config.general.always_on.then_some(config.general.glance),
         ));
@@ -602,9 +647,9 @@ impl IslandHost {
         if tint_changed {
             self.apply_media();
         }
-        if self.hide_in_fullscreen && self.demo.is_none() {
-            let hide = self.should_hide_for_fullscreen();
-            self.set_fullscreen_hidden(hide);
+        if self.demo.is_none() {
+            // Also shows it again when hiding in full screen was turned off.
+            self.update_fullscreen();
         } else if self.fullscreen_hidden {
             self.set_fullscreen_hidden(false);
         }
@@ -711,6 +756,8 @@ impl IslandHost {
                             );
                         }
                     }
+                } else if self.relocating {
+                    self.finish_relocation();
                 }
                 Some(LRESULT(0))
             }
@@ -817,6 +864,8 @@ impl IslandHost {
                     self.finish_volume();
                 } else if !armed || !self.shape_settled() {
                     // Pressed or released mid-animation: not a click.
+                } else if self.handle_notice_click(lparam) {
+                    // The opened notice's button (Download).
                 } else if self.handle_converter_click(lparam) || self.handle_widget_click(lparam) {
                     // Widget controls never toggle or operate the music player.
                 } else if self.media_bubble_hit(lparam) {
@@ -828,7 +877,7 @@ impl IslandHost {
                 {
                     self.media_action(action);
                 } else {
-                    self.dispatch(IslandEvent::Click);
+                    self.click_island();
                 }
                 self.focus_calculator();
                 Some(LRESULT(0))
@@ -896,6 +945,22 @@ impl IslandHost {
                 }
                 Some(LRESULT(0))
             }
+            WM_APP_NIGHT_STATE => {
+                self.dispatch(IslandEvent::SetNightLight(wparam.0 != 0));
+                Some(LRESULT(0))
+            }
+            WM_APP_NIGHT_LIGHT => {
+                // The eyes for a moment, then a word on what happened.
+                if self.demo.is_none() {
+                    use islet_core::island::NightGreeting;
+                    let greeting = if wparam.0 == 0 { NightGreeting::Morning } else { NightGreeting::Evening };
+                    self.dispatch(IslandEvent::SetNightGreeting(Some(greeting)));
+                    unsafe {
+                        SetTimer(Some(self.hwnd), TIMER_NIGHT_GREETING, NIGHT_GREETING_MS, None);
+                    }
+                }
+                Some(LRESULT(0))
+            }
             WM_APP_DICTATION => {
                 while let Ok(update) = self.dictation_rx.try_recv() {
                     match update {
@@ -908,9 +973,14 @@ impl IslandHost {
                             }
                         }
                         UiUpdate::Notice(notice) => {
-                            self.dispatch(IslandEvent::SetDone(Some(notice)));
+                            // No offer to download what is downloading.
+                            let offer = notice.action == Some(islet_core::island::NoticeAction::DownloadAiCleanup);
+                            if !(offer && self.ai_downloading) {
+                                self.dispatch(IslandEvent::SetDone(Some(notice)));
+                            }
                         }
                         UiUpdate::Media(verb) => self.voice_media(verb),
+                        UiUpdate::AiDownload(update) => self.ai_download_update(update),
                     }
                 }
                 Some(LRESULT(0))
@@ -1115,7 +1185,10 @@ impl IslandHost {
 
     /// Hooks window events only while slim mode is enabled.
     fn update_window_events(&mut self) {
-        let wanted = self.preview.is_some() || (self.tuck_enabled && self.demo.is_none());
+        // Also while hiding for full-screen apps: Windows does not tell
+        // about every one (Firefox), so focus and size changes are watched.
+        let wanted = self.preview.is_some()
+            || ((self.tuck_enabled || self.hide_in_fullscreen) && self.demo.is_none());
         match (wanted, self.window_events.is_some()) {
             (true, false) => {
                 self.window_events = Some(occlusion::WindowEvents::install(
@@ -1141,7 +1214,7 @@ impl IslandHost {
         if self.demo.is_some() {
             return;
         }
-        let behind = self.window_events.is_some() && self.window_behind_island();
+        let behind = self.tuck_enabled && self.window_events.is_some() && self.window_behind_island();
         let tucked = behind && !self.home_space_is_empty();
         // Content under the island can change without any window event (a
         // new tab, a title), so look again now and then, but only while an
@@ -1218,14 +1291,16 @@ impl IslandHost {
         } else {
             self.appearance[1]
         };
-        arrange(
-            self.state.resting_size(),
+        let size = if self.state.cornered() { islet_core::island::CORNER_EYES } else { self.state.resting_size() };
+        islet_core::island::arrange_on(
+            size,
             None,
             0.0,
             islet_core::island::EDGE_GAP_DP + home.logical_height * margin / 100.0,
             WINDOW_LOGICAL_WIDTH,
             home.logical_height,
-            home.anchor_top,
+            if home.anchor_top { 0.0 } else { 1.0 },
+            self.window_side,
         )
         .main
     }
@@ -1687,6 +1762,114 @@ impl IslandHost {
         self.set_widget_hover(hover);
     }
 
+    /// A click on the button of the opened notice.
+    fn handle_notice_click(&mut self, lparam: LPARAM) -> bool {
+        use islet_core::island::{notice_action_at, NoticeAction, NOTIFICATION};
+        let Some(islet_core::ContentCard::Notification(card)) = self.state.primary_card() else {
+            return false;
+        };
+        if card.action.is_none() || self.state.layout().main != NOTIFICATION {
+            return false;
+        }
+        let Some((x, y)) = self.widget_point(point_from_lparam(lparam)) else {
+            return false;
+        };
+        match notice_action_at(&card, x, y, NOTIFICATION.width, NOTIFICATION.height) {
+            Some(NoticeAction::DownloadAiCleanup) => {
+                self.start_ai_download();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Downloads the AI dictation model on a worker thread; its progress
+    /// shows in the pill. Dictation uses it from the next one on.
+    fn start_ai_download(&mut self) {
+        if self.ai_downloading {
+            return;
+        }
+        self.ai_downloading = true;
+        let manager = islet_asr::ModelManager::new(crate::paths::Paths::discover().model_dir);
+        let total = manager.addon_download_size(&islet_asr::AI_CLEANUP);
+        self.ai_download_update(AiDownload::Progress { done: 0, total });
+        let tx = self.dictation_tx.clone();
+        let hwnd = self.hwnd.0 as isize;
+        let post = move |update: AiDownload| {
+            let _ = tx.send(UiUpdate::AiDownload(update));
+            // SAFETY: a non-blocking post to the island window.
+            unsafe {
+                let _ = PostMessageW(Some(HWND(hwnd as *mut _)), WM_APP_DICTATION, WPARAM(0), LPARAM(0));
+            }
+        };
+        let spawned = std::thread::Builder::new()
+            .name("ai-download".to_owned())
+            .spawn(move || {
+                let cancel = std::sync::atomic::AtomicBool::new(false);
+                let mut last = Instant::now();
+                let result = manager
+                    .download_addon(
+                        &islet_asr::AI_CLEANUP,
+                        &mut |progress| {
+                            if last.elapsed().as_millis() >= 250 {
+                                last = Instant::now();
+                                post(AiDownload::Progress { done: progress.done, total: progress.total });
+                            }
+                        },
+                        &cancel,
+                    )
+                    .map_err(|error| error.to_string());
+                if let Err(error) = &result {
+                    tracing::warn!(%error, "AI dictation download failed");
+                }
+                post(AiDownload::Finished(result));
+            });
+        if spawned.is_err() {
+            self.ai_download_update(AiDownload::Finished(Err("Could not start the download.".to_owned())));
+        }
+    }
+
+    fn ai_download_update(&mut self, update: AiDownload) {
+        use islet_core::island::{AlertLevel, NoticeAction};
+        const MB: u64 = 1024 * 1024;
+        let card = match update {
+            AiDownload::Progress { done, total } => NotificationCard {
+                source: String::new(),
+                title: "Getting AI dictation".to_owned(),
+                body: format!("{} of {} MB \u{b7} {}%", done / MB, total / MB, (done * 100).checked_div(total).unwrap_or(0)),
+                level: AlertLevel::Info,
+                icon: None,
+                action: None,
+                progress: Some(if total == 0 { 0.0 } else { done as f32 / total as f32 }),
+            },
+            AiDownload::Finished(Ok(())) => {
+                self.ai_downloading = false;
+                NotificationCard {
+                    source: String::new(),
+                    title: "AI dictation is ready".to_owned(),
+                    body: "Your next dictation is cleaned up on this PC.".to_owned(),
+                    level: AlertLevel::Success,
+                    icon: None,
+                    action: None,
+                    progress: None,
+                }
+            }
+            AiDownload::Finished(Err(error)) => {
+                self.ai_downloading = false;
+                NotificationCard {
+                    source: String::new(),
+                    title: "Download failed".to_owned(),
+                    body: error,
+                    level: AlertLevel::Error,
+                    icon: None,
+                    action: Some(NoticeAction::DownloadAiCleanup),
+                    progress: None,
+                }
+            }
+        };
+        self.dispatch(IslandEvent::SetDone(Some(card)));
+    }
+
     fn handle_widget_click(&mut self, lparam: LPARAM) -> bool {
         let point = point_from_lparam(lparam);
         match self.widget_hover_at(point) {
@@ -2014,8 +2197,8 @@ impl IslandHost {
         }
         // The shell also reports the desktop and some maximized windows as
         // full-screen, so confirm before hiding.
-        let hide = opened && self.should_hide_for_fullscreen();
-        self.set_fullscreen_hidden(hide);
+        let _ = opened;
+        self.update_fullscreen();
     }
 
     fn send_snapshot(&mut self) {
@@ -2024,6 +2207,26 @@ impl IslandHost {
             self.gesture = None;
             unsafe { let _ = KillTimer(Some(self.hwnd), TIMER_GESTURE); let _ = ReleaseCapture(); }
             let _ = self.tx.send(RenderCommand::Pull(0.0, 0.0, false));
+        }
+        if self.preview.is_none() && self.preview_pending.is_none() {
+            if self.relocating {
+                // Sent once the window has moved.
+                return;
+            }
+            let side = self.state.side();
+            if side != self.window_side {
+                if self.fullscreen_hidden || self.last_target.is_none_or(|target| !target.visible) {
+                    // Nothing on screen to see go: move straight away.
+                    self.window_side = side;
+                    self.last_layout = None;
+                    let _ = self.reposition_layout();
+                } else {
+                    // Sink into the edge, then move (see `finish_relocation`).
+                    self.relocating = true;
+                    self.begin_departure();
+                    return;
+                }
+            }
         }
 
         self.update_calculator_activation();
@@ -2062,7 +2265,10 @@ impl IslandHost {
         });
         let display_state = preview_state.as_ref().unwrap_or(&self.state);
         let anchor_top = self.effective_anchor_top();
-        let target = self.customized_layout(display_state.layout(), anchor_top);
+        let mut target = self.customized_layout(display_state.layout(), anchor_top);
+        // The window is where the island is laid out (it only moves once
+        // the pill has sunk into the edge); the settings preview is centred.
+        target.side = if self.preview.is_some() { 0.0 } else { self.window_side };
         let content = display_state.content();
         if self
             .last_sent_anchor_top
@@ -2114,14 +2320,15 @@ impl IslandHost {
         target: LayoutTarget,
         anchor_top: bool,
     ) -> islet_core::island::PillFrame {
-        arrange(
+        islet_core::island::arrange_on(
             target.main,
             target.bubble,
             target.gap,
             target.inset,
             self.pixel_width as f32 * 96.0 / self.dpi as f32,
             self.logical_height,
-            anchor_top,
+            if anchor_top { 0.0 } else { 1.0 },
+            target.side,
         )
     }
 
@@ -2279,12 +2486,40 @@ impl IslandHost {
                     let _ = KillTimer(Some(self.hwnd), TIMER_OCCLUSION);
                 }
                 self.occlusion_pending = false;
+                self.update_fullscreen();
                 self.update_tucked();
             }
             TIMER_EMPTY_CHECK => self.update_tucked(),
             TIMER_STATS => self.sample_stats(),
             TIMER_CLOCK => self.update_clock(),
             TIMER_RESUME => self.finish_resume(),
+            TIMER_NIGHT_GREETING => {
+                unsafe {
+                    let _ = KillTimer(Some(self.hwnd), TIMER_NIGHT_GREETING);
+                }
+                let morning = self.state.night_greeting == Some(islet_core::island::NightGreeting::Morning);
+                self.dispatch(IslandEvent::SetNightGreeting(None));
+                let config = read_config(&self.shared);
+                let night = &config.night_light;
+                let (start, end) = (
+                    islet_core::night_light::parse_time(&night.start).unwrap_or(20 * 60),
+                    islet_core::night_light::parse_time(&night.end).unwrap_or(5 * 60),
+                );
+                let (title, body) = if morning {
+                    ("Night light off", format!("Back on at {}", islet_core::night_light::display_time(start)))
+                } else {
+                    ("Night light on", format!("Warmer screen until {}", islet_core::night_light::display_time(end)))
+                };
+                self.dispatch(IslandEvent::SetDone(Some(NotificationCard {
+                    source: String::new(),
+                    title: title.to_owned(),
+                    body,
+                    level: islet_core::island::AlertLevel::Info,
+                    icon: None,
+                    action: None,
+                    progress: None,
+                })));
+            }
             TIMER_INTRO => {
                 unsafe {
                     let _ = KillTimer(Some(self.hwnd), TIMER_INTRO);
@@ -2416,6 +2651,23 @@ impl IslandHost {
         }
     }
 
+    /// The pill has sunk into the edge: move the window to where the island
+    /// is now laid out and let the new shape well out of the edge there.
+    fn finish_relocation(&mut self) {
+        self.relocating = false;
+        self.window_side = self.state.side();
+        self.last_layout = None;
+        self.last_target = None;
+        self.last_sent_anchor_top = None;
+        self.last_target_anchor_top = None;
+        self.morph_box = None;
+        let _ = self.reposition_layout();
+        self.send_snapshot();
+        let _ = self.tx.send(RenderCommand::Arrive);
+        self.set_click_through(false);
+        self.update_poll_timer();
+    }
+
     fn detach_preview(&mut self) {
         if self.preview_pending == Some(None) {
             return;
@@ -2535,7 +2787,7 @@ impl IslandHost {
             return Ok(());
         }
         let config = read_config(&self.shared);
-        let layout = compute_window_layout(&config)?;
+        let layout = compute_window_layout(&config, self.window_side)?;
         self.home_layout = Some(layout);
         // A new home edge alone moves nothing: the window is the same, and the
         // renderer glides the pill across to the other edge.
@@ -2605,34 +2857,75 @@ impl IslandHost {
         self.update_loopback();
     }
 
-    fn should_hide_for_fullscreen(&self) -> bool {
-        if self.preview.is_some() {
-            return self.fullscreen_hidden;
-        }
+    /// Why the island should hide for what is in front (`None`: it should
+    /// not), for the log.
+    fn should_hide_for_fullscreen(&self) -> Option<&'static str> {
         let foreground = unsafe { GetForegroundWindow() };
-        if foreground.is_invalid() || foreground == self.hwnd {
-            return false;
+        if foreground.is_invalid() || foreground == self.hwnd || !is_app_window(foreground) {
+            return None;
         }
         let mut rect = windows::Win32::Foundation::RECT::default();
         if unsafe { GetWindowRect(foreground, &mut rect) }.is_err() {
-            return false;
+            return None;
         }
         let monitor = unsafe { MonitorFromWindow(foreground, MONITOR_DEFAULTTONEAREST) };
-        let Some(info) = monitor_info(monitor) else {
-            return false;
-        };
-        let monitor_rect = info.rcMonitor;
-        let covers = rect.left <= monitor_rect.left + 2
-            && rect.top <= monitor_rect.top + 2
-            && rect.right >= monitor_rect.right - 2
-            && rect.bottom >= monitor_rect.bottom - 2;
-        if !covers {
-            return false;
+        // A full-screen video on another screen leaves this one alone.
+        if monitor != unsafe { MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONEAREST) } {
+            return None;
         }
-        matches!(
-            unsafe { SHQueryUserNotificationState() }.ok(),
-            Some(QUNS_RUNNING_D3D_FULL_SCREEN | QUNS_BUSY)
-        )
+        let info = monitor_info(monitor)?;
+        let monitor_rect = info.rcMonitor;
+        let edges = [
+            rect.left - monitor_rect.left,
+            rect.top - monitor_rect.top,
+            monitor_rect.right - rect.right,
+            monitor_rect.bottom - rect.bottom,
+        ];
+        let covers = edges.iter().all(|edge| *edge <= 2);
+        if !covers {
+            return None;
+        }
+        // Exactly the monitor, with no frame: a browser's full-screen video,
+        // a video player or a borderless game. Firefox, among others, does
+        // not always make Windows report this as full-screen. A maximized
+        // window overshoots the screen by its frame, or keeps its frame.
+        let exact = edges.iter().all(|edge| edge.abs() <= 2);
+        let style = unsafe { GetWindowLongW(foreground, GWL_STYLE) } as u32;
+        let framed = style & (WS_CAPTION.0 | WS_THICKFRAME.0) != 0;
+        let maximized = unsafe { IsZoomed(foreground) }.as_bool();
+        if exact && (!framed || !maximized) {
+            return Some("covers the screen without a frame");
+        }
+        // Exclusive full-screen games, presentations and full-screen Store
+        // apps (Media Player, Netflix) are reported by Windows itself.
+        match unsafe { SHQueryUserNotificationState() }.ok() {
+            Some(QUNS_RUNNING_D3D_FULL_SCREEN) => Some("Windows reports a full-screen game"),
+            Some(QUNS_BUSY) => Some("Windows reports a full-screen app or presentation"),
+            Some(QUNS_APP) => Some("Windows reports a full-screen Store app"),
+            _ => None,
+        }
+    }
+
+    /// Hides or shows the island for a full-screen app in front, when that
+    /// setting is on. Called as windows come, go, move and take focus.
+    fn update_fullscreen(&mut self) {
+        if self.preview.is_some() {
+            return;
+        }
+        if self.preview.is_some() || self.demo.is_some() {
+            return;
+        }
+        let reason = self.hide_in_fullscreen.then(|| self.should_hide_for_fullscreen()).flatten();
+        if reason.is_some() != self.fullscreen_hidden {
+            // Which program and why, never its window title.
+            let foreground = unsafe { GetForegroundWindow() };
+            let (class, exe) = window_owner(foreground);
+            match reason {
+                Some(reason) => tracing::info!(%exe, %class, reason, "island hidden for a full-screen window"),
+                None => tracing::info!(%exe, %class, "island shown again"),
+            }
+        }
+        self.set_fullscreen_hidden(reason.is_some());
     }
 
     fn demo_advance(&mut self) {
@@ -2873,14 +3166,20 @@ fn render_thread(
                 *last = Instant::now();
                 *count = 0;
             }
-            // Parked. The only timed wakeup is the one that releases
-            // graphics after the island has been hidden for a while.
-            let received = match renderer.graphics_release_in(clock_now()) {
+            // Parked. The timed wakeups are the one that releases graphics
+            // after the island has been hidden for a while, and the resting
+            // eyes' next blink.
+            let parked_at = clock_now();
+            let release = renderer.graphics_release_in(parked_at);
+            let wake = release.or_else(|| renderer.wake_in(parked_at));
+            let received = match wake {
                 Some(delay) => match rx.recv_timeout(std::time::Duration::from_secs_f64(delay)) {
                     Ok(command) => Some(command),
                     Err(RecvTimeoutError::Timeout) => {
-                        renderer.release_graphics();
-                        tracing::debug!("released island graphics after idle");
+                        if release.is_some() {
+                            renderer.release_graphics();
+                            tracing::debug!("released island graphics after idle");
+                        }
                         None
                     }
                     Err(RecvTimeoutError::Disconnected) => break,
@@ -3058,7 +3357,9 @@ fn point_from_lparam(lparam: LPARAM) -> POINT {
     POINT { x, y }
 }
 
-fn compute_window_layout(config: &Config) -> WinResult<WindowLayout> {
+/// `side`: -1 puts the window against the work area's left end, 1 its
+/// right end, 0 centres it (see `IslandState::side`).
+fn compute_window_layout(config: &Config, side: f32) -> WinResult<WindowLayout> {
     let monitor = if config.general.monitor == MonitorChoice::FollowCursor {
         let mut point = POINT::default();
         unsafe { GetCursorPos(&mut point) }?;
@@ -3082,7 +3383,13 @@ fn compute_window_layout(config: &Config) -> WinResult<WindowLayout> {
     // outside the pill's own shape, so the tall window blocks nothing.
     let height = (work.bottom - work.top).max(1);
     let (height, y, logical_height) = (height, work.top, height as f32 * 96.0 / dpi as f32);
-    let x = work.left + ((work.right - work.left) - width) / 2;
+    let x = if side < 0.0 {
+        work.left
+    } else if side > 0.0 {
+        work.right - width
+    } else {
+        work.left + ((work.right - work.left) - width) / 2
+    };
 
     Ok(WindowLayout {
         x,
@@ -3234,6 +3541,8 @@ fn demo_needs_input() -> NotificationCard {
         body: "Allow cargo clippy to run?".to_owned(),
         level: AlertLevel::NeedsInput,
         icon: None,
+        action: None,
+        progress: None,
     }
 }
 
@@ -3244,6 +3553,8 @@ fn demo_done() -> NotificationCard {
         body: "Refactored auth.rs and updated tests".to_owned(),
         level: AlertLevel::Success,
         icon: None,
+        action: None,
+        progress: None,
     }
 }
 
@@ -3440,6 +3751,77 @@ fn activate_window(hwnd: HWND) -> bool {
         }
     }
     true
+}
+
+/// A window of some other app, not the desktop, the taskbar or Onyx's own
+/// settings (whose full-screen customize view shows the island on purpose).
+/// Window classes of Windows' own screens and overlays: the desktop, the
+/// taskbar, Alt+Tab and Task View. They can cover the whole screen without
+/// a frame, but are not a full-screen app.
+const SHELL_CLASSES: &[&str] = &[
+    "Progman",
+    "WorkerW",
+    "Shell_TrayWnd",
+    "Shell_SecondaryTrayWnd",
+    "XamlExplorerHostIslandWindow",
+    "MultitaskingViewFrame",
+    "TaskSwitcherWnd",
+    "ForegroundStaging",
+    "Windows.UI.Core.CoreWindow",
+];
+
+/// Programs that draw Windows' own overlays: Start, search, notifications
+/// and quick settings, the touch keyboard and emoji panel, the lock screen
+/// and the screenshot overlay. And Onyx's own settings.
+const SHELL_PROGRAMS: &[&str] = &[
+    "startmenuexperiencehost.exe",
+    "searchhost.exe",
+    "searchapp.exe",
+    "shellexperiencehost.exe",
+    "shellhost.exe",
+    "textinputhost.exe",
+    "lockapp.exe",
+    "screenclippinghost.exe",
+    "islet-settings.exe",
+];
+
+/// The class and program file name ("firefox.exe") of a window.
+fn window_owner(hwnd: HWND) -> (String, String) {
+    let mut class = [0u16; 128];
+    let length = unsafe { GetClassNameW(hwnd, &mut class) } as usize;
+    let class = String::from_utf16_lossy(&class[..length]);
+    let mut pid = 0;
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+    let Ok(process) = (unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }) else {
+        return (class, String::new());
+    };
+    let mut path = [0u16; 1024];
+    let mut size = path.len() as u32;
+    let named = unsafe {
+        QueryFullProcessImageNameW(process, PROCESS_NAME_FORMAT(0), windows::core::PWSTR(path.as_mut_ptr()), &mut size)
+    }
+    .is_ok();
+    unsafe {
+        let _ = CloseHandle(process);
+    }
+    let exe = if named {
+        let path = String::from_utf16_lossy(&path[..size as usize]);
+        path.rsplit(['\\', '/']).next().unwrap_or_default().to_ascii_lowercase()
+    } else {
+        String::new()
+    };
+    (class, exe)
+}
+
+/// A window of some app, not Windows' own screens or Onyx.
+fn is_app_window(hwnd: HWND) -> bool {
+    let mut pid = 0;
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+    if pid == 0 || pid == std::process::id() {
+        return false;
+    }
+    let (class, exe) = window_owner(hwnd);
+    !SHELL_CLASSES.contains(&class.as_str()) && !SHELL_PROGRAMS.contains(&exe.as_str())
 }
 
 unsafe fn is_candidate_window(hwnd: HWND, needles: &[String]) -> bool {

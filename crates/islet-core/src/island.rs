@@ -5,15 +5,21 @@
 //! Timers are described as [`Effect`]s rather than run here, which keeps the
 //! reducer deterministic and easy to test.
 
-use crate::config::{ExpandTrigger, IdleGlance, IdleStyle};
+use crate::config::{ExpandTrigger, IdleGlance, IdleStyle, IslandCorner};
 use crate::geometry::Rect;
 use crate::media::{ArtImage, Timeline};
 
-pub const HOVER_EXPAND_MS: u32 = 250;
+/// How long the pointer rests on the pill before it opens: long enough
+/// that passing over it on the way somewhere else does not open it.
+pub const HOVER_EXPAND_MS: u32 = 750;
 pub const HOVER_COLLAPSE_MS: u32 = 400;
 pub const DONE_VISIBLE_MS: u32 = 4_000;
 /// Plain information ("Stopped") is brief; it is not news worth four seconds.
 pub const INFO_VISIBLE_MS: u32 = 2_500;
+
+/// A notice offering something to do (a download) stays long enough to
+/// reach for it.
+pub const ACTION_VISIBLE_MS: u32 = 8_000;
 
 /// How long a transient notice stays on the island.
 #[must_use]
@@ -21,6 +27,17 @@ pub const fn visible_ms(level: AlertLevel) -> u32 {
     match level {
         AlertLevel::Info => INFO_VISIBLE_MS,
         _ => DONE_VISIBLE_MS,
+    }
+}
+
+/// How long this notice stays: longer when it offers a button or shows
+/// progress.
+#[must_use]
+pub fn notice_visible_ms(card: &NotificationCard) -> u32 {
+    if card.lingers() {
+        ACTION_VISIBLE_MS
+    } else {
+        visible_ms(card.level)
     }
 }
 /// A notice this close to its time is gone (timers fire a few ms early).
@@ -49,6 +66,11 @@ pub const CALCULATOR: PillSize = PillSize::new(
 /// The always-on glance pills: the time, or CPU and memory.
 pub const GLANCE_CLOCK: PillSize = PillSize::new(108.0, 32.0, 16.0);
 pub const GLANCE_STATS: PillSize = PillSize::new(164.0, 32.0, 16.0);
+pub const GLANCE_EYES: PillSize = PillSize::new(84.0, 32.0, 16.0);
+/// The eyes waiting at a screen side: the eyes pill, its outer rounded end
+/// tucked past the screen edge (see [`arrange_on`]), so it shows square
+/// against the edge and round only on the inner side, `GLANCE_EYES` wide.
+pub const CORNER_EYES: PillSize = PillSize::new(84.0 + 16.0, 32.0, 16.0);
 pub const STATS: PillSize = PillSize::new(
     crate::widgets::STATS_WIDTH,
     crate::widgets::STATS_HEIGHT,
@@ -104,6 +126,10 @@ pub struct LayoutTarget {
     /// Distance from the screen edge. Springs to 0 when tucked.
     pub inset: f32,
     pub visible: bool,
+    /// Where along the edge: -1 the left end of the window, 0 the middle,
+    /// 1 the right end (see [`arrange_on`]). The window itself moves to the
+    /// screen's corner for the ends.
+    pub side: f32,
 }
 
 impl LayoutTarget {
@@ -114,6 +140,7 @@ impl LayoutTarget {
         gap: 0.0,
         inset: EDGE_GAP_DP,
         visible: false,
+        side: 0.0,
     };
 
     #[must_use]
@@ -125,6 +152,7 @@ impl LayoutTarget {
             gap: 0.0,
             inset: EDGE_GAP_DP,
             visible: true,
+            side: 0.0,
         }
     }
 
@@ -137,6 +165,7 @@ impl LayoutTarget {
             gap: SPLIT_GAP_DP,
             inset: EDGE_GAP_DP,
             visible: true,
+            side: 0.0,
         }
     }
 
@@ -234,6 +263,25 @@ pub fn arrange_at(
     window_height: f32,
     anchor: f32,
 ) -> PillFrame {
+    arrange_on(main, bubble, gap, inset, window_width, window_height, anchor, 0.0)
+}
+
+/// Like [`arrange_at`], with the group placed along the edge by `side`:
+/// `-1` at the window's left end, `0` centred, `1` at its right end. At an
+/// end the main pill's rounded end reaches past the window edge, so it looks
+/// attached to the screen side, round only on the inner side.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn arrange_on(
+    main: PillSize,
+    bubble: Option<PillSize>,
+    gap: f32,
+    inset: f32,
+    window_width: f32,
+    window_height: f32,
+    anchor: f32,
+    side: f32,
+) -> PillFrame {
     let main_w = main.width.max(0.0);
     let main_h = main.height.max(0.0);
     let bubble = bubble.filter(|bubble| bubble.width > 0.5);
@@ -246,7 +294,14 @@ pub fn arrange_at(
         } else {
             0.0
         };
-    let main_x = (window_width - group_w) * 0.5;
+    let side = side.clamp(-1.0, 1.0);
+    let centred = (window_width - group_w) * 0.5;
+    let overhang = main.corner.max(0.0);
+    let main_x = if side < 0.0 {
+        centred + (-overhang - centred) * -side
+    } else {
+        centred + (window_width - group_w + overhang - centred) * side
+    };
     let inset = inset.max(0.0);
     let top_y = inset;
     let bottom_y = window_height - main_h - inset;
@@ -329,6 +384,54 @@ pub struct NotificationCard {
     /// The app it is about (the assistant's "Opening Spotify"), drawn in
     /// place of the source's initial.
     pub icon: Option<crate::media::ArtImage>,
+    /// A button the opened notice offers.
+    pub action: Option<NoticeAction>,
+    /// How far along what it reports is (a download), 0..=1.
+    pub progress: Option<f32>,
+}
+
+/// What a notice's button does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoticeAction {
+    /// Download the on-device AI cleanup model ("AI dictation").
+    DownloadAiCleanup,
+}
+
+impl NotificationCard {
+    /// The button's text: a failed download offers to try again.
+    #[must_use]
+    pub fn action_label(&self) -> Option<&'static str> {
+        self.action.map(|action| match (action, self.level) {
+            (NoticeAction::DownloadAiCleanup, AlertLevel::Error) => "Retry",
+            (NoticeAction::DownloadAiCleanup, _) => "Download",
+        })
+    }
+
+    /// A notice with a button or a progress bar is waited on: it stays
+    /// longer, and while the pointer is on it.
+    #[must_use]
+    pub fn lingers(&self) -> bool {
+        self.action.is_some() || self.progress.is_some()
+    }
+}
+
+/// The button of an opened notice (`width` by `height`, in content units).
+#[must_use]
+pub fn notice_button(width: f32, height: f32) -> Rect {
+    let (button_w, button_h) = (96.0, 30.0);
+    Rect::new(width - 20.0 - button_w, (height - button_h) * 0.5, button_w, button_h)
+}
+
+/// The action under a click at (`x`, `y`) on an opened notice.
+#[must_use]
+pub fn notice_action_at(card: &NotificationCard, x: f32, y: f32, width: f32, height: f32) -> Option<NoticeAction> {
+    let button = notice_button(width, height);
+    let slop = 4.0;
+    let inside = x >= button.x - slop
+        && x <= button.right() + slop
+        && y >= button.y - slop
+        && y <= button.bottom() + slop;
+    card.action.filter(|_| inside)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -377,6 +480,20 @@ pub struct GlanceCard {
     /// 0..1.
     pub cpu: f32,
     pub memory: f32,
+    /// The night light is coming on (sleepy, yellow eyes) or going off
+    /// (waking up, back to white).
+    pub night: Option<NightGreeting>,
+    /// The night light is on: the eyes are yellow.
+    pub night_light: bool,
+}
+
+/// The eyes' moment as the night light turns on or off.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NightGreeting {
+    /// Coming on: they grow heavy, yawn and stay drowsy, in yellow.
+    Evening,
+    /// Going off: they flutter awake, the yellow fades and they smile.
+    Morning,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -565,6 +682,10 @@ pub struct IslandState {
     /// hovering it never expands the island.
     pub pointer_on_switcher: bool,
     pub done_deadline: Option<f64>,
+    /// The night light just came on or went off: the eyes show for a moment.
+    pub night_greeting: Option<NightGreeting>,
+    /// Where the eyes alone wait (see [`IslandState::cornered`]).
+    pub corner: IslandCorner,
 }
 
 impl Default for IslandState {
@@ -597,11 +718,44 @@ impl Default for IslandState {
             pointer_inside: false,
             pointer_on_switcher: false,
             done_deadline: None,
+            night_greeting: None,
+            corner: IslandCorner::Middle,
         }
     }
 }
 
 impl IslandState {
+    /// Only the eyes are showing, and they were swiped into a corner: the
+    /// island waits there as a small circle. Anything else (music, a notice,
+    /// dictation, the opened island) shows in the middle as usual, and the
+    /// eyes go back to the corner afterwards.
+    #[must_use]
+    pub fn cornered(&self) -> bool {
+        self.corner != IslandCorner::Middle && self.shows_only_eyes()
+    }
+
+    /// The collapsed island shows the eyes and nothing else.
+    #[must_use]
+    pub fn shows_only_eyes(&self) -> bool {
+        !self.expanded
+            && !self.splits()
+            && !(self.intro && self.needs_input.is_none())
+            && matches!(self.primary_card(), Some(ContentCard::Glance(glance)) if glance.kind == IdleGlance::Eyes)
+    }
+
+    /// -1, 0 or 1: where along the edge the island is laid out now.
+    #[must_use]
+    pub fn side(&self) -> f32 {
+        if !self.cornered() {
+            return 0.0;
+        }
+        match self.corner {
+            IslandCorner::Left => -1.0,
+            IslandCorner::Right => 1.0,
+            IslandCorner::Middle => 0.0,
+        }
+    }
+
     /// Urgent notices and dictation keep priority over optional widgets.
     pub fn widget_navigation_available(&self) -> bool {
         self.expanded
@@ -685,8 +839,10 @@ impl IslandState {
 
     /// Resting the pointer here should open the island: hover mode, and not
     /// on the second player's bubble (a button).
+    /// Not in a corner either: the eyes there are out of the way, and
+    /// opening would carry the island back to the middle under the pointer.
     fn hover_expands(&self) -> bool {
-        self.expand_on == ExpandTrigger::Hover && !self.pointer_on_switcher
+        self.expand_on == ExpandTrigger::Hover && !self.pointer_on_switcher && !self.cornered()
     }
 
     #[must_use]
@@ -708,6 +864,13 @@ impl IslandState {
         }
         if self.intro && !self.expanded {
             return Some(ContentCard::Intro);
+        }
+        if let Some(greeting) = self.night_greeting.filter(|_| !self.expanded) {
+            return Some(ContentCard::Glance(GlanceCard {
+                kind: IdleGlance::Eyes,
+                night: Some(greeting),
+                ..self.glance_info.clone()
+            }));
         }
         if self.expanded {
             if let Some(converter) = &self.converter {
@@ -799,6 +962,7 @@ impl IslandState {
         }
         match self.primary_card() {
             Some(ContentCard::Glance(glance)) if glance.kind == IdleGlance::Stats => GLANCE_STATS,
+            Some(ContentCard::Glance(glance)) if glance.kind == IdleGlance::Eyes => GLANCE_EYES,
             Some(ContentCard::Glance(_)) => GLANCE_CLOCK,
             _ => COMPACT,
         }
@@ -820,6 +984,9 @@ impl IslandState {
         // Shown whatever the idle style, even tucked: it is a greeting.
         if self.intro && !self.expanded && self.needs_input.is_none() {
             return LayoutTarget::single(INTRO);
+        }
+        if self.cornered() {
+            return LayoutTarget { side: self.side(), ..LayoutTarget::single(CORNER_EYES) };
         }
 
         // Out of the way of the window behind; hovering expands as usual.
@@ -992,6 +1159,10 @@ pub enum IslandEvent {
     SetNeedsInput(Option<NotificationCard>),
     SetDone(Option<NotificationCard>),
     SetRunning(Option<AgentCard>),
+    /// Show (or stop showing) the eyes as the night light turns on or off.
+    SetNightGreeting(Option<NightGreeting>),
+    /// Whether the night light is warming the screen (the eyes turn yellow).
+    SetNightLight(bool),
     ClearAll,
 }
 
@@ -1199,6 +1370,12 @@ pub fn reduce(state: &mut IslandState, event: IslandEvent, now: f64) -> Vec<Effe
             }
         }
         IslandEvent::Tick { now } => match state.done_deadline {
+            // The pointer is on a notice with a button: it waits.
+            Some(_) if state.pointer_inside && state.done.as_ref().is_some_and(NotificationCard::lingers) => {
+                let visible = state.done.as_ref().map_or(ACTION_VISIBLE_MS, notice_visible_ms);
+                state.done_deadline = Some(now + f64::from(visible) / 1000.0);
+                vec![Effect::ArmTimer { kind: TimerKind::DoneExpiry, after_ms: visible }]
+            }
             Some(deadline) if now + DONE_EXPIRY_SLACK >= deadline => {
                 state.done = None;
                 state.done_deadline = None;
@@ -1369,10 +1546,7 @@ pub fn reduce(state: &mut IslandState, event: IslandEvent, now: f64) -> Vec<Effe
             }
             state.done = card;
             if state.done.is_some() {
-                let visible = state
-                    .done
-                    .as_ref()
-                    .map_or(DONE_VISIBLE_MS, |card| visible_ms(card.level));
+                let visible = state.done.as_ref().map_or(DONE_VISIBLE_MS, notice_visible_ms);
                 state.done_deadline = Some(now + f64::from(visible) / 1000.0);
                 let mut effects = Effect::changed();
                 effects.push(Effect::ArmTimer {
@@ -1394,6 +1568,21 @@ pub fn reduce(state: &mut IslandState, event: IslandEvent, now: f64) -> Vec<Effe
             } else {
                 Vec::new()
             }
+        }
+        IslandEvent::SetNightLight(on) => {
+            if state.glance_info.night_light == on {
+                return Vec::new();
+            }
+            // Every glance is made from `glance_info`, so the eyes follow.
+            state.glance_info.night_light = on;
+            glance_repaint(state)
+        }
+        IslandEvent::SetNightGreeting(greeting) => {
+            if state.night_greeting == greeting {
+                return Vec::new();
+            }
+            state.night_greeting = greeting;
+            Effect::changed()
         }
         IslandEvent::ClearAll => {
             let had_activity = state.has_activity();
@@ -1747,6 +1936,108 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_notice_with_a_button_waits_while_hovered_and_answers_clicks_on_it() {
+        let mut state = IslandState::default();
+        let offer = NotificationCard {
+            action: Some(NoticeAction::DownloadAiCleanup),
+            level: AlertLevel::Info,
+            ..notification(AlertLevel::Info)
+        };
+        assert_eq!(offer.action_label(), Some("Download"));
+        let effects = reduce(&mut state, IslandEvent::SetDone(Some(offer.clone())), 0.0);
+        assert!(effects.contains(&Effect::ArmTimer { kind: TimerKind::DoneExpiry, after_ms: ACTION_VISIBLE_MS }));
+        reduce(&mut state, IslandEvent::HoverEnter, 1.0);
+        // Long past its time, but the pointer is on it.
+        reduce(&mut state, IslandEvent::Tick { now: 20.0 }, 20.0);
+        assert!(state.done.is_some());
+        reduce(&mut state, IslandEvent::HoverLeave, 21.0);
+        reduce(&mut state, IslandEvent::Tick { now: 40.0 }, 40.0);
+        assert!(state.done.is_none());
+
+        let button = notice_button(NOTIFICATION.width, NOTIFICATION.height);
+        let (x, y) = (button.x + button.width * 0.5, button.y + button.height * 0.5);
+        let (w, h) = (NOTIFICATION.width, NOTIFICATION.height);
+        assert_eq!(notice_action_at(&offer, x, y, w, h), Some(NoticeAction::DownloadAiCleanup));
+        assert_eq!(notice_action_at(&offer, 30.0, y, w, h), None);
+        assert_eq!(notice_action_at(&notification(AlertLevel::Info), x, y, w, h), None);
+        let failed = NotificationCard { level: AlertLevel::Error, ..offer };
+        assert_eq!(failed.action_label(), Some("Retry"));
+        // A plain notice still goes on time when hovered.
+        reduce(&mut state, IslandEvent::SetDone(Some(notification(AlertLevel::Success))), 50.0);
+        reduce(&mut state, IslandEvent::HoverEnter, 50.5);
+        reduce(&mut state, IslandEvent::Tick { now: 60.0 }, 60.0);
+        assert!(state.done.is_none());
+    }
+
+    #[test]
+    fn the_night_light_greeting_shows_sleepy_eyes_then_gives_the_pill_back() {
+        let mut state = IslandState::default();
+        assert_eq!(state.layout(), LayoutTarget::HIDDEN);
+        reduce(&mut state, IslandEvent::SetNightGreeting(Some(NightGreeting::Evening)), 0.0);
+        assert!(matches!(
+            state.primary_card(),
+            Some(ContentCard::Glance(GlanceCard { kind: IdleGlance::Eyes, night: Some(NightGreeting::Evening), .. }))
+        ));
+        assert_eq!(state.layout(), LayoutTarget::single(GLANCE_EYES));
+        // Dictation still comes first.
+        reduce(&mut state, IslandEvent::SetDictation(Some(DictationCard::default())), 0.1);
+        assert_eq!(state.primary_kind(), Some(CardKind::Dictation));
+        reduce(&mut state, IslandEvent::SetDictation(None), 0.2);
+        reduce(&mut state, IslandEvent::SetNightGreeting(None), 4.0);
+        assert_eq!(state.layout(), LayoutTarget::HIDDEN);
+        // While the night light is on, the resting eyes know it.
+        reduce(&mut state, IslandEvent::SetGlance(Some(IdleGlance::Eyes)), 5.0);
+        let effects = reduce(&mut state, IslandEvent::SetNightLight(true), 5.0);
+        assert!(effects.contains(&Effect::ContentChanged));
+        assert!(matches!(state.primary_card(), Some(ContentCard::Glance(GlanceCard { night_light: true, .. }))));
+        reduce(&mut state, IslandEvent::SetNightLight(false), 6.0);
+        assert!(matches!(state.primary_card(), Some(ContentCard::Glance(GlanceCard { night_light: false, .. }))));
+    }
+
+    #[test]
+    fn swiped_eyes_wait_in_the_corner_and_everything_else_shows_in_the_middle() {
+        let mut state = IslandState { corner: IslandCorner::Left, ..IslandState::default() };
+        // Nothing to show: no corner either.
+        assert!(!state.cornered());
+        reduce(&mut state, IslandEvent::SetGlance(Some(IdleGlance::Eyes)), 0.0);
+        assert!(state.cornered());
+        assert_eq!(state.layout(), LayoutTarget { side: -1.0, ..LayoutTarget::single(CORNER_EYES) });
+        // Resting the pointer on the circle does not open it.
+        reduce(&mut state, IslandEvent::HoverEnter, 0.1);
+        assert!(reduce(&mut state, IslandEvent::HoverExpandElapsed, 1.0).is_empty());
+        reduce(&mut state, IslandEvent::HoverLeave, 1.1);
+        // Music shows in the middle, and the eyes go back when it is gone.
+        reduce(&mut state, IslandEvent::SetMedia(Some(media())), 2.0);
+        assert_eq!(state.side(), 0.0);
+        assert_eq!(state.layout().main, COMPACT);
+        reduce(&mut state, IslandEvent::SetMedia(None), 3.0);
+        assert_eq!(state.side(), -1.0);
+        // So does the opened island.
+        state.corner = IslandCorner::Right;
+        reduce(&mut state, IslandEvent::SetExpanded(true), 4.0);
+        assert_eq!(state.side(), 0.0);
+        reduce(&mut state, IslandEvent::SetExpanded(false), 5.0);
+        assert_eq!(state.side(), 1.0);
+        // Another glance stays in the middle.
+        reduce(&mut state, IslandEvent::SetGlance(Some(IdleGlance::Clock)), 6.0);
+        assert!(!state.cornered());
+    }
+
+    #[test]
+    fn a_cornered_pill_is_attached_to_the_screen_side_showing_the_eyes_pill() {
+        // The rounded outer end reaches past the edge; the eyes pill's width shows.
+        let left = arrange_on(CORNER_EYES, None, 0.0, EDGE_GAP_DP, 720.0, 1040.0, 0.0, -1.0);
+        assert_eq!((left.main.x, left.main.y), (-CORNER_EYES.corner, EDGE_GAP_DP));
+        assert_eq!(left.main.right(), GLANCE_EYES.width);
+        let right = arrange_on(CORNER_EYES, None, 0.0, EDGE_GAP_DP, 720.0, 1040.0, 1.0, 1.0);
+        assert_eq!(right.main.x, 720.0 - GLANCE_EYES.width);
+        assert_eq!(right.main.right(), 720.0 + CORNER_EYES.corner);
+        assert_eq!(right.main.bottom(), 1040.0 - EDGE_GAP_DP);
+        let middle = arrange_on(CORNER_EYES, None, 0.0, EDGE_GAP_DP, 720.0, 1040.0, 0.0, 0.0);
+        assert_eq!(middle.main.x, (720.0 - CORNER_EYES.width) / 2.0);
+    }
+
     fn notification(level: AlertLevel) -> NotificationCard {
         NotificationCard {
             source: "Claude Code".to_owned(),
@@ -1754,6 +2045,8 @@ mod tests {
             body: "Refactored auth.rs".to_owned(),
             level,
             icon: None,
+            action: None,
+            progress: None,
         }
     }
 
@@ -2601,6 +2894,8 @@ mod compact_gesture_tests {
         assert!(matches!(state.content().primary, Some(ContentCard::Glance(_))));
         state.compact_widget = Some(IdleGlance::Stats);
         assert_eq!(state.layout().main, GLANCE_STATS);
+        state.compact_widget = Some(IdleGlance::Eyes);
+        assert_eq!(state.layout().main, GLANCE_EYES);
     }
 }
 

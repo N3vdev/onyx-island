@@ -25,6 +25,30 @@ pub struct Config {
     pub keysounds: KeysoundConfig,
     pub agents: AgentConfig,
     pub widgets: WidgetConfig,
+    pub night_light: NightLightConfig,
+}
+
+/// Warms the screen at night (less blue light), like f.lux.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NightLightConfig {
+    pub enabled: bool,
+    /// 0 is no change, 1 the warmest (about candlelight).
+    pub intensity: f32,
+    /// When it comes on and goes off, as "20:00"; it may run past midnight.
+    pub start: String,
+    pub end: String,
+}
+
+impl Default for NightLightConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            intensity: 0.75,
+            start: "20:00".to_owned(),
+            end: "05:00".to_owned(),
+        }
+    }
 }
 
 impl Default for Config {
@@ -37,6 +61,7 @@ impl Default for Config {
             keysounds: KeysoundConfig::default(),
             agents: AgentConfig::default(),
             widgets: WidgetConfig::default(),
+            night_light: NightLightConfig::default(),
         }
     }
 }
@@ -70,6 +95,20 @@ pub struct GeneralConfig {
     pub bottom_margin_percent: f32,
     pub top_expanded_scale: f32,
     pub bottom_expanded_scale: f32,
+    /// With only the eyes showing, the island waits as a small circle in
+    /// this corner (swiped there); anything else shows in the middle.
+    pub corner: IslandCorner,
+}
+
+/// Where the eyes-only island waits along its edge.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IslandCorner {
+    /// In the middle, as the usual pill.
+    #[default]
+    Middle,
+    Left,
+    Right,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -139,6 +178,8 @@ pub enum IdleGlance {
     Clock,
     /// CPU and memory use.
     Stats,
+    /// Two eyes that blink and look the way the island is pulled.
+    Eyes,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -213,6 +254,13 @@ pub struct DictationConfig {
     /// it only runs once the model is downloaded, and until then dictation
     /// uses the rule-based cleanup.
     pub ai_cleanup: bool,
+    /// Keep a WAV file of each dictation's audio (never its text). Off by
+    /// default.
+    pub save_recordings: bool,
+    /// Where recordings are saved; empty means Onyx's own data folder.
+    pub recordings_folder: String,
+    /// Recordings older than this many days are deleted; 0 keeps them.
+    pub delete_recordings_after_days: u32,
 }
 
 /// One "say this, get that" entry for the dictionary or snippets.
@@ -283,6 +331,7 @@ impl Default for GeneralConfig {
             bottom_margin_percent: 0.0,
             top_expanded_scale: 1.0,
             bottom_expanded_scale: 1.0,
+            corner: IslandCorner::Middle,
         }
     }
 }
@@ -313,6 +362,9 @@ impl Default for DictationConfig {
             dictionary: Vec::new(),
             snippets: Vec::new(),
             ai_cleanup: true,
+            save_recordings: false,
+            recordings_folder: String::new(),
+            delete_recordings_after_days: 7,
         }
     }
 }

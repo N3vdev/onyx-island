@@ -202,6 +202,7 @@ impl Gfx {
     ) -> RenderResult<()> {
         let expanded = height > 60.0;
         match (glance.kind, expanded) {
+            (IdleGlance::Eyes, _) => self.draw_eyes(width, height, alpha)?,
             (IdleGlance::Stats, false) => {
                 let half = width * 0.5;
                 for (index, (label, value)) in

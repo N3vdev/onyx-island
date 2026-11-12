@@ -12,6 +12,7 @@ mod last_music;
 mod learn;
 mod island_window;
 mod logging;
+mod night_light;
 mod occlusion;
 mod paths;
 mod restart;

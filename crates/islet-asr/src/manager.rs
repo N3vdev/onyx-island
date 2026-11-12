@@ -421,10 +421,13 @@ fn download_file_from(
     }
 
     let mut last_error = None;
-    for attempt in 1..=ATTEMPTS {
+    let mut attempt = 0;
+    while attempt < ATTEMPTS {
+        attempt += 1;
         if cancel.load(Ordering::Relaxed) {
             return Err(ManagerError::Cancelled);
         }
+        let before = file_size(&part).unwrap_or(0);
         match fetch_into(file, &part, base_done, total, progress, cancel) {
             Ok(()) => {
                 // The hash covers any bytes kept from an earlier run too.
@@ -444,6 +447,11 @@ fn download_file_from(
                 tracing::warn!(file = file.name, attempt, "download interrupted: {message}");
                 last_error = Some(ManagerError::Http(message));
                 std::thread::sleep(Duration::from_millis(400 * u64::from(attempt)));
+                // A connection that dropped after real progress is not a
+                // failing server: only attempts that gained nothing count.
+                if file_size(&part).unwrap_or(0) > before {
+                    attempt = 0;
+                }
             }
             Err(error) => return Err(error),
         }
@@ -544,13 +552,17 @@ fn fetch_into(
         if read == 0 {
             break;
         }
-        output.write_all(&buffer[..read])?;
-        have += read as u64;
-        if have > file.size {
+        if have + read as u64 > file.size {
+            // The server's file is not the pinned one. Drop the partial
+            // download so the next try does not resume a mismatched file.
+            drop(output);
+            let _ = fs::remove_file(part);
             return Err(ManagerError::SizeMismatch {
                 file: file.name.to_owned(),
             });
         }
+        output.write_all(&buffer[..read])?;
+        have += read as u64;
         if last_report.elapsed() >= PROGRESS_INTERVAL {
             last_report = Instant::now();
             progress(Progress {

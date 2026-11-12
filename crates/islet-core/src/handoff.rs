@@ -8,6 +8,10 @@ pub const ONBOARDING_TITLE: &str = "Welcome to Onyx";
 pub const PREVIEW_ATTACH: u32 = 0x8000 + 40;
 pub const PREVIEW_DETACH: u32 = 0x8000 + 41;
 pub const PREVIEW_DEPARTED: u32 = 0x8000 + 42;
+/// Posted to the island to play the night light's eyes: `wparam` 1 for
+/// turning on, 0 for turning off. Settings sends it to preview them, and
+/// the night light itself when it turns on or off.
+pub const NIGHT_LIGHT_GREETING: u32 = 0x8000 + 43;
 pub const DEPART_SECONDS: f64 = 0.28;
 pub const ARRIVE_SECONDS: f64 = 0.50;
 

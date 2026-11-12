@@ -9,7 +9,10 @@
 mod autostart;
 mod customize;
 mod dictation_page;
+mod folder_picker;
+mod night_light_page;
 mod onboarding;
+mod practice;
 mod showcase;
 mod preview;
 mod ui;
@@ -59,6 +62,7 @@ fn main() -> eframe::Result {
         Some("media" | "now-playing") => Page::NowPlaying,
         Some("dictation" | "models") => Page::Dictation,
         Some("widgets") => Page::Widgets,
+        Some("night-light" | "night") => Page::NightLight,
         Some("about") => Page::About,
         _ => Page::General,
     };
@@ -103,6 +107,7 @@ pub enum Page {
     NowPlaying,
     Dictation,
     Widgets,
+    NightLight,
     About,
 }
 
@@ -118,6 +123,7 @@ pub struct SettingsApp {
     new_site: String,
     status: Option<String>,
     dictation_ui: dictation_page::DictationUi,
+    night_light_ui: night_light_page::NightLightUi,
     /// One-shot initial scroll position (`--scroll <px>`, for development).
     initial_scroll: Option<f32>,
 }
@@ -144,6 +150,7 @@ impl SettingsApp {
             new_site: String::new(),
             status: None,
             dictation_ui: dictation_page::DictationUi::new(),
+            night_light_ui: night_light_page::NightLightUi::default(),
             initial_scroll: std::env::args()
                 .skip_while(|arg| arg != "--scroll")
                 .nth(1)

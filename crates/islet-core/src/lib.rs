@@ -13,6 +13,8 @@ pub mod learn;
 pub mod island;
 pub mod media;
 pub mod music;
+pub mod night_light;
+pub mod recordings;
 pub mod spring;
 pub mod transcript;
 pub mod tween;

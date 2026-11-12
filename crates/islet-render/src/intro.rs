@@ -252,7 +252,7 @@ impl Gfx {
     }
 
     /// Strokes an open line through `points` with round ends.
-    unsafe fn stroke_polyline(&mut self, points: &[Vector2], width: f32, color: D2D1_COLOR_F) -> RenderResult<()> {
+    pub(super) unsafe fn stroke_polyline(&mut self, points: &[Vector2], width: f32, color: D2D1_COLOR_F) -> RenderResult<()> {
         if points.len() < 2 || color.a <= 0.003 {
             return Ok(());
         }

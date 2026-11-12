@@ -242,6 +242,7 @@ pub fn draw(app: &mut SettingsApp, ctx: &egui::Context) {
                     Page::NowPlaying => now_playing(app, ui),
                     Page::Dictation => crate::dictation_page::show(app, ui),
                     Page::Widgets => widgets(app, ui),
+                    Page::NightLight => crate::night_light_page::show(app, ui),
                     Page::About => about(app, ui),
                 }
                 if let Some(status) = &app.status {
@@ -272,6 +273,7 @@ fn sidebar(app: &mut SettingsApp, ui: &mut egui::Ui) {
         (Page::NowPlaying, "Now Playing"),
         (Page::Dictation, "Dictation"),
         (Page::Widgets, "Widgets"),
+        (Page::NightLight, "Night light"),
     ];
     for (page, label) in pages {
         let (rect, response) =
@@ -403,6 +405,20 @@ fn nav_item(
                     );
                 }
             }
+        }
+        Page::NightLight => {
+            // A crescent moon: a circle with a bite taken out of it.
+            let points: Vec<egui::Pos2> = (0..=24)
+                .map(|step| {
+                    let a = -2.3 + 4.6 * step as f32 / 24.0;
+                    center + egui::vec2(-7.0 * a.cos() + 1.0, 7.0 * a.sin())
+                })
+                .chain((0..=24).map(|step| {
+                    let a = 2.0 - 4.0 * step as f32 / 24.0;
+                    center + egui::vec2(-5.0 * a.cos() + 3.4, 5.6 * a.sin())
+                }))
+                .collect();
+            ui.painter().add(egui::Shape::closed_line(points, stroke));
         }
         Page::About => {
             ui.painter().circle_stroke(center, 7.0, stroke);
@@ -632,6 +648,7 @@ fn general(app: &mut SettingsApp, ui: &mut egui::Ui) {
                         "The time. Hover the island for your music player."
                     }
                     IdleGlance::Stats => "CPU and memory use, updated every two seconds.",
+                    IdleGlance::Eyes => "Two eyes that blink and look where you pull the island.",
                 },
                 |ui| {
                     segmented(
@@ -640,6 +657,7 @@ fn general(app: &mut SettingsApp, ui: &mut egui::Ui) {
                         &[
                             (IdleGlance::Clock, "Clock"),
                             (IdleGlance::Stats, "Stats"),
+                            (IdleGlance::Eyes, "Eyes"),
                         ],
                     );
                 },

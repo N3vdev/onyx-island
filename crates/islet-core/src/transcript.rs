@@ -216,8 +216,149 @@ fn apply_phrases(tokens: &[Token], phrases: &[Phrase]) -> Vec<Token> {
 }
 
 const FILLERS: &[&str] = &[
-    "um", "umm", "uh", "uhh", "uhhh", "uhm", "er", "erm", "ehm", "hmm", "mhm", "mmm",
+    "um", "umm", "uh", "uhh", "uhhh", "uhm", "er", "erm", "ehm", "hmm", "mhm", "mmm", "mm", "hm",
 ];
+
+/// A hesitation sound, however long it was drawn out: "um", "Ummm",
+/// "uhhm", "hmmm", "mm-hmm", "errm".
+fn is_filler_sound(word: &str) -> bool {
+    if FILLERS.contains(&word) {
+        return true;
+    }
+    let word = word.replace('-', "");
+    // Runs of one letter each, in order: "u" then any of "h"/"m".
+    let shaped = |first: &[char], rest: &[char]| {
+        let mut chars = word.chars().peekable();
+        let mut leading = 0;
+        while chars.peek().is_some_and(|c| first.contains(c)) {
+            chars.next();
+            leading += 1;
+        }
+        let tail: Vec<char> = chars.collect();
+        leading > 0 && !tail.is_empty() && tail.iter().all(|c| rest.contains(c))
+    };
+    word.len() <= 8
+        && word != "em"
+        && (shaped(&['u'], &['h', 'm'])
+            || shaped(&['h'], &['m'])
+            || shaped(&['m'], &['h', 'm'])
+            || shaped(&['e'], &['r', 'h', 'm']) && word.ends_with(['r', 'm']))
+}
+
+/// Linking words that open a clause and can pile up when someone restarts:
+/// "and also and for the Leo character…".
+const LINKING_WORDS: &[&str] = &["and", "also", "so", "but", "then", "plus", "or"];
+
+/// "And Also and for the Leo character" -> "And also for the Leo character":
+/// in a run of linking words with nothing else between, a word said again
+/// is a restart and goes, and a stray capital inside the run is lowered.
+fn collapse_linking_runs(tokens: Vec<Token>) -> Vec<Token> {
+    let linking = |token: &Token| {
+        !token.verbatim && token.lead.is_empty() && LINKING_WORDS.contains(&norm(token).as_str())
+    };
+    let mut out: Vec<Token> = Vec::with_capacity(tokens.len());
+    let mut run: Vec<String> = Vec::new();
+    for token in tokens {
+        let continues = linking(&token)
+            && !run.is_empty()
+            && out.last().is_some_and(|previous| previous.trail.is_empty() || previous.trail == ",");
+        if !continues {
+            run.clear();
+        }
+        // A run only counts where a clause opens: "so and so" in the middle
+        // of a sentence is a phrase.
+        let opens = out.last().is_none_or(|previous| clause_boundary(previous) || previous.trail == ",");
+        if linking(&token) && !continues && !opens {
+            out.push(token);
+            continue;
+        }
+        if linking(&token) {
+            let word = norm(&token);
+            if continues && run.contains(&word) {
+                // Its punctuation stays with the run ("and also and, for").
+                if let Some(previous) = out.last_mut() {
+                    if previous.trail.is_empty() {
+                        previous.trail = token.trail.clone();
+                    }
+                }
+                continue;
+            }
+            let mut token = token;
+            if continues && token.word.chars().skip(1).all(char::is_lowercase) {
+                token.word = token.word.to_lowercase();
+            }
+            run.push(word);
+            out.push(token);
+            continue;
+        }
+        out.push(token);
+    }
+    out
+}
+
+/// File types that make "name dot ext" a file name.
+const FILE_TYPES: &[&str] = &[
+    "glb", "gltf", "fbx", "obj", "blend", "usd", "usdz", "png", "jpg", "jpeg", "gif", "svg",
+    "webp", "ico", "mp3", "mp4", "wav", "mov", "pdf", "doc", "docx", "xlsx", "pptx", "txt", "md",
+    "json", "toml", "yaml", "yml", "csv", "html", "css", "js", "ts", "tsx", "jsx", "py", "rs",
+    "exe", "zip", "dll", "lua", "cs", "cpp", "sh", "bat", "ps1", "com", "org", "net", "io", "dev",
+];
+
+/// Spoken file names: "cyberpunk underscore dot glb" -> "cyberpunk_.glb",
+/// "my underscore model" -> "my_model", "config dot toml" -> "config.toml".
+/// After "underscore", speech recognition often hears "dot" as "or"
+/// ("cyberpunk underscore or glb"), which is no English, so that is read as
+/// "dot" too. A plain "or" stays: "PNG or JPG".
+fn spoken_file_names(tokens: Vec<Token>) -> Vec<Token> {
+    let plain = |token: &Token| !token.verbatim && token.lead.is_empty();
+    let file_type = |token: &Token| plain(token) && FILE_TYPES.contains(&norm(token).as_str());
+    let mut out: Vec<Token> = Vec::with_capacity(tokens.len());
+    let mut index = 0;
+    while index < tokens.len() {
+        let token = &tokens[index];
+        let joinable = out.last().is_some_and(|previous| {
+            !previous.word.is_empty() && previous.trail.is_empty() && !previous.word.ends_with('.')
+        });
+        let key = norm(token);
+        let after_underscore = out.last().is_some_and(|previous| previous.word.ends_with('_'));
+        let dot = plain(token)
+            && token.trail.is_empty()
+            && (key == "dot" || (key == "or" && after_underscore))
+            && tokens.get(index + 1).is_some_and(file_type);
+        if joinable && dot {
+            let ext = &tokens[index + 1];
+            let previous = out.last_mut().unwrap();
+            previous.word = format!("{}.{}", previous.word, ext.word.to_lowercase());
+            previous.trail = ext.trail.clone();
+            previous.verbatim = true;
+            index += 2;
+            continue;
+        }
+        if joinable && plain(token) && key == "underscore" && token.trail.is_empty() {
+            let previous = out.last_mut().unwrap();
+            previous.word.push('_');
+            previous.verbatim = true;
+            // "my underscore model": the next word joins on, unless it is
+            // the "dot" of a file type.
+            if let Some(next) = tokens.get(index + 1).filter(|next| {
+                plain(next) && next.word.chars().all(|c| c.is_alphanumeric()) && {
+                    let word = norm(next);
+                    !(matches!(word.as_str(), "dot" | "or") && tokens.get(index + 2).is_some_and(file_type))
+                }
+            }) {
+                previous.word.push_str(&next.word);
+                previous.trail = next.trail.clone();
+                index += 2;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+        out.push(token.clone());
+        index += 1;
+    }
+    out
+}
 
 /// Padding that adds nothing when it follows a linking word with no
 /// punctuation: "what I want is basically let's say a car".
@@ -307,7 +448,7 @@ fn remove_fillers(tokens: Vec<Token>) -> Vec<Token> {
             index += aside;
             continue;
         }
-        let is_filler = !token.verbatim && (FILLERS.contains(&token.key().as_str()) || stray_oh);
+        let is_filler = !token.verbatim && (is_filler_sound(&token.key()) || stray_oh);
         let is_you_know = at_clause_start
             && !token.verbatim
             && token.key() == "you"
@@ -423,6 +564,15 @@ fn is_false_start(token: &Token, next: &Token) -> bool {
     let (key, next_key) = (token.key(), next.key());
     let cut_off = token.trail.starts_with('-');
     if !(token.trail.is_empty() || cut_off || token.trail == ",") {
+        return false;
+    }
+    // "D drive", "C code": a capital letter on its own names a letter; a
+    // broken-off word would be lower case or cut with a hyphen.
+    let mut letters = token.word.chars();
+    let lone_capital = letters.next().is_some_and(|c| c.is_ascii_uppercase())
+        && letters.next().is_none()
+        && !matches!(token.word.as_str(), "I" | "A");
+    if lone_capital && !cut_off {
         return false;
     }
     next_key.len() > key.len()
@@ -576,6 +726,8 @@ enum Cue {
     Restate,
     /// Single ambiguous words only act when a typed phrase can be resolved.
     Scoped,
+    /// "never mind": the sentence being spoken is given up (see `given_up`).
+    GiveUp,
 }
 
 const CUES: &[(&[&str], Cue)] = &[
@@ -621,6 +773,8 @@ const CUES: &[(&[&str], Cue)] = &[
     (&["my", "bad"], Cue::Restate),
     (&["my", "mistake"], Cue::Restate),
     (&["let", "me", "rephrase"], Cue::Restate),
+    (&["never", "mind"], Cue::GiveUp),
+    (&["nevermind"], Cue::GiveUp),
     (&["sorry"], Cue::Scoped),
     (&["i'm", "sorry"], Cue::Scoped),
     (&["i", "am", "sorry"], Cue::Scoped),
@@ -920,6 +1074,358 @@ fn misheard_thanks(text: &str) -> String {
     out.join(" ")
 }
 
+/// Nouns that follow a describing word, so "using black. Color if
+/// possible." is one sentence cut by a pause.
+const DESCRIBED_NOUNS: &[&str] = &[
+    "color", "colour", "colors", "colours", "background", "border", "borders", "edge", "edges",
+    "size", "format", "version", "mode", "theme", "style", "font", "text", "tone", "shade",
+    "line", "lines", "fill", "bars", "padding", "margin", "margins", "outline",
+];
+
+/// Sentence fragments made by pauses, put back together:
+///
+/// - "Expand the image using black. Color if possible." -> "…using black
+///   color if possible.": a lone describing noun and "if possible" (or "if
+///   needed", "please") goes on the sentence before.
+/// - "It should be YouTube resolutions. YouTube thumbnail resolution size."
+///   -> "It should be YouTube thumbnail resolution size.": a short phrase
+///   with no subject or verb that starts like the end of the sentence before
+///   and says it more exactly (it adds words inside it) replaces that end.
+fn rejoin_fragments(text: &str) -> String {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let mut sentences: Vec<Vec<String>> = Vec::new();
+    let mut current: Vec<String> = Vec::new();
+    for word in words {
+        current.push(word.to_owned());
+        if word.ends_with(['.', '?', '!']) {
+            sentences.push(std::mem::take(&mut current));
+        }
+    }
+    let tail = current;
+    let mut out: Vec<Vec<String>> = Vec::new();
+    for sentence in sentences {
+        if let Some(previous) = out.last_mut() {
+            if let Some(joined) = fragment_onto(previous, &sentence) {
+                *previous = joined;
+                continue;
+            }
+        }
+        out.push(sentence);
+    }
+    out.push(tail);
+    out.into_iter().flatten().collect::<Vec<_>>().join(" ")
+}
+
+fn fragment_onto(previous: &[String], fragment: &[String]) -> Option<Vec<String>> {
+    let last = previous.last()?;
+    if !last.ends_with('.') || last.ends_with("..") || !fragment.last()?.ends_with('.') {
+        return None;
+    }
+    let bare: Vec<String> = fragment.iter().map(|w| bare_word(w)).collect();
+    let before: Vec<String> = previous.iter().map(|w| bare_word(w)).collect();
+    let mut joined: Vec<String> = previous.to_vec();
+    let strip = |word: &mut String| {
+        word.pop();
+    };
+    // "Color if possible."
+    let polite = matches!(
+        bare[1..].iter().map(String::as_str).collect::<Vec<_>>().as_slice(),
+        ["if", "possible"] | ["if", "needed"] | ["if", "necessary"] | ["if", "you", "can"] | ["please"]
+    );
+    if fragment.len() >= 2 && polite && DESCRIBED_NOUNS.contains(&bare[0].as_str()) {
+        strip(joined.last_mut()?);
+        joined.push(fragment[0].to_lowercase());
+        joined.extend(fragment[1..].iter().cloned());
+        return Some(joined);
+    }
+    // "YouTube resolutions. YouTube thumbnail resolution size."
+    if !(2..=6).contains(&fragment.len()) || previous.len() < 3 {
+        return None;
+    }
+    let verbish = |w: &String| {
+        RESTART_SUBJECTS.contains(&w.as_str())
+            || RESTART_HELPERS.contains(&w.as_str())
+            || matches!(w.as_str(), "is" | "are" | "be" | "was" | "were" | "has" | "have" | "had" | "i'm" | "it's")
+    };
+    if bare.iter().any(verbish) || fragment.iter().any(|w| w.contains(',')) {
+        return None;
+    }
+    let end = before.last()?;
+    let stem = end.strip_suffix('s').unwrap_or(end);
+    for at in previous.len().saturating_sub(4)..previous.len() - 1 {
+        if before[at] != bare[0] || previous[at..previous.len() - 1].iter().any(|w| w.contains(',')) {
+            continue;
+        }
+        let tail_len = previous.len() - at;
+        // It says the end again with more inside: the last word comes later.
+        let again = bare.iter().position(|w| w.len() >= 3 && (w == end || w.starts_with(stem)));
+        if again.is_some_and(|j| j >= tail_len) {
+            joined.truncate(at);
+            joined.extend(fragment.iter().cloned());
+            return Some(joined);
+        }
+    }
+    None
+}
+
+/// Words no sentence ends on.
+const DANGLING_WORDS: &[&str] = &[
+    "the", "a", "an", "and", "or", "but", "because", "become", "becomes", "became", "my", "your",
+    "our", "their", "very", "than", "into",
+];
+
+/// Common words that can go on a sentence cut by a pause.
+const CONTINUING_WORDS: &[&str] = &[
+    "around", "about", "almost", "nearly", "roughly", "maybe", "more", "less", "much", "really",
+    "too", "very", "only", "even", "over", "under", "of", "than", "like", "to",
+];
+
+/// "Also, I wrote this prompt using the voice dictation model. Also, I wrote
+/// this prompt using the voice dictation.": the same sentence said again
+/// straight away, a word or two longer or shorter. The second try is the one
+/// meant. Only exact restatements count, so "Fix the login page. Fix the
+/// signup page." keeps both.
+fn drop_resaid_sentences(text: &str) -> String {
+    let mut sentences: Vec<Vec<&str>> = vec![Vec::new()];
+    for word in text.split_whitespace() {
+        sentences.last_mut().unwrap().push(word);
+        if word.ends_with(['.', '?', '!']) && !word.ends_with("..") {
+            sentences.push(Vec::new());
+        }
+    }
+    sentences.retain(|sentence| !sentence.is_empty());
+    let bare = |sentence: &[&str]| -> Vec<String> {
+        sentence.iter().map(|w| bare_word(w)).filter(|w| !w.is_empty()).collect()
+    };
+    let mut kept: Vec<&[&str]> = Vec::with_capacity(sentences.len());
+    for (index, sentence) in sentences.iter().enumerate() {
+        let resaid = sentences.get(index + 1).is_some_and(|next| {
+            let (a, b) = (bare(sentence), bare(next));
+            let shorter = a.len().min(b.len());
+            shorter >= 5 && a.len().abs_diff(b.len()) <= 3 && a[..shorter] == b[..shorter]
+        });
+        if !resaid {
+            kept.push(sentence);
+        }
+    }
+    kept.iter().map(|sentence| sentence.join(" ")).collect::<Vec<_>>().join(" ")
+}
+
+/// Words the speech model mishears, fixed only where the context gives
+/// them away: "Oh some kind of indication" after a sentence is "Or some kind
+/// of…", and "on whoever of the island" is "on hover of the island".
+fn misheard_words(text: &str) -> String {
+    let mut words: Vec<String> = text.split_whitespace().map(str::to_owned).collect();
+    let bare: Vec<String> = words.iter().map(|w| bare_word(w)).collect();
+    let at = |i: usize| bare.get(i).map_or("", String::as_str);
+    for index in 0..words.len() {
+        let after_sentence = index > 0 && words[index - 1].ends_with(['.', '?', '!']);
+        let alternative = matches!((at(index + 1), at(index + 2), at(index + 3)), ("some", "kind" | "sort", "of"));
+        if after_sentence && words[index] == "Oh" && alternative {
+            words[index] = "Or".to_owned();
+        }
+        if index > 0 && at(index - 1) == "on" && at(index + 1) == "of" && words[index].eq_ignore_ascii_case("whoever") {
+            words[index] = "hover".to_owned();
+        }
+        // "I want it to chart after 8 PM": nothing charts after a time.
+        let when_follows = matches!(at(index + 1), "after" | "before" | "at" | "from" | "around");
+        if index > 0 && at(index - 1) == "to" && at(index) == "chart" && when_follows {
+            let capital = words[index].starts_with('C');
+            let rest = &words[index][5..];
+            words[index] = format!("{}tart{rest}", if capital { "S" } else { "s" });
+        }
+    }
+    words.join(" ")
+}
+
+/// Words that open a sentence going on from the last one ("Also, the island").
+const OPENING_CONNECTIVES: &[&str] = &["also", "and", "so", "but", "plus", "then"];
+
+/// "Also, the island. Eye animation should show": a pause cut a phrase in
+/// two. A "sentence" that is only a connective and a two- or three-word
+/// noun phrase says nothing yet, so the next words belong to it.
+fn rejoin_opened_phrases(text: &str) -> String {
+    let mut words: Vec<String> = text.split_whitespace().map(str::to_owned).collect();
+    let mut start = 0;
+    for index in 0..words.len() {
+        if !words[index].ends_with('.') || words[index].ends_with("..") {
+            continue;
+        }
+        let sentence: Vec<String> = words[start..=index].iter().map(|w| bare_word(w)).collect();
+        let opened = (3..=4).contains(&sentence.len())
+            && OPENING_CONNECTIVES.contains(&sentence[0].as_str())
+            && DETERMINERS.contains(&sentence[1].as_str())
+            && !words[start..index].iter().skip(1).any(|w| w.ends_with([',', ';', ':']));
+        if opened && index + 1 < words.len() && plain_capitalised_noun(&words, index + 1) {
+            words[index].pop();
+            let next = &mut words[index + 1];
+            *next = next.to_lowercase().chars().take(1).chain(next.chars().skip(1)).collect();
+            continue;
+        }
+        start = index + 1;
+    }
+    words.join(" ")
+}
+
+/// Helper verbs that follow the subject of a sentence.
+const HELPER_VERBS: &[&str] = &[
+    "should", "will", "would", "can", "could", "must", "might", "may", "is", "are", "was", "were", "has",
+    "have", "needs", "need", "shows", "show", "gets", "keeps", "starts",
+];
+
+/// "Eye animation should…": a capitalised everyday word, a lower-case word
+/// that goes with it, then a helper verb. Not a name or greeting ("Sarah
+/// will call", "Thanks for watching"), which have no second noun.
+fn plain_capitalised_noun(words: &[String], index: usize) -> bool {
+    let word = words[index].as_str();
+    let mut letters = word.chars();
+    let second = words.get(index + 1).map(String::as_str).unwrap_or("");
+    let third = words.get(index + 2).map(|w| bare_word(w)).unwrap_or_default();
+    word.chars().count() >= 2
+        && letters.next().is_some_and(char::is_uppercase)
+        && letters.all(|c| c.is_lowercase())
+        && second.chars().all(|c| c.is_lowercase())
+        && !second.is_empty()
+        && !HELPER_VERBS.contains(&bare_word(second).as_str())
+        && HELPER_VERBS.contains(&third.as_str())
+}
+
+/// "But before that you just check the per performance uh before that I
+/// want you to check…": after an "uh", the speaker said the same opening
+/// words again and went on differently. The first try, up to the "uh", is
+/// dropped. Only within one sentence, a few words back, with no comma
+/// between (a list or two clauses keep their words).
+fn restart_after_filler(text: &str) -> String {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let bare: Vec<String> = words.iter().map(|w| bare_word(w)).collect();
+    let mut drop = vec![false; words.len()];
+    for filler in 1..words.len().saturating_sub(2) {
+        // "…to Anna and uh send the slides": a joining word goes on, it
+        // does not start over.
+        let joined = matches!(bare[filler - 1].as_str(), "and" | "or" | "then" | "but" | "so" | "also" | "plus");
+        if !is_filler_sound(&bare[filler]) || joined || words[filler - 1].ends_with(['.', '?', '!', ',']) {
+            continue;
+        }
+        let again = [&bare[filler + 1], &bare[filler + 2]];
+        if again.iter().any(|w| w.is_empty()) {
+            continue;
+        }
+        let earliest = filler.saturating_sub(14);
+        let first = (earliest..filler.saturating_sub(2)).rev().find(|&start| {
+            [&bare[start], &bare[start + 1]] == again
+                && !words[start..filler].iter().any(|w| w.ends_with(['.', '?', '!', ',', ';', ':']))
+        });
+        if let Some(start) = first {
+            drop[start..=filler].iter_mut().for_each(|d| *d = true);
+        }
+    }
+    let mut out: Vec<String> = Vec::with_capacity(words.len());
+    let mut capital = false;
+    for (index, word) in words.iter().enumerate() {
+        if drop[index] {
+            // The first try opened the sentence: the second does now.
+            capital |= words[index].chars().next().is_some_and(char::is_uppercase)
+                && (index == 0 || words[index - 1].ends_with(['.', '?', '!']));
+            continue;
+        }
+        let mut word = (*word).to_owned();
+        if std::mem::take(&mut capital) {
+            word = capitalized(&word);
+        }
+        out.push(word);
+    }
+    out.join(" ")
+}
+
+/// Words after which "to" starts a verb: "I want you to update…".
+const WANTING_WORDS: &[&str] = &[
+    "want", "wants", "wanted", "need", "needs", "needed", "like", "love", "ask", "asked", "tell", "told",
+    "try", "trying", "able", "how", "allowed", "supposed", "meant", "wish", "hope", "plan", "decided",
+];
+
+/// Who a wish can be about: "want you to", "need them to".
+const OBJECT_PRONOUNS: &[&str] = &["you", "me", "him", "her", "them", "us", "it", "everyone", "someone"];
+
+/// Whether the "to" at `to` begins a verb ("want you to update"), not a
+/// place or a name ("talk to Daniel", "go to Paris").
+fn starts_verb<S: AsRef<str>>(words: &[S], to: usize) -> bool {
+    let same_sentence = |i: usize| !words[i].as_ref().ends_with(['.', '?', '!', ',', ';', ':']);
+    let word = |i: usize| bare_word(words[i].as_ref());
+    if to == 0 || word(to) != "to" || !same_sentence(to - 1) {
+        return false;
+    }
+    if WANTING_WORDS.contains(&word(to - 1).as_str()) {
+        return true;
+    }
+    to >= 2
+        && OBJECT_PRONOUNS.contains(&word(to - 1).as_str())
+        && same_sentence(to - 2)
+        && WANTING_WORDS.contains(&word(to - 2).as_str())
+}
+
+/// Words that open what a verb acts on: "update the game", "set it up".
+const OBJECT_STARTS: &[&str] = &[
+    "the", "a", "an", "this", "that", "these", "those", "it", "my", "your", "our", "their", "his", "her",
+    "me", "him", "them", "us", "all", "some", "any", "every", "everything", "something", "more", "out",
+    "up", "down", "off", "on", "after", "before", "at", "from", "until", "every", "once",
+];
+
+/// "Update" but not "I", "OK", "iPhone" or the start of a name ("Visual
+/// Studio"): a word that is capitalised only because a sentence began there.
+fn plain_capitalised<S: AsRef<str>>(words: &[S], index: usize) -> bool {
+    let core = words[index].as_ref().trim_end_matches([',', ';', ':', '.', '!', '?']);
+    let mut letters = core.chars();
+    let name_follows = words
+        .get(index + 1)
+        .and_then(|next| next.as_ref().chars().next())
+        .is_some_and(char::is_uppercase);
+    // A verb is followed by what it acts on ("Update the game"); a name by
+    // what it does ("Paris is lovely"), so a name is never lowered.
+    let object_follows = words.get(index + 1).is_some_and(|next| {
+        let next = next.as_ref();
+        !core.ends_with(|c: char| !c.is_alphanumeric())
+            && !words[index].as_ref().ends_with(['.', ',', ';', ':', '!', '?'])
+            && OBJECT_STARTS.contains(&bare_word(next).as_str())
+    });
+    core.chars().count() >= 2
+        && object_follows
+        && !name_follows
+        && letters.next().is_some_and(char::is_uppercase)
+        && letters.all(|c| c.is_lowercase() || c == '\'' || c == '\u{2019}')
+}
+
+/// Describing words tried after "a" and then said again with another one.
+const RESTARTED_ADJECTIVES: &[&str] = &[
+    "proper", "real", "good", "nice", "great", "simple", "basic", "clean", "modern", "full", "complete",
+    "decent", "solid", "quick", "small", "big", "little", "new", "realistic", "better", "short", "long",
+    "fast", "smooth", "cool", "huge", "tiny", "fancy", "beautiful", "polished", "detailed", "professional",
+    "high", "proper-looking", "nice-looking", "serious", "fully", "really", "very", "super",
+];
+
+/// "a proper. A realistic open world game" → "a proper, realistic open world
+/// game": the speaker paused after a describing word and started the phrase
+/// over with another, so both describe the same thing.
+fn restarted_articles(text: &str) -> String {
+    let mut words: Vec<String> = text.split_whitespace().map(str::to_owned).collect();
+    let article = |w: &str| matches!(w.to_lowercase().as_str(), "a" | "an");
+    let mut index = 0;
+    while index + 3 < words.len() {
+        let describing = words[index + 1].trim_end_matches(['.', ',']);
+        let restarted = article(&words[index])
+            && !words[index + 1].ends_with("..")
+            && describing.chars().all(|c| c.is_alphabetic() || c == '-')
+            && RESTARTED_ADJECTIVES.contains(&describing.to_lowercase().as_str())
+            && article(&words[index + 2])
+            && words[index + 3].chars().next().is_some_and(char::is_alphabetic);
+        if restarted {
+            words[index + 1] = format!("{describing},");
+            words.remove(index + 2);
+        }
+        index += 1;
+    }
+    words.join(" ")
+}
+
 /// "…to Daniel? before 5pm." → "…to Daniel before 5pm?", "pricing. and the
 /// dates" → "pricing and the dates": the speech model put a stop where you
 /// paused, but the next word, in lower case, shows the sentence went on.
@@ -948,6 +1454,25 @@ fn continue_sentences(text: &str) -> String {
             words[index].pop();
             continue;
         }
+        // "So the 3 minutes long will become. Around 5 to 6 minutes": no
+        // sentence ends on "become" or "the", so the pause was mid-sentence.
+        // Only when the next word is a common one, safe to lower.
+        if mark == Some('.') && !word.ends_with("..") && !command_follows {
+            let dangling = DANGLING_WORDS.contains(&bare_word(word).as_str());
+            let next = words.get(index + 1).map(|w| bare_word(w));
+            // Not "the", "it" or "we": those open a new sentence as often.
+            let common = next.as_deref().is_some_and(|w| CONTINUING_WORDS.contains(&w));
+            // "I want you to. Update the game": "to" after a wish starts a
+            // verb, and the verb is what follows the pause.
+            let verb_follows = next.is_some()
+                && starts_verb(&words, index)
+                && plain_capitalised(&words, index + 1);
+            if (dangling && common) || verb_follows {
+                words[index].pop();
+                let next = &mut words[index + 1];
+                *next = next.to_lowercase().chars().take(1).chain(next.chars().skip(1)).collect();
+            }
+        }
         if question_pending && matches!(mark, Some('.' | '!')) {
             words[index].pop();
             words[index].push('?');
@@ -973,8 +1498,8 @@ pub fn finish_layout(text: &str) -> String {
             out.push('\n');
         }
         let line = match line.strip_prefix("- ") {
-            Some(item) => format!("- {}", capitalized(item)),
-            None => line.to_owned(),
+            Some(item) => format!("- {}", capitalized(&stray_capitals(item))),
+            None => stray_capitals(line),
         };
         let chars: Vec<char> = line.chars().collect();
         let mut fixed = String::with_capacity(line.len() + 4);
@@ -991,6 +1516,51 @@ pub fn finish_layout(text: &str) -> String {
         out.push_str(&fixed);
     }
     out
+}
+
+/// Small words that are only capitalised at the start of a sentence.
+const SENTENCE_START_ONLY: &[&str] = &[
+    "about", "after", "also", "an", "and", "are", "as", "at", "because", "before", "but", "by", "can",
+    "could", "do", "does", "for", "from", "he", "here", "how", "if", "in", "into", "is", "it", "it's",
+    "just", "maybe", "my", "not", "of", "on", "onto", "or", "our", "please", "she", "should", "so",
+    "than", "that", "the", "their", "then", "there", "these", "they", "this", "those", "to", "was",
+    "we", "what", "when", "which", "who", "will", "with", "would", "you", "your",
+];
+
+/// "can you increase the hover On hover time": after a pause the speech
+/// model starts a new sentence, and once the pieces are joined a small word
+/// keeps its capital in mid-sentence. Lowercases those words when they
+/// follow a lowercase word (not after a stop, and not inside a run of
+/// capitalised words, which is likely a name or title).
+fn stray_capitals(line: &str) -> String {
+    let words: Vec<&str> = line.split(' ').collect();
+    let mut out: Vec<String> = Vec::with_capacity(words.len());
+    for (index, word) in words.iter().enumerate() {
+        let core = word.trim_end_matches([',', ';', ':', '.', '!', '?']);
+        let after_lowercase = index > 0 && {
+            let previous = words[index - 1];
+            !previous.ends_with(['.', '!', '?', ':', ';', '"', '\u{201d}'])
+                && previous.chars().next().is_some_and(|c| c.is_lowercase() || c.is_ascii_digit())
+        };
+        // "play The Weeknd": the start of a capitalised run, a name.
+        let starts_name = words
+            .get(index + 1)
+            .and_then(|next| next.chars().next())
+            .is_some_and(char::is_uppercase);
+        let mut letters = core.chars();
+        let capitalised = !starts_name
+            && letters.next().is_some_and(char::is_uppercase)
+            && letters.all(|c| c.is_lowercase() || c == '\'' || c == '\u{2019}');
+        let small_word = SENTENCE_START_ONLY.contains(&core.to_lowercase().replace('\u{2019}', "'").as_str());
+        // "want you to Update": a verb after "to", not a place or name.
+        let verb = index > 0 && starts_verb(&words, index - 1) && plain_capitalised(&words, index);
+        if after_lowercase && capitalised && (small_word || verb) {
+            out.push(word.to_lowercase());
+        } else {
+            out.push((*word).to_owned());
+        }
+    }
+    out.join(" ")
 }
 
 /// In each run of bullets, items end the same way: with a full stop when
@@ -1088,6 +1658,60 @@ fn abandoned_start(tokens: &[Token], out: &mut Vec<Token>, cue_end: usize) -> Op
     Some(cue_end + 1)
 }
 
+/// Words "never" belongs to when it is part of the sentence: "I never mind
+/// the noise", "you'd never mind it", "try to never mind them".
+const NEVER_OWNERS: &[&str] = &[
+    "i", "you", "we", "they", "he", "she", "it", "who", "that", "to", "would", "will", "i'd",
+    "you'd", "we'd", "they'd", "he'd", "she'd", "really", "just", "almost", "and", "or", "but",
+];
+
+/// Most words a "never mind" gives up: a short unfinished start, not a
+/// paragraph of meant text.
+const GIVE_UP_WORDS: usize = 16;
+
+/// "I want you to create never mind. Sorry. First, I want you to…": a
+/// sentence started and given up with "never mind" (and perhaps a "sorry").
+/// The unfinished start, the "never mind" and the apology go.
+///
+/// Only when the start runs straight into "never mind" with no punctuation
+/// between (a finished "Did you see it? Never mind." stays), "never mind"
+/// (or its apology) closes the phrase, the start is short, and the word
+/// before is not one "never" would belong to ("I never mind the noise.").
+fn given_up(tokens: &[Token], out: &mut Vec<Token>, cue_end: usize) -> Option<usize> {
+    let before = out.last()?;
+    if clause_boundary(before) || closes_phrase(before) || NEVER_OWNERS.contains(&norm(before).as_str()) {
+        return None;
+    }
+    let mut end = cue_end;
+    for apology in [&["sorry"][..], &["i'm", "sorry"], &["i", "am", "sorry"]] {
+        let said = apology.iter().enumerate().all(|(offset, word)| {
+            tokens.get(end + offset).is_some_and(|token| !token.verbatim && norm(token) == *word)
+        });
+        let last = end + apology.len();
+        if said && (last == tokens.len() || closes_phrase(&tokens[last - 1])) {
+            end += apology.len();
+            break;
+        }
+    }
+    if !(closes_phrase(&tokens[end - 1]) || end == tokens.len()) {
+        return None;
+    }
+    let start = out.iter().rposition(Token::ends_sentence).map_or(0, |at| at + 1);
+    if out.len() - start > GIVE_UP_WORDS || out[start..].iter().any(|token| token.verbatim) {
+        return None;
+    }
+    out.truncate(start);
+    let Some(next) = tokens.get(end) else {
+        return Some(end);
+    };
+    let mut next = next.clone();
+    if out.last().is_none_or(clause_boundary) {
+        capitalize(&mut next);
+    }
+    out.push(next);
+    Some(end + 1)
+}
+
 fn clause_boundary(token: &Token) -> bool {
     token.ends_sentence() || is_break(token)
 }
@@ -1126,6 +1750,116 @@ const RESTART_OPENERS: &[&str] = &[
     "it",
     "they",
 ];
+
+/// Who a restarted clause is about.
+const RESTART_SUBJECTS: &[&str] = &["it", "i", "we", "you", "they", "he", "she", "this", "that"];
+
+/// The helper verb a restarted clause opens with after its subject.
+const RESTART_HELPERS: &[&str] = &[
+    "will", "won't", "would", "wouldn't", "does", "doesn't", "do", "don't", "did", "didn't", "is",
+    "isn't", "was", "wasn't", "can", "can't", "could", "couldn't", "should", "shouldn't", "might",
+];
+
+/// Words that join two real clauses, so the same subject after one is meant.
+const CLAUSE_JOINERS: &[&str] = &["and", "but", "or", "so", "because", "if", "when", "then", "while", "until"];
+
+/// "it will just sound l does not it wouldn't it will not sound like a
+/// loop" -> "it will not sound like a loop": the same subject and helper verb
+/// begun again and again, with no punctuation or joining word between, are
+/// tries at one clause. The last try stays.
+///
+/// Only when the last try picks up a word from the earlier ones ("sound"),
+/// or an earlier one broke off mid-word ("l"); "it is what it is" stays.
+fn drop_subject_restarts(tokens: Vec<Token>) -> Vec<Token> {
+    let plain = |token: &Token| !token.verbatim && token.lead.is_empty() && token.trail.is_empty();
+    let opens = |at: usize| {
+        tokens.get(at).is_some_and(|t| plain(t) && RESTART_SUBJECTS.contains(&norm(t).as_str()))
+            && tokens.get(at + 1).is_some_and(|t| plain(t) && RESTART_HELPERS.contains(&norm(t).as_str()))
+    };
+    let content = |token: &Token| {
+        let word = norm(token);
+        (word.len() >= 3 && !FUNCTION_WORDS.contains(&word.as_str()) && !RESTART_HELPERS.contains(&word.as_str()))
+            .then_some(word)
+    };
+    let mut out: Vec<Token> = Vec::with_capacity(tokens.len());
+    let mut index = 0;
+    while index < tokens.len() {
+        if opens(index) {
+            let mut last_try = None;
+            let mut j = index + 2;
+            while j < tokens.len().min(index + 14) {
+                let between = &tokens[index + 2..j];
+                if !between.iter().all(plain) || between.iter().any(|t| CLAUSE_JOINERS.contains(&norm(t).as_str())) {
+                    break;
+                }
+                if norm(&tokens[j]) == norm(&tokens[index]) && opens(j) {
+                    let tried: Vec<String> = tokens[index + 2..j].iter().filter_map(content).collect();
+                    let picked_up = tokens[j + 2..tokens.len().min(j + 7)]
+                        .iter()
+                        .filter_map(content)
+                        .any(|word| tried.contains(&word));
+                    let broke_off = between
+                        .iter()
+                        .any(|t| t.word.chars().count() == 1 && !matches!(norm(t).as_str(), "a" | "i"));
+                    if picked_up || broke_off {
+                        last_try = Some(j);
+                    }
+                }
+                j += 1;
+            }
+            if let Some(j) = last_try {
+                let mut kept = tokens[j].clone();
+                if tokens[index].word.starts_with(char::is_uppercase) {
+                    capitalize(&mut kept);
+                }
+                out.push(kept);
+                index = j + 1;
+                continue;
+            }
+        }
+        out.push(tokens[index].clone());
+        index += 1;
+    }
+    out
+}
+
+/// A bare number word or numeral, as a value.
+fn small_number(token: &Token) -> Option<i64> {
+    if token.verbatim && !token.word.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let word = norm(token);
+    if let Ok(value) = word.parse() {
+        return Some(value);
+    }
+    const WORDS: &[&str] = &[
+        "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+        "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen",
+        "nineteen", "twenty",
+    ];
+    WORDS.iter().position(|w| *w == word).map(|at| at as i64)
+}
+
+/// "around 6 5 to 6 minutes" -> "around 5 to 6 minutes": a number said and
+/// at once replaced by a range it belongs to (its end, or next to its start).
+fn drop_number_restarts(tokens: Vec<Token>) -> Vec<Token> {
+    let mut out: Vec<Token> = Vec::with_capacity(tokens.len());
+    for (index, token) in tokens.iter().enumerate() {
+        let range = (|| {
+            let first = small_number(tokens.get(index + 1)?)?;
+            (norm(tokens.get(index + 2)?) == "to" && tokens[index + 1].trail.is_empty())
+                .then_some(())?;
+            Some((first, small_number(tokens.get(index + 3)?)?))
+        })();
+        if let (Some(said), Some((from, to))) = (small_number(token).filter(|_| token.trail.is_empty() && token.lead.is_empty()), range) {
+            if from != said && (said == to || (from < said && said < to) || (said - from).abs() == 1) {
+                continue;
+            }
+        }
+        out.push(token.clone());
+    }
+    out
+}
 
 /// "can I just can't we just use" -> "can't we just use": two phrases of the
 /// same length with different openers that end on the same word, with no
@@ -1250,7 +1984,7 @@ fn apply_cue(
     }
     if !matches!(
         cue,
-        Cue::Contrast | Cue::VerifiedRestate | Cue::Scratch | Cue::Restate
+        Cue::Contrast | Cue::VerifiedRestate | Cue::Scratch | Cue::Restate | Cue::GiveUp
     ) && (!matches!(cue, Cue::Replace { strong: false }) || !closes_phrase(last_cue))
     {
         if let Some(end) = corrections::apply(tokens, out, cue_end, !matches!(cue, Cue::Scoped)) {
@@ -1261,6 +1995,7 @@ fn apply_cue(
         Cue::Contrast => corrections::contrast(tokens, out, cue_end),
         Cue::VerifiedRestate => corrections::verified_restate(tokens, out, cue_end),
         Cue::Scoped => abandoned_start(tokens, out, cue_end),
+        Cue::GiveUp => given_up(tokens, out, cue_end),
         Cue::Scratch => {
             // Only when it ends its clause ("scratch that." / "scratch that, ...").
             if !(closes_phrase(last_cue) || cue_end == tokens.len()) || out.is_empty() {
@@ -2304,7 +3039,17 @@ fn written_numbers(tokens: Vec<Token>) -> Vec<Token> {
         if let Some((value, end)) = written_decimal_or_clock(&tokens, at) {
             let mut replacement: Vec<_> = value.split_whitespace().map(Token::parse).collect();
             replacement.first_mut().unwrap().lead = tokens[at].lead.clone();
-            replacement.last_mut().unwrap().trail = tokens[end - 1].trail.clone();
+            let mut trail = tokens[end - 1].trail.clone();
+            // "eight p.m. by default": the stop belonged to "p.m.", and
+            // the sentence goes on, so "8:00 PM" takes no full stop.
+            let goes_on = tokens
+                .get(end)
+                .and_then(|next| next.word.chars().next())
+                .is_some_and(char::is_lowercase);
+            if goes_on && trail == "." && tokens[end - 1].word.contains('.') {
+                trail.clear();
+            }
+            replacement.last_mut().unwrap().trail = trail;
             out.extend(replacement);
             at = end;
         } else {
@@ -2425,6 +3170,11 @@ fn literal_tokens(text: &str) -> Vec<Token> {
 /// Cleans one recognised utterance.
 #[must_use]
 pub fn clean(text: &str, options: &TextOptions) -> String {
+    // "Mm." on its own: a hum, nothing to type.
+    let hums = text.split_whitespace().map(bare_word).collect::<Vec<_>>();
+    if options.filler_removal && !hums.is_empty() && hums.iter().all(|w| !w.is_empty() && is_filler_sound(w)) {
+        return String::new();
+    }
     // Existing paragraphs and list markers are structural boundaries, not
     // stutters or punctuation to flatten. Spoken breaks created below still
     // go through the usual whole-utterance path.
@@ -2449,7 +3199,7 @@ pub fn clean(text: &str, options: &TextOptions) -> String {
     }
     let joined;
     let text = if options.filler_removal {
-        joined = misheard_thanks(&continue_sentences(&resolve_denied_value(&drop_repeated_runs(&drop_noun_restarts(text)))));
+        joined = misheard_thanks(&rejoin_fragments(&continue_sentences(&rejoin_opened_phrases(&restarted_articles(&resolve_denied_value(&drop_repeated_runs(&drop_noun_restarts(&drop_resaid_sentences(&misheard_words(&restart_after_filler(text)))))))))));
         joined.as_str()
     } else {
         text
@@ -2465,11 +3215,11 @@ pub fn clean(text: &str, options: &TextOptions) -> String {
         apply_phrases(&tokens, &phrases)
     };
     if options.spoken_punctuation {
-        tokens = written_numbers(tokens);
+        tokens = spoken_file_names(written_numbers(tokens));
     }
     if options.filler_removal {
         tokens = remove_stutters(resolve_quick_swaps(resolve_corrections(drop_restarts(
-            remove_fillers(tokens),
+            drop_number_restarts(drop_subject_restarts(collapse_linking_runs(remove_fillers(tokens)))),
         ))));
     }
     safety::punctuate_questions(&mut tokens);
@@ -2497,6 +3247,219 @@ mod tests {
         );
         assert_eq!(clean("Click save, not save but submit.", &options()), "Click submit.");
         assert_eq!(clean("What when did it start?", &options()), "When did it start?");
+    }
+
+    #[test]
+    fn a_restart_after_uh_and_a_dictation_of_only_hums_are_cleaned() {
+        let o = options();
+        // Dictated exactly like this (the speech model's own words).
+        assert_eq!(
+            clean("But before that you just check the per performance uh before that I want you to check the performance impact.", &o),
+            "But before that I want you to check the performance impact."
+        );
+        assert_eq!(clean("Uh so the plan is um so the plan is to ship on Friday.", &o), "So the plan is to ship on Friday.");
+        for hum in ["Mm.", "Hmm.", "Uh.", "Um, uh.", "Mm-hmm."] {
+            assert_eq!(clean(hum, &o), "", "{hum}");
+        }
+        for kept in [
+            "Before that, we eat. Um, before that we cook.",
+            "Check the logs, uh, check the logs again tomorrow.",
+            "Send the report to Anna and uh send the slides to Ben.",
+        ] {
+            assert_eq!(clean(kept, &o).contains("logs") || clean(kept, &o).contains("report") || clean(kept, &o).contains("eat"), true, "{kept}");
+        }
+        assert_eq!(
+            clean("Send the report to Anna and uh send the slides to Ben.", &o),
+            "Send the report to Anna and send the slides to Ben."
+        );
+    }
+
+    #[test]
+    fn a_drive_letter_a_time_mid_sentence_and_phrases_cut_by_pauses_are_kept_whole() {
+        let o = options();
+        // Dictated exactly like this (the speech model's own words).
+        assert_eq!(
+            clean("And I wanted to. Chart after eight p.m. by default and add a settings page as well.", &o),
+            "And I wanted to start after 8:00 PM by default and add a settings page as well."
+        );
+        assert_eq!(
+            clean("Also, the island. Eye animation should also show when the red light effect is gonna start.", &o),
+            "Also, the island eye animation should also show when the red light effect is gonna start."
+        );
+        assert_eq!(clean("My audio is saved at D drive games folder.", &o), "My audio is saved at D drive games folder.");
+        assert_eq!(clean("Meet at nine a.m. tomorrow.", &o), "Meet at 9:00 AM tomorrow.");
+        for kept in [
+            "Open the D drive.",
+            "Write it in C code.",
+            "I want to chart the sales data.",
+            "Also, the end. Thanks for watching.",
+            "So the plan. Sarah will call.",
+            "And then. Next week we ship.",
+        ] {
+            assert_eq!(clean(kept, &o), kept);
+        }
+    }
+
+    #[test]
+    fn a_resaid_sentence_and_misheard_or_and_hover_are_fixed() {
+        let o = options();
+        // Dictated exactly like this.
+        assert_eq!(
+            clean("Also, I wrote this prompt using the voice dictation model. Also, I wrote this prompt using the voice dictation.", &o),
+            "Also, I wrote this prompt using the voice dictation."
+        );
+        assert_eq!(
+            clean("Warning, in the sense, it should show. Oh some kind of indication where it will give a hint.", &o),
+            "Warning, in the sense, it should show. Or some kind of indication where it will give a hint."
+        );
+        assert_eq!(
+            clean("And on whoever of the dynamic island, it will give the button to download.", &o),
+            "And on hover of the dynamic island, it will give the button to download."
+        );
+        for kept in [
+            "Fix the login page. Fix the signup page.",
+            "I want you to fix the bug. I want you to fix the bug in the parser and add tests for it.",
+            "Oh, some kind of error came up.",
+            "Oh some kind of error came up.",
+            "It depends on whoever wins.",
+            "Thanks. Thanks.",
+        ] {
+            assert_eq!(clean(kept, &o), kept);
+        }
+    }
+
+    #[test]
+    fn a_verb_after_a_pause_and_a_restarted_describing_word_are_joined() {
+        let o = options();
+        // Dictated exactly like this; the speech model put stops at the pauses.
+        assert_eq!(
+            clean(
+                "And I want you to. Update the game graphics design. I want it to look like a proper. A realistic open world game, browser game.",
+                &o
+            ),
+            "And I want you to update the game graphics design. I want it to look like a proper, realistic open world game, browser game."
+        );
+        assert_eq!(clean("I asked them to. Set it up today.", &o), "I asked them to set it up today.");
+        assert_eq!(clean("Build a simple a clean menu.", &o), "Build a simple, clean menu.");
+        // After the AI rewrite drops the stop, the capital still goes.
+        assert_eq!(
+            finish_layout("And I want you to Update the game graphics design."),
+            "And I want you to update the game graphics design."
+        );
+        for kept in [
+            "Talk to Daniel. Tell him the plan.",
+            "I want to. Paris is lovely.",
+            "I need you to. Visual Studio is open.",
+            "I have a dog. A big one.",
+            "Please send it to Daniel.",
+            "Go to Paris the city of light.",
+        ] {
+            assert_eq!(clean(kept, &o), kept);
+            assert_eq!(finish_layout(kept), kept);
+        }
+    }
+
+    #[test]
+    fn fragments_cut_off_by_pauses_are_put_back() {
+        let o = options();
+        // Dictated exactly like this.
+        assert_eq!(
+            clean(
+                "Expand the image using black. Color if possible. It should be YouTube resolutions. YouTube thumbnail resolution size.",
+                &o
+            ),
+            "Expand the image using black color if possible. It should be YouTube thumbnail resolution size."
+        );
+        for kept in [
+            "I love New York. New York pizza is great.",
+            "I love New York. New York pizza.",
+            "Use another app. Spotify if possible.",
+            "Send the report. The report is late.",
+            "Book the hotel. The hotel near the station.",
+            "It needs a border. Thin black lines.",
+        ] {
+            assert_eq!(clean(kept, &o), kept);
+        }
+    }
+
+    #[test]
+    fn restarted_clauses_numbers_and_pauses_mid_sentence_are_cleaned() {
+        let o = options();
+        // Dictated exactly like this.
+        assert_eq!(
+            clean(
+                "So the 3 minutes long will become. Around 6 5 to 6 minutes. Because if I just cut and put it at the end it will just sound l does not it wouldn't it will not sound like a loop.",
+                &o
+            ),
+            "So the 3 minutes long will become around 5 to 6 minutes. Because if I just cut and put it at the end it will not sound like a loop."
+        );
+        assert_eq!(clean("It will rain and it will snow.", &o), "It will rain and it will snow.");
+        for kept in [
+            "It is what it is.",
+            "I will send the report and I will send the slides.",
+            "We need 5 to 6 people.",
+            "Give me 2 4 to 6 inch boards.",
+            "Pick a number. Around noon works.",
+            "It became. The end.",
+        ] {
+            assert_eq!(clean(kept, &o), kept);
+        }
+    }
+
+    #[test]
+    fn a_spoken_file_name_a_drawn_out_um_and_a_repeated_and_are_cleaned() {
+        let o = options();
+        // Dictated exactly like this.
+        assert_eq!(
+            clean(
+                "Okay, now replace one of the Roblox character with the cyberpunk underscore or glb. Ummm And Also and for the Leo character, use the Twin Cannon Baggy Pants.",
+                &o
+            ),
+            "Okay, now replace one of the Roblox character with the cyberpunk_.glb. And also for the Leo character, use the Twin Cannon Baggy Pants."
+        );
+        assert_eq!(clean("Open config dot toml and my underscore model dot GLB.", &o), "Open config.toml and my_model.glb.");
+        assert_eq!(clean("Go to example dot com.", &o), "Go to example.com.");
+        for kept in [
+            "Save it as PNG or JPG.",
+            "Connect the dot to the line.",
+            "Ask Mr so and so about it.",
+            "Tell 'em it's done.",
+            "And also the music.",
+        ] {
+            assert_eq!(clean(kept, &o), kept);
+        }
+        for sound in ["um", "Ummm", "uhhm", "hmmm", "mm-hmm", "errm", "Mhm"] {
+            assert!(is_filler_sound(&sound.to_lowercase()), "{sound}");
+        }
+        for word in ["umbrella", "hum", "mum", "her", "em", "eh", "me", "uhuh"] {
+            assert!(!is_filler_sound(word), "{word}");
+        }
+    }
+
+    #[test]
+    fn a_start_given_up_with_never_mind_is_dropped() {
+        let o = options();
+        assert_eq!(
+            clean(
+                "I want you to create Never mind. Sorry. First, I want you to connect to the MCP and then revamp the animations.",
+                &o
+            ),
+            "First, I want you to connect to the MCP and then revamp the animations."
+        );
+        assert_eq!(
+            clean("Send it. Can you open the never mind, can you close the window?", &o),
+            "Send it. Can you close the window?"
+        );
+        assert_eq!(clean("Book a table for nevermind.", &o), "");
+        for kept in [
+            "Did you see the email? Never mind. I found it.",
+            "I never mind the noise.",
+            "Never mind the cost, ship it.",
+            "You would never mind.",
+            "Tell them to never mind, it's fine.",
+        ] {
+            assert_eq!(clean(kept, &o), kept);
+        }
     }
 
     #[test]
@@ -3998,6 +4961,27 @@ mod list_layout_tests {
 #[cfg(test)]
 mod dictated_list_tests {
     #[test]
+    fn small_words_lose_a_capital_left_over_from_a_pause() {
+        use super::finish_layout;
+        assert_eq!(
+            finish_layout("Can you increase the hover On hover time?"),
+            "Can you increase the hover on hover time?"
+        );
+        assert_eq!(finish_layout("I paused here, And then went on."), "I paused here, and then went on.");
+        // Sentence starts, names, titles and "I" keep their capitals.
+        for kept in [
+            "It works. On Monday we ship.",
+            "We read The Lord Of The Rings.",
+            "Open Spotify and play The Weeknd.",
+            "I think I can.",
+            "Plan A is fine.",
+            "Notes:\n- On Monday, ship it.",
+        ] {
+            assert_eq!(finish_layout(kept), kept);
+        }
+    }
+
+    #[test]
     fn a_counted_lead_in_makes_a_list_when_the_count_fits() {
         let bullets = "I need 3 things:\n- Milk\n- Eggs\n- Bread";
         for said in [
@@ -4174,5 +5158,3 @@ mod dictated_list_tests {
         assert!(!accept_rewrite(&rules, "Hi Sarah, Thanks for the update. I will review it today."));
     }
 }
-
-

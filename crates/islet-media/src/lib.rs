@@ -706,6 +706,16 @@ impl HiddenTab {
         format!("{}#{}", self.browser, self.tab)
     }
 
+    /// A player already on the island plays this tab's song: the browser
+    /// reports the tab after all (it first looked like something else), so
+    /// it is not shown twice.
+    fn shown_by(&self, players: &[MediaInfo]) -> bool {
+        let same = |a: &str, b: &str| !a.trim().is_empty() && a.trim().eq_ignore_ascii_case(b.trim());
+        players.iter().any(|player| {
+            MusicFilter::tab_names_track(&self.tab, &player.title) || same(&self.title, &player.title)
+        })
+    }
+
     fn info(&self) -> MediaInfo {
         MediaInfo {
             app_id: self.app_id(),
@@ -920,7 +930,7 @@ impl State {
 
     fn info(&self) -> Vec<MediaInfo> {
         let mut info: Vec<MediaInfo> = self.players.iter().filter_map(Player::info).collect();
-        if let Some(hidden) = &self.hidden {
+        if let Some(hidden) = self.hidden.as_ref().filter(|hidden| !hidden.shown_by(&info)) {
             // Playing now: it takes the main pill ahead of paused players.
             let place = if hidden.playing {
                 info.iter().position(|player| !player.playing).unwrap_or(info.len())
@@ -1393,6 +1403,36 @@ mod tests {
         assert_eq!(info.app_id, "308046B0AF4A39CB#YouTube Music");
         assert_eq!(info.source, "YouTube Music");
         assert!(info.playing && info.art.is_none() && info.duration == 0.0);
+    }
+
+    #[test]
+    fn a_tab_the_browser_already_reports_is_not_shown_twice() {
+        // The tab first looked like a video, so it was found as a hidden
+        // tab; then Firefox's own session was accepted as music.
+        let hidden = HiddenTab {
+            browser: "308046B0AF4A39CB".to_owned(),
+            tab: "Secondhand - Don Toliver - (feat. Rema) [Extended + Majestic Outro] | prod. codax - YouTube".to_owned(),
+            title: "Secondhand - Don Toliver - (feat. Rema) [Extended + Majestic Outro] | prod. codax".to_owned(),
+            artist: String::new(),
+            playing: true,
+            heard_at: std::time::Instant::now(),
+        };
+        let firefox = MediaInfo {
+            app_id: "308046B0AF4A39CB".to_owned(),
+            source: "Firefox".to_owned(),
+            title: "Secondhand - Don Toliver - (feat. Rema) [Extended + Majestic Outro] | prod. codax".to_owned(),
+            artist: "cactus nev".to_owned(),
+            playing: true,
+            position: 77.0,
+            duration: 384.0,
+            rate: 1.0,
+            art: None,
+            accent: None,
+        };
+        assert!(hidden.shown_by(std::slice::from_ref(&firefox)));
+        // A different song in the browser's session leaves the tab its own.
+        let other = MediaInfo { title: "Lucid Dreams".to_owned(), ..firefox };
+        assert!(!hidden.shown_by(&[other]));
     }
 
     #[test]
