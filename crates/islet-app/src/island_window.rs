@@ -112,6 +112,12 @@ const EMPTY_MARGIN_DP: f32 = 2.0;
 const OWN_EDGE_DP: f32 = 1.0;
 /// With the hot-CPU halo lit, the island's own glow reaches this far out.
 const OWN_GLOW_DP: f32 = 5.0;
+/// How far the window region reaches past the pill: its 1 dip outline is
+/// centred on the edge and its anti-aliasing adds about a pixel more.
+const REGION_EDGE_MARGIN_DP: f32 = 2.0;
+/// With the hot-CPU halo lit: its widest stroke (9 dips, centred on the edge)
+/// reaches 4.5 dips out, plus anti-aliasing.
+const REGION_GLOW_MARGIN_DP: f32 = 6.0;
 /// Window moves arrive in bursts (dragging); check what is behind after this.
 const OCCLUSION_DEBOUNCE_MS: u32 = 120;
 const WM_MOUSELEAVE: u32 = 0x02A3;
@@ -197,11 +203,14 @@ enum WindowRegion {
     Empty,
     /// While morphing: a box covering every shape the springs pass through.
     Box(Rect),
-    /// Once settled: the pill and bubble shapes.
+    /// Once settled: the pill and bubble shapes, grown by `margin` so the
+    /// region's hard pixel steps fall where the pill's anti-aliased edge (or
+    /// hot-CPU glow) has already faded out.
     Exact {
         main: Rect,
         main_corner: f32,
         bubble: Option<(Rect, f32)>,
+        margin: f32,
     },
 }
 
@@ -2301,6 +2310,10 @@ impl IslandHost {
             self.last_target = Some(target);
             self.last_target_anchor_top = Some(anchor_top);
             self.update_region();
+        } else {
+            // The same shape, but the hot-CPU glow may have lit or gone out,
+            // which changes how far past the pill the region must reach.
+            self.update_region();
         }
         let command = RenderCommand::Snapshot {
             target,
@@ -2405,6 +2418,11 @@ impl IslandHost {
                     bubble: frame
                         .bubble
                         .map(|bubble| (scale_rect(bubble, scale), frame.bubble_corner * scale)),
+                    margin: if self.state.cpu_hot {
+                        REGION_GLOW_MARGIN_DP
+                    } else {
+                        REGION_EDGE_MARGIN_DP
+                    } * scale,
                 },
             }
         };
@@ -3425,17 +3443,20 @@ fn scale_rect(rect: Rect, scale: f32) -> Rect {
     )
 }
 
-/// Builds a GDI region. Rounded shapes are grown by a pixel so the region
-/// never trims the pill's anti-aliased edge; the squircle lies inside a
+/// Builds a GDI region. GDI regions are aliased: wherever one cuts through
+/// drawn pixels it leaves a staircase. Rounded shapes are therefore grown by
+/// `margin` (the corner radius with them, keeping the offset even all round)
+/// so the cut falls on transparent pixels; the squircle lies inside a
 /// circular corner of the same radius.
 unsafe fn build_region(region: WindowRegion) -> HRGN {
-    let rounded = |rect: Rect, corner: f32| {
-        let diameter = (corner * 2.0).round() as i32 + 2;
+    let rounded = |rect: Rect, corner: f32, margin: f32| {
+        let grow = (margin.ceil() as i32).max(1);
+        let diameter = (corner * 2.0).round() as i32 + 2 * grow;
         CreateRoundRectRgn(
-            rect.x.floor() as i32 - 1,
-            rect.y.floor() as i32 - 1,
-            rect.right().ceil() as i32 + 2,
-            rect.bottom().ceil() as i32 + 2,
+            rect.x.floor() as i32 - grow,
+            rect.y.floor() as i32 - grow,
+            rect.right().ceil() as i32 + grow + 1,
+            rect.bottom().ceil() as i32 + grow + 1,
             diameter,
             diameter,
         )
@@ -3452,10 +3473,11 @@ unsafe fn build_region(region: WindowRegion) -> HRGN {
             main,
             main_corner,
             bubble,
+            margin,
         } => {
-            let combined = rounded(main, main_corner);
+            let combined = rounded(main, main_corner, margin);
             if let Some((bubble, corner)) = bubble {
-                let extra = rounded(bubble, corner);
+                let extra = rounded(bubble, corner, margin);
                 CombineRgn(Some(combined), Some(combined), Some(extra), RGN_OR);
                 let _ = DeleteObject(extra.into());
             }

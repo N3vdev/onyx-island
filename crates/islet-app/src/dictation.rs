@@ -1560,9 +1560,12 @@ mod tests {
         controller.offer_ai_cleanup();
         controller.offer_ai_cleanup();
         assert_eq!(offers(&rx), 1, "once, then not again within the hour");
-        controller.last_ai_offer = Some(Instant::now() - AI_OFFER_INTERVAL);
-        controller.offer_ai_cleanup();
-        assert_eq!(offers(&rx), 1);
+        // An Instant cannot go back past boot, so this needs an hour's uptime.
+        if let Some(an_hour_ago) = Instant::now().checked_sub(AI_OFFER_INTERVAL) {
+            controller.last_ai_offer = Some(an_hour_ago);
+            controller.offer_ai_cleanup();
+            assert_eq!(offers(&rx), 1);
+        }
     }
 
     #[test]
