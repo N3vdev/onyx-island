@@ -59,7 +59,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SWP_NOOWNERZORDER, SWP_NOZORDER, SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWNOACTIVATE,
     SW_SHOWNORMAL, WINDOWPOS, WM_APP, WM_APPCOMMAND, WM_CAPTURECHANGED, WM_CHAR, WM_DISPLAYCHANGE, WM_DPICHANGED,
     WM_ERASEBKGND, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCHITTEST, WM_SETTINGCHANGE, WM_TIMER, WM_WINDOWPOSCHANGING,
+    WM_HOTKEY, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCHITTEST, WM_SETTINGCHANGE, WM_TIMER, WM_WINDOWPOSCHANGING,
     WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -87,6 +87,24 @@ const TIMER_GESTURE: usize = 14;
 const TIMER_INTRO: usize = 15;
 /// The sleepy eyes shown as the night light comes on.
 const TIMER_NIGHT_GREETING: usize = 16;
+/// Shows the island to screen capture again after a lens press, if the lens
+/// has not reported by then.
+const TIMER_LENS_CAPTURE: usize = 17;
+/// The next reminder, or the focus timer's next second.
+const TIMER_TASKS: usize = 18;
+/// Scrolled lyrics go back to following the song.
+const TIMER_LYRICS_FOLLOW: usize = 19;
+/// While the island is the lens's toolbar: checks the lens is still running
+/// (it can be switched off or crash with its overlay open).
+const TIMER_LENS_ALIVE: usize = 21;
+/// How long scrolled lyrics stay put.
+const LYRICS_FOLLOW_MS: u32 = 4_000;
+/// Spotify search runs this long after typing pauses.
+const TIMER_SPOTIFY_SEARCH: usize = 20;
+const SPOTIFY_SEARCH_PAUSE_MS: u32 = 300;
+/// After search is closed with its button, the player it shrinks back to
+/// stays open this long though the pointer is now off it.
+const SEARCH_CLOSE_GRACE: f64 = 3.0;
 /// How long the night light's sleepy eyes stay (their animation's length).
 const NIGHT_GREETING_MS: u32 = 5_800;
 /// How long the startup greeting stays before the island moves on. Its
@@ -140,6 +158,9 @@ const WM_APP_NIGHT_LIGHT: u32 = islet_core::handoff::NIGHT_LIGHT_GREETING;
 const WM_APP_NIGHT_STATE: u32 = WM_APP + 32;
 /// Extra room around a morphing island's window region for spring overshoot.
 const REGION_MORPH_MARGIN_DP: f32 = 12.0;
+/// Room round the pill while it is dragged (it stretches with the pull),
+/// and while it sinks away after a swipe, still springing back.
+const GESTURE_REGION_MARGIN_DP: f32 = 140.0;
 
 /// Anchors are invisible child windows; only the settings root determines
 /// whether the live island belongs inside its preview.
@@ -234,6 +255,8 @@ enum RenderCommand {
         logical_height: f32,
     },
     Suspend(bool),
+    /// See-through, or black.
+    Glass(Option<islet_render::Glass>),
     Stop,
 }
 
@@ -253,6 +276,17 @@ pub struct IslandHost {
     preview: Option<HWND>,
     preview_pending: Option<Option<HWND>>,
     appearance: [f32; 4],
+    /// The see-through look, as last sent to the renderer.
+    glass: Option<islet_render::Glass>,
+    /// The to-do list, its reminders and the focus timer.
+    tasks: crate::tasks::Tasks,
+    /// The lyrics view is open (the island shows it when opened).
+    lyrics_open: bool,
+    /// Its lookups, made on first use.
+    lyrics: Option<crate::lyrics::Lyrics>,
+    /// Pixels the lyrics were scrolled by hand, and for which song.
+    lyrics_scroll: Option<f32>,
+    lyrics_song: Option<crate::lyrics::Song>,
     hwnd: HWND,
     shared: Arc<RwLock<Config>>,
     state: IslandState,
@@ -320,6 +354,21 @@ pub struct IslandHost {
     /// The AI dictation model is downloading (started from the island).
     ai_downloading: bool,
     night_light: Option<crate::night_light::NightLight>,
+    /// Bluetooth earbuds' comings and goings, while that setting is on.
+    bluetooth: Option<crate::bluetooth::Bluetooth>,
+    /// The playing apps' icons, for the music card's round button.
+    source_icons: Option<crate::source_icon::SourceIcons>,
+    /// Spotify's Web API, started once Spotify is in use.
+    spotify: Option<crate::spotify::Spotify>,
+    /// The Spotify setting.
+    spotify_enabled: bool,
+    /// Until when (island clock) the island does not close for the pointer
+    /// leaving: search, closed with its button, shrank from under it.
+    collapse_grace_until: Option<f64>,
+    /// Whether a Spotify key was saved, once looked at.
+    spotify_key_saved: Option<bool>,
+    /// The screen-search helper and its shortcut.
+    lens: Option<crate::lens::Lens>,
     loopback: Option<Loopback>,
     volume: Option<VolumeHandle>,
     real_bars: bool,
@@ -377,6 +426,7 @@ impl IslandHost {
             logical_width: WINDOW_LOGICAL_WIDTH,
             logical_height: layout.logical_height,
             anchor_top: layout.anchor_top,
+            glass: wants_glass(&config),
         };
         let render_hit = Arc::clone(&hit);
         let bars = Arc::new(BarLevels::default());
@@ -401,6 +451,12 @@ impl IslandHost {
             converter_generation: 0, converter_paths: Vec::new(), converter_outputs: Vec::new(),
             preview: None,
             preview_pending: None,
+            glass: wants_glass(&config),
+            tasks: crate::tasks::Tasks::new(crate::paths::Paths::discover().config_dir.join("tasks.toml")),
+            lyrics_open: false,
+            lyrics: None,
+            lyrics_scroll: None,
+            lyrics_song: None,
             appearance: [
                 config.general.top_margin_percent,
                 config.general.bottom_margin_percent,
@@ -462,6 +518,13 @@ impl IslandHost {
             dictation_rx,
             ai_downloading: false,
             night_light: None,
+            bluetooth: None,
+            source_icons: None,
+            spotify: None,
+            spotify_enabled: config.media.spotify,
+            collapse_grace_until: None,
+            spotify_key_saved: None,
+            lens: None,
             loopback: None,
             volume,
             real_bars: config.media.real_bars,
@@ -531,6 +594,10 @@ impl IslandHost {
                     }
                 }),
             ));
+            host.set_bluetooth(config.media.bluetooth);
+            let mut lens = crate::lens::Lens::new(HWND(hwnd as *mut _));
+            lens.configure(&config.lens);
+            host.lens = Some(lens);
         }
         // After the demo is set up: the demo never tucks.
         host.update_window_events();
@@ -565,6 +632,9 @@ impl IslandHost {
         self.dictation = None;
         // Puts the screens' colours back.
         self.night_light = None;
+        self.bluetooth = None;
+        self.spotify = None;
+        self.lens = None;
         self.loopback = None;
         self.media = None;
         self.poll_interval = None;
@@ -583,6 +653,7 @@ impl IslandHost {
         if let Some(drop)=&self.file_drop {
             drop.set_enabled(config.widgets.file_converter && !self.state.converter.as_ref().is_some_and(|c|c.stage==islet_core::converter::ConversionStage::Running));
         }
+        self.update_glass(&config);
         self.appearance = [
             config.general.top_margin_percent,
             config.general.bottom_margin_percent,
@@ -594,6 +665,12 @@ impl IslandHost {
         }
         if let Some(night_light) = &self.night_light {
             night_light.configure(&config.night_light);
+            // Live (not the demo): earbuds, as the setting says.
+            self.set_bluetooth(config.media.bluetooth);
+            self.spotify_enabled = config.media.spotify;
+        }
+        if let Some(lens) = &mut self.lens {
+            lens.configure(&config.lens);
         }
         self.anchor_top = config.general.position.home_is_top();
         self.hide_in_fullscreen = config.general.hide_in_fullscreen;
@@ -604,6 +681,8 @@ impl IslandHost {
             self.stats_sampler = needs_sampler(&config).then(crate::sysstats::Sampler::new);
         }
         self.dispatch(IslandEvent::SetStatsEnabled(config.widgets.system_stats));
+        self.tasks.configure(&config.widgets);
+        self.refresh_tasks();
         self.state.corner = config.general.corner;
         self.dispatch(IslandEvent::SetGlance(
             config.general.always_on.then_some(config.general.glance),
@@ -673,6 +752,31 @@ impl IslandHost {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> Option<LRESULT> {
+        if message == crate::lens::tools_message() {
+            self.on_lens_report(wparam, lparam);
+            return Some(LRESULT(0));
+        }
+        if message == spotify_message() {
+            // From Settings: 1 connects, 0 disconnects; anything else is
+            // not Settings.
+            if wparam.0 > 1 {
+                return Some(LRESULT(0));
+            }
+            let dir = crate::paths::Paths::discover().config_dir;
+            let hwnd = self.hwnd;
+            let spotify = self.spotify.get_or_insert_with(|| crate::spotify::Spotify::start(hwnd, dir));
+            if wparam.0 == 1 {
+                spotify.connect();
+            } else {
+                spotify.disconnect();
+            }
+            return Some(LRESULT(0));
+        }
+        if message == crate::tasks::changed_message() {
+            self.tasks.reload();
+            self.refresh_tasks();
+            return Some(LRESULT(0));
+        }
         match message {
             windows::Win32::UI::WindowsAndMessaging::WM_CONTEXTMENU => {
                 unsafe {
@@ -771,6 +875,27 @@ impl IslandHost {
                 Some(LRESULT(0))
             }
             WM_NCHITTEST => Some(self.hit_test(lparam)),
+            WM_HOTKEY if wparam.0 == crate::lens::HOTKEY_ID as usize => {
+                // Tell the lens, before it captures, whether the island can
+                // be its toolbar. Not while it sits in Settings' live preview
+                // (the tools would go there, under the frozen screen) or is
+                // hidden: then the lens keeps its own toolbar.
+                let toolbar = self.preview.is_none() && self.preview_pending.is_none() && !self.fullscreen_hidden;
+                unsafe {
+                    if toolbar {
+                        let _ = SetPropW(self.hwnd, w!("OnyxLensToolbar"), Some(HANDLE(std::ptr::without_provenance_mut(1))));
+                    } else {
+                        let _ = RemovePropW(self.hwnd, w!("OnyxLensToolbar"));
+                    }
+                }
+                if let Some(lens) = &mut self.lens {
+                    lens.on_hotkey();
+                    unsafe {
+                        SetTimer(Some(self.hwnd), TIMER_LENS_CAPTURE, 1500, None);
+                    }
+                }
+                Some(LRESULT(0))
+            }
             crate::file_drop::MESSAGE => { self.on_file_drop(); Some(LRESULT(0)) }
             crate::converter::MESSAGE => { self.on_converter_update(); Some(LRESULT(0)) }
             WM_MOUSEMOVE if self.gesture.is_some() => {
@@ -795,6 +920,11 @@ impl IslandHost {
                 self.track_mouse();
                 self.dispatch_hover(self.cursor_inside());
                 self.update_media_hover();
+                Some(LRESULT(0))
+            }
+            WM_MOUSEWHEEL if self.state.lyrics_visible() => {
+                let delta = ((wparam.0 >> 16) as u16 as i16) as f32;
+                self.scroll_lyrics(-delta / 120.0 * 44.0);
                 Some(LRESULT(0))
             }
             WM_MOUSEWHEEL => {
@@ -873,8 +1003,12 @@ impl IslandHost {
                     self.finish_volume();
                 } else if !armed || !self.shape_settled() {
                     // Pressed or released mid-animation: not a click.
+                } else if self.handle_lens_click(lparam) {
+                    // A tool on the lens toolbar, or the toolbar around it.
                 } else if self.handle_notice_click(lparam) {
                     // The opened notice's button (Download).
+                } else if self.handle_lyrics_click(lparam) {
+                    // A button or a line on the lyrics view.
                 } else if self.handle_converter_click(lparam) || self.handle_widget_click(lparam) {
                     // Widget controls never toggle or operate the music player.
                 } else if self.media_bubble_hit(lparam) {
@@ -889,8 +1023,47 @@ impl IslandHost {
                     self.click_island();
                 }
                 self.focus_calculator();
+                if self.state.tasks_visible() {
+                    self.push_tasks();
+                }
                 Some(LRESULT(0))
             }
+            WM_CHAR if self.state.search_visible() && self.calculator_keyboard_active() => {
+                match char::from_u32(wparam.0 as u32) {
+                    Some('\r') => self.run_search(),
+                    Some('\u{1b}') => self.close_search(),
+                    // Ctrl+V.
+                    Some('\u{16}') => {
+                        if let Some(text) = clipboard_text() {
+                            self.edit_search(|card| text.chars().filter(|c| !c.is_control()).fold(false, |changed, c| card.type_char(c) | changed));
+                        }
+                    }
+                    Some(c) => {
+                        let repeats = (lparam.0 as u16).clamp(1, 64);
+                        self.edit_search(|card| (0..repeats).fold(false, |changed, _| card.type_char(c) | changed));
+                    }
+                    None => {}
+                }
+                Some(LRESULT(0))
+            }
+            WM_KEYDOWN if self.state.search_visible() && self.calculator_keyboard_active() => None,
+            WM_CHAR if self.state.tasks_visible() && self.calculator_keyboard_active() => {
+                let typed = match char::from_u32(wparam.0 as u32) {
+                    // Ctrl+V.
+                    Some('\u{16}') => clipboard_text().is_some_and(|text| self.tasks.paste(&text)),
+                    Some(c) => {
+                        let repeats = (lparam.0 as u16).clamp(1, 64);
+                        (0..repeats).fold(false, |changed, _| self.tasks.type_char(c) | changed)
+                    }
+                    None => false,
+                };
+                if typed {
+                    self.refresh_tasks();
+                }
+                Some(LRESULT(0))
+            }
+            // Keys become characters (Esc, Enter, Backspace) above.
+            WM_KEYDOWN if self.state.tasks_visible() && self.calculator_keyboard_active() => None,
             WM_CHAR if self.converter_visible() && self.calculator_keyboard_active() => Some(LRESULT(0)),
             WM_KEYDOWN if self.converter_visible() && self.calculator_keyboard_active() => {
                 self.handle_converter_key(wparam.0 as u16).then_some(LRESULT(0))
@@ -925,6 +1098,12 @@ impl IslandHost {
             WM_KILLFOCUS => {
                 // Another app was deliberately selected: never reclaim focus.
                 self.calculator_return_focus = None;
+                // The tasks page stops showing its typing caret.
+                self.push_tasks();
+                None
+            }
+            windows::Win32::UI::WindowsAndMessaging::WM_SETFOCUS => {
+                self.push_tasks();
                 None
             }
             WM_CAPTURECHANGED => {
@@ -954,6 +1133,25 @@ impl IslandHost {
                 }
                 Some(LRESULT(0))
             }
+            crate::source_icon::WM_APP_SOURCE_ICON => {
+                let ready = self.source_icons.as_ref().map(crate::source_icon::SourceIcons::take).unwrap_or_default();
+                self.dispatch_all(ready.into_iter().map(|(source, icon)| IslandEvent::SetSourceIcon(source, icon)));
+                Some(LRESULT(0))
+            }
+            crate::spotify::WM_APP_SPOTIFY => {
+                self.on_spotify();
+                Some(LRESULT(0))
+            }
+            crate::bluetooth::WM_APP_BLUETOOTH => {
+                self.on_bluetooth();
+                Some(LRESULT(0))
+            }
+            crate::lyrics::WM_APP_LYRICS => {
+                if self.sync_lyrics() | self.sync_lyrics_found() {
+                    self.send_snapshot();
+                }
+                Some(LRESULT(0))
+            }
             WM_APP_NIGHT_STATE => {
                 self.dispatch(IslandEvent::SetNightLight(wparam.0 != 0));
                 Some(LRESULT(0))
@@ -974,6 +1172,7 @@ impl IslandHost {
                 while let Ok(update) = self.dictation_rx.try_recv() {
                     match update {
                         UiUpdate::PauseMedia => islet_media::pause_playing_media(),
+                        UiUpdate::ResumeMedia => islet_media::resume_paused_media(),
                         UiUpdate::Card(card) => {
                             let starting = card.is_some() && self.state.dictation.is_none();
                             self.dispatch(IslandEvent::SetDictation(card));
@@ -990,6 +1189,7 @@ impl IslandHost {
                         }
                         UiUpdate::Media(verb) => self.voice_media(verb),
                         UiUpdate::AiDownload(update) => self.ai_download_update(update),
+                        UiUpdate::AddTask(text) => self.add_spoken_task(&text),
                     }
                 }
                 Some(LRESULT(0))
@@ -1066,6 +1266,12 @@ impl IslandHost {
                 Some(LRESULT(0))
             }
             WM_DPICHANGED | WM_DISPLAYCHANGE | WM_SETTINGCHANGE => {
+                if message == WM_SETTINGCHANGE {
+                    // Transparency effects (the frost) may have been turned
+                    // on or off.
+                    let config = read_config(&self.shared);
+                    self.update_glass(&config);
+                }
                 if let Err(error) = self.reposition() {
                     tracing::warn!(%error, "could not reposition island window");
                 }
@@ -1079,6 +1285,103 @@ impl IslandHost {
         self.dispatch_all([event]);
     }
 
+    /// Shows the list as it is now and sets the timer for what comes next.
+    fn refresh_tasks(&mut self) {
+        self.push_tasks();
+        unsafe {
+            match self.tasks.next_wake() {
+                Some(wait) => {
+                    SetTimer(Some(self.hwnd), TIMER_TASKS, wait.as_millis().clamp(10, 60_000) as u32, None);
+                }
+                None => {
+                    let _ = KillTimer(Some(self.hwnd), TIMER_TASKS);
+                }
+            }
+        }
+    }
+
+    /// "Remind me to…" said to the assistant.
+    fn add_spoken_task(&mut self, text: &str) {
+        let (title, body) = if !self.tasks.enabled {
+            ("To-do list is off".to_owned(), "Turn it on in Onyx Settings, To-do.".to_owned())
+        } else {
+            // What was being typed in the to-do input stays there.
+            let typed = std::mem::replace(&mut self.tasks.draft, text.to_owned());
+            let added = self.tasks.add_draft_described();
+            self.tasks.draft = typed;
+            match added {
+                Some((task, when)) => (
+                    task,
+                    when.map_or_else(|| "Added to your to-do list".to_owned(), |when| format!("Reminder {when}")),
+                ),
+                None => ("Nothing to add".to_owned(), "Say the task after \u{201c}remind me to\u{201d}.".to_owned()),
+            }
+        };
+        self.dispatch(IslandEvent::SetDone(Some(NotificationCard {
+            source: String::new(),
+            title,
+            body,
+            level: AlertLevel::Success,
+            icon: None,
+            action: None,
+            progress: None,
+            device: None,
+        })));
+        self.refresh_tasks();
+    }
+
+    fn push_tasks(&mut self) {
+        let typing = self.state.tasks_visible() && self.calculator_keyboard_active();
+        let card = self.tasks.enabled.then(|| self.tasks.card(typing));
+        self.dispatch(IslandEvent::SetTasks(card));
+    }
+
+    fn on_tasks_timer(&mut self) {
+        for happening in self.tasks.tick() {
+            let (title, body, action) = match happening {
+                crate::tasks::Happening::Reminder(id, text) => {
+                    (text, "Reminder".to_owned(), islet_core::island::NoticeAction::TaskDone(id))
+                }
+                crate::tasks::Happening::FocusEnded => (
+                    "Focus session done".to_owned(),
+                    format!("Take a {}-minute break.", self.tasks.break_minutes()),
+                    islet_core::island::NoticeAction::StartBreak,
+                ),
+                crate::tasks::Happening::BreakEnded => (
+                    "Break's over".to_owned(),
+                    format!("Ready for {} more minutes?", self.tasks.focus_minutes()),
+                    islet_core::island::NoticeAction::StartFocus,
+                ),
+            };
+            if self.tasks.sound {
+                unsafe {
+                    let _ = windows::Win32::System::Diagnostics::Debug::MessageBeep(
+                        windows::Win32::UI::WindowsAndMessaging::MB_ICONASTERISK,
+                    );
+                }
+            }
+            self.dispatch(IslandEvent::SetDone(Some(NotificationCard {
+                source: String::new(),
+                title,
+                body,
+                level: AlertLevel::Info,
+                icon: None,
+                action: Some(action),
+                progress: None,
+                device: None,
+            })));
+        }
+        self.refresh_tasks();
+    }
+
+    fn update_glass(&mut self, config: &Config) {
+        let glass = wants_glass(config);
+        if glass != self.glass {
+            self.glass = glass;
+            let _ = self.tx.send(RenderCommand::Glass(glass));
+        }
+    }
+
     /// Applies several events as one change, so the renderer gets a single
     /// snapshot (two players swapping places is one move, not two).
     fn dispatch_all(&mut self, events: impl IntoIterator<Item = IslandEvent>) {
@@ -1086,6 +1389,10 @@ impl IslandHost {
         for event in events {
             changed |= self.reduce_one(event);
         }
+        changed |= self.sync_lyrics();
+        changed |= self.sync_lyrics_found();
+        changed |= self.sync_spotify_pill();
+        self.want_source_icons();
         if changed {
             self.send_snapshot();
         }
@@ -1413,6 +1720,11 @@ impl IslandHost {
             accent: info.accent,
             scrub: None,
             volume: None,
+            device: None,
+            source_icon: None,
+            lyrics: false,
+            spotify: Default::default(),
+            skips: Default::default(),
         };
         let next = crate::last_music::Remembered::from_live(&info.app_id, &card);
         if self.remembered.as_ref().is_some_and(|known| known.same_as(&next)) {
@@ -1521,6 +1833,11 @@ impl IslandHost {
             accent: info.accent.filter(|_| self.color_tint),
             scrub: None,
             volume: None,
+            device: None,
+            source_icon: None,
+            lyrics: false,
+            spotify: Default::default(),
+            skips: info.skips,
         };
         vec![
             IslandEvent::SetOtherMedia(other.map(card)),
@@ -1576,6 +1893,8 @@ impl IslandHost {
     /// button: resting on it keeps the island as it is instead of expanding.
     fn dispatch_hover(&mut self, inside: bool) {
         if self.gesture.is_some() { return; }
+        // The lens toolbar is a row of buttons: resting on it opens nothing.
+        let inside = inside && self.state.lens.is_none();
         if inside {
             let on_switcher = self.cursor_on_media_bubble();
             self.dispatch_all([
@@ -1675,8 +1994,105 @@ impl IslandHost {
         ))
     }
 
+    /// A point on the lens toolbar, in its own logical pixels.
+    fn lens_point(&self, point: POINT) -> Option<(f32, f32)> {
+        if self.state.lens.is_none() || self.traveling || self.fullscreen_hidden {
+            return None;
+        }
+        let top = self.effective_anchor_top();
+        // Two rows are taller than a compact pill, so the island's size
+        // setting scales them like any opened card.
+        let layout = self.customized_layout(self.state.layout(), top);
+        let main = self.target_frame(layout, top).main;
+        let dpi = self.dpi as f32 / 96.0;
+        let (x, y) = (point.x as f32 / dpi, point.y as f32 / dpi);
+        main.contains(x, y).then_some((
+            (x - main.x) / layout.content_scale,
+            (y - main.y) / layout.content_scale,
+        ))
+    }
+
+    /// Onyx Lens opened, changed its tools, or closed.
+    fn on_lens_report(&mut self, wparam: WPARAM, lparam: LPARAM) {
+        let thread = lparam.0 as u32;
+        // Only the lens's own reports: any app can post this message.
+        let Some(lens) = self.lens.as_mut().filter(|lens| lens.owns_thread(thread)) else {
+            return;
+        };
+        lens.on_report(thread);
+        let mut card = islet_core::lens::unpack(wparam.0);
+        if self.preview.is_some() || self.preview_pending.is_some() {
+            // In Settings' preview the island is no toolbar (see WM_HOTKEY).
+            card = None;
+        }
+        if card.is_some() && self.state.lens.is_none() {
+            tracing::info!("lens opened: the island is its toolbar");
+            // Above the lens's overlay, which opened after the island.
+            unsafe {
+                let _ = SetWindowPos(
+                    self.hwnd,
+                    Some(HWND_TOPMOST),
+                    0,
+                    0,
+                    0,
+                    0,
+                    windows::Win32::UI::WindowsAndMessaging::SWP_NOMOVE
+                        | windows::Win32::UI::WindowsAndMessaging::SWP_NOSIZE
+                        | SWP_NOACTIVATE,
+                );
+            }
+        }
+        self.set_lens_card(card);
+    }
+
+    fn set_lens_card(&mut self, card: Option<islet_core::lens::LensCard>) {
+        if card.is_some() != self.state.lens.is_some() {
+            // Opens from, and closes to, the resting pill.
+            self.dispatch_hover(false);
+        }
+        // SAFETY: the island's own window and timer, from its thread.
+        unsafe {
+            if card.is_some() {
+                SetTimer(Some(self.hwnd), TIMER_LENS_ALIVE, 1_000, None);
+            } else {
+                let _ = KillTimer(Some(self.hwnd), TIMER_LENS_ALIVE);
+            }
+        }
+        self.dispatch(IslandEvent::SetLens(card));
+        self.update_fullscreen();
+        self.update_widget_hover();
+    }
+
+    /// Clicks anywhere on the lens toolbar stay on it; a button's goes to
+    /// the lens.
+    fn handle_lens_click(&mut self, lparam: LPARAM) -> bool {
+        let Some(card) = self.state.lens else {
+            return false;
+        };
+        let Some((x, y)) = self.lens_point(point_from_lparam(lparam)) else {
+            return false;
+        };
+        if let (Some(index), Some(lens)) = (card.item_at(x, y).and_then(|item| item.index()), &self.lens) {
+            lens.send_tool(index);
+        }
+        true
+    }
+
     fn widget_hover_at(&self, point: POINT) -> Option<WidgetHover> {
+        if let Some(card) = self.state.lens {
+            let (x, y) = self.lens_point(point)?;
+            return card.item_at(x, y).map(WidgetHover::Lens);
+        }
         let (x, y) = self.widget_point(point)?;
+        if let Some(islet_core::ContentCard::Tasks(card)) = self.state.primary_card().filter(|_| self.state.expanded) {
+            return card.item_at(x, y).map(WidgetHover::Task);
+        }
+        if let Some(card) = self.state.search.as_ref().filter(|_| self.state.search_visible()) {
+            return card.item_at(x, y).map(WidgetHover::Search);
+        }
+        if let Some(card) = self.state.lyrics.as_ref().filter(|_| self.state.lyrics_visible()) {
+            return card.item_at(x, y, clock_now()).map(WidgetHover::Lyrics);
+        }
         let calculator = matches!(
             self.state.primary_card(),
             Some(islet_core::ContentCard::Calculator(_))
@@ -1695,7 +2111,12 @@ impl IslandHost {
             && self.preview_pending.is_none()
             && matches!(
                 self.state.primary_card(),
-                Some(islet_core::ContentCard::Calculator(_) | islet_core::ContentCard::Converter(_))
+                Some(
+                    islet_core::ContentCard::Calculator(_)
+                        | islet_core::ContentCard::Converter(_)
+                        | islet_core::ContentCard::Tasks(_)
+                        | islet_core::ContentCard::Search(_)
+                )
             )
     }
 
@@ -1788,6 +2209,22 @@ impl IslandHost {
                 self.start_ai_download();
                 true
             }
+            Some(NoticeAction::TaskDone(id)) => {
+                self.tasks.complete(id);
+                self.dispatch(IslandEvent::SetDone(None));
+                self.refresh_tasks();
+                true
+            }
+            Some(action @ (NoticeAction::StartBreak | NoticeAction::StartFocus)) => {
+                self.tasks.start(if action == NoticeAction::StartBreak {
+                    islet_core::tasks::FocusPhase::Break
+                } else {
+                    islet_core::tasks::FocusPhase::Focus
+                });
+                self.dispatch(IslandEvent::SetDone(None));
+                self.refresh_tasks();
+                true
+            }
             None => false,
         }
     }
@@ -1850,6 +2287,7 @@ impl IslandHost {
                 icon: None,
                 action: None,
                 progress: Some(if total == 0 { 0.0 } else { done as f32 / total as f32 }),
+                device: None,
             },
             AiDownload::Finished(Ok(())) => {
                 self.ai_downloading = false;
@@ -1861,6 +2299,7 @@ impl IslandHost {
                     icon: None,
                     action: None,
                     progress: None,
+                    device: None,
                 }
             }
             AiDownload::Finished(Err(error)) => {
@@ -1873,6 +2312,7 @@ impl IslandHost {
                     icon: None,
                     action: Some(NoticeAction::DownloadAiCleanup),
                     progress: None,
+                    device: None,
                 }
             }
         };
@@ -1886,11 +2326,34 @@ impl IslandHost {
                 self.dispatch(IslandEvent::CalculatorKey(key));
                 true
             }
+            // Handled by `handle_lens_click` and `handle_lyrics_click`,
+            // which run first.
+            Some(WidgetHover::Lens(_) | WidgetHover::Lyrics(_)) => false,
+            Some(WidgetHover::Search(item)) => {
+                match item {
+                    islet_core::spotify::SearchItem::Close => {
+                        // The player is much smaller than search: the
+                        // pointer ends up off it. Give it a moment.
+                        self.collapse_grace_until = Some(clock_now() + SEARCH_CLOSE_GRACE);
+                        self.close_search();
+                    }
+                    islet_core::spotify::SearchItem::Field => self.focus_calculator(),
+                    islet_core::spotify::SearchItem::Result(index) => self.play_result(index),
+                }
+                self.update_widget_hover();
+                true
+            }
+            Some(WidgetHover::Task(item)) => {
+                self.tasks.click(item);
+                self.refresh_tasks();
+                self.update_widget_hover();
+                true
+            }
             None => {
                 self.widget_point(point).is_some()
                     && matches!(
                         self.state.primary_card(),
-                        Some(islet_core::ContentCard::Calculator(_))
+                        Some(islet_core::ContentCard::Calculator(_) | islet_core::ContentCard::Tasks(_))
                     )
             }
         }
@@ -1942,6 +2405,11 @@ impl IslandHost {
                         media.volume.is_some(),
                         !media.source.is_empty(),
                     )
+                    // No lyrics, no button.
+                    .filter(|hover| *hover != MediaHover::Lyrics || media.lyrics)
+                    .filter(|hover| *hover != MediaHover::Previous || media.skips.previous)
+                    .filter(|hover| *hover != MediaHover::Next || media.skips.next)
+                    .filter(|hover| *hover != MediaHover::Spotify || media.spotify != islet_core::spotify::SpotifyPill::Hidden)
                 }
                 _ => None,
             }
@@ -2047,8 +2515,26 @@ impl IslandHost {
     /// Sends a transport command and updates the card optimistically, so
     /// the island reacts before the app reports back.
     fn media_action(&mut self, action: MediaAction) {
+        if action == MediaAction::Spotify {
+            self.spotify_pill_clicked();
+            return;
+        }
+        if action == MediaAction::Lyrics {
+            let found = matches!(self.state.primary_card(), Some(islet_core::ContentCard::Media(media)) if media.lyrics);
+            if found && self.state.media.is_some() {
+                self.lyrics_open = true;
+                self.lyrics_scroll = None;
+                self.set_media_hover(None);
+                self.dispatch_all([]);
+            }
+            return;
+        }
         if action == MediaAction::OpenApp {
             self.open_current_media_app();
+            return;
+        }
+        let skips = self.state.media.as_ref().map(|media| media.skips).unwrap_or_default();
+        if (action == MediaAction::Previous && !skips.previous) || (action == MediaAction::Next && !skips.next) {
             return;
         }
         let Some(mut media) = self.state.media.clone() else {
@@ -2076,13 +2562,374 @@ impl IslandHost {
                 timeline.sampled_at = now;
                 MediaCommand::Seek(timeline.position)
             }
-            MediaAction::OpenApp => unreachable!(),
+            MediaAction::OpenApp | MediaAction::Lyrics | MediaAction::Spotify => unreachable!(),
         };
         media.scrub = None;
         if let (Some(service), Some(info)) = (&self.media, self.focused_media()) {
             service.send(&info.app_id, command);
         }
         self.dispatch(IslandEvent::SetMedia(Some(media)));
+    }
+
+    /// Asks once for the icon of each app that plays (and the remembered
+    /// one), for the music card's round button.
+    fn want_source_icons(&mut self) {
+        if self.demo.is_some() {
+            return;
+        }
+        let hwnd = self.hwnd;
+        let icons = self.source_icons.get_or_insert_with(|| crate::source_icon::SourceIcons::new(hwnd));
+        for info in &self.last_media {
+            icons.want(&info.source, &info.app_id);
+        }
+        if let Some(remembered) = &self.remembered {
+            icons.want(&remembered.card.source, &remembered.app_id);
+        }
+    }
+
+    fn set_bluetooth(&mut self, on: bool) {
+        if on == self.bluetooth.is_some() {
+            return;
+        }
+        self.bluetooth = on.then(|| crate::bluetooth::Bluetooth::start(self.hwnd));
+        if !on {
+            self.dispatch(IslandEvent::SetAudioDevice(None));
+        }
+    }
+
+    /// Earbuds connected, left or ran low: a notice with their battery.
+    fn on_bluetooth(&mut self) {
+        use crate::bluetooth::News;
+        let Some(bluetooth) = &self.bluetooth else { return };
+        let (news, current) = bluetooth.take();
+        let mut events = vec![IslandEvent::SetAudioDevice(current)];
+        // Only the latest says anything (a quick reconnect is one notice).
+        if let Some(last) = news.into_iter().last() {
+            let (name, body, badge) = match last {
+                News::Connected { name, badge } => (name, "Connected".to_owned(), badge),
+                News::Disconnected { name, badge } => (name, "Disconnected".to_owned(), badge),
+                News::Low { name, badge } => {
+                    let body = format!("Battery low \u{b7} {}%", badge.battery.unwrap_or(0));
+                    (name, body, badge)
+                }
+            };
+            events.push(IslandEvent::SetDone(Some(NotificationCard {
+                source: String::new(),
+                title: name,
+                body,
+                level: islet_core::island::AlertLevel::Info,
+                icon: None,
+                action: None,
+                progress: None,
+                device: Some(badge),
+            })));
+        }
+        self.dispatch_all(events);
+    }
+
+    /// What the music card's Spotify pill offers: connecting while
+    /// Spotify plays and Onyx is not connected, search once connected with
+    /// Premium, nothing for a free account. Spotify's worker starts the
+    /// first time Spotify plays, or a saved sign-in has music to search.
+    fn sync_spotify_pill(&mut self) -> bool {
+        use islet_core::spotify::SpotifyPill;
+        if !self.spotify_enabled || self.demo.is_some() {
+            return self.state.spotify_pill != SpotifyPill::Hidden
+                && self.reduce_one(IslandEvent::SetSpotifyPill(SpotifyPill::Hidden));
+        }
+        let spotify_plays = self.last_media.iter().any(|info| info.source == "Spotify");
+        if self.spotify.is_none() && self.state.media.is_some() {
+            // The disk is asked once, not on every event: a key is only
+            // saved by a sign-in, which needs the worker running.
+            let saved = *self.spotify_key_saved.get_or_insert_with(|| {
+                crate::spotify::Spotify::saved(&crate::paths::Paths::discover().config_dir)
+            });
+            if spotify_plays || saved {
+                let dir = crate::paths::Paths::discover().config_dir;
+                self.spotify = Some(crate::spotify::Spotify::start(self.hwnd, dir));
+            }
+        }
+        let pill = match self.spotify.as_ref().map(crate::spotify::Spotify::account) {
+            Some(crate::spotify::Account::Premium) => SpotifyPill::Search,
+            Some(crate::spotify::Account::Disconnected | crate::spotify::Account::Connecting) => SpotifyPill::Connect,
+            _ => SpotifyPill::Hidden,
+        };
+        self.state.spotify_pill != pill && self.reduce_one(IslandEvent::SetSpotifyPill(pill))
+    }
+
+    fn spotify_pill_clicked(&mut self) {
+        use islet_core::spotify::SpotifyPill;
+        match self.state.spotify_pill {
+            SpotifyPill::Search => self.open_search(),
+            SpotifyPill::Connect => {
+                let Some(spotify) = &self.spotify else { return };
+                // A second click while waiting opens the sign-in page again.
+                spotify.connect();
+                self.notify("Connect Spotify", "Finish signing in in your browser");
+            }
+            SpotifyPill::Hidden => {}
+        }
+    }
+
+    fn notify(&mut self, title: &str, body: &str) {
+        self.dispatch(IslandEvent::SetDone(Some(NotificationCard {
+            source: String::new(),
+            title: title.to_owned(),
+            body: body.to_owned(),
+            level: islet_core::island::AlertLevel::Info,
+            icon: None,
+            action: None,
+            progress: None,
+            device: None,
+        })));
+    }
+
+    fn open_search(&mut self) {
+        if self.state.spotify_pill != islet_core::spotify::SpotifyPill::Search {
+            return;
+        }
+        let card = self.state.search.clone().unwrap_or_default();
+        self.set_media_hover(None);
+        self.set_widget_hover(None);
+        self.dispatch(IslandEvent::SetSearch(Some(islet_core::spotify::SearchCard { typing: true, ..card })));
+        self.focus_calculator();
+    }
+
+    fn close_search(&mut self) {
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), TIMER_SPOTIFY_SEARCH);
+        }
+        self.set_widget_hover(None);
+        self.dispatch(IslandEvent::SetSearch(None));
+        self.update_media_hover();
+    }
+
+    /// Changes the query; the search runs once typing pauses.
+    fn edit_search(&mut self, change: impl FnOnce(&mut islet_core::spotify::SearchCard) -> bool) {
+        use islet_core::spotify::SearchStatus;
+        let Some(mut card) = self.state.search.clone() else { return };
+        if !change(&mut card) {
+            return;
+        }
+        let empty = card.query.trim().is_empty();
+        card.status = if empty { SearchStatus::Empty } else { SearchStatus::Searching };
+        if empty {
+            card.results.clear();
+        }
+        card.starting = None;
+        self.dispatch(IslandEvent::SetSearch(Some(card)));
+        unsafe {
+            if empty {
+                let _ = KillTimer(Some(self.hwnd), TIMER_SPOTIFY_SEARCH);
+            } else {
+                SetTimer(Some(self.hwnd), TIMER_SPOTIFY_SEARCH, SPOTIFY_SEARCH_PAUSE_MS, None);
+            }
+        }
+    }
+
+    fn run_search(&mut self) {
+        let Some(card) = &self.state.search else { return };
+        let query = card.query.trim().to_owned();
+        if let (Some(spotify), false) = (&self.spotify, query.is_empty()) {
+            spotify.search(&query);
+        }
+    }
+
+    fn play_result(&mut self, index: usize) {
+        let Some(mut card) = self.state.search.clone() else { return };
+        let Some(result) = card.results.get(index) else { return };
+        if let Some(spotify) = &self.spotify {
+            spotify.play(&result.uri);
+        }
+        card.starting = Some(index);
+        self.dispatch(IslandEvent::SetSearch(Some(card)));
+    }
+
+    /// Spotify's news: sign-in, results and covers, a song started.
+    fn on_spotify(&mut self) {
+        use crate::spotify::News;
+        use islet_core::spotify::SearchStatus;
+        let news = self.spotify.as_ref().map(crate::spotify::Spotify::take).unwrap_or_default();
+        for item in news {
+            match item {
+                News::Connected { premium: true } => self.notify("Spotify connected", "Search and play from the music card"),
+                News::Connected { premium: false } => {
+                    self.notify("Spotify connected", "Playing from Onyx needs Premium");
+                }
+                News::ConnectFailed(why) => self.notify("Spotify wasn't connected", why),
+                News::Results { query, results } => {
+                    let Some(mut card) = self.state.search.clone().filter(|card| card.query.trim() == query) else { continue };
+                    card.status = if results.is_empty() { SearchStatus::NoResults } else { SearchStatus::Results };
+                    card.results = results;
+                    card.starting = None;
+                    self.dispatch(IslandEvent::SetSearch(Some(card)));
+                }
+                News::SearchFailed { query } => {
+                    let Some(mut card) = self.state.search.clone().filter(|card| card.query.trim() == query) else { continue };
+                    card.status = SearchStatus::Failed;
+                    self.dispatch(IslandEvent::SetSearch(Some(card)));
+                }
+                News::Art { uri, art } => {
+                    let Some(mut card) = self.state.search.clone() else { continue };
+                    for result in card.results.iter_mut().filter(|result| result.uri == uri) {
+                        result.art = Some(art.clone());
+                    }
+                    self.dispatch(IslandEvent::SetSearch(Some(card)));
+                }
+                News::Played { uri } => {
+                    // Back to the player, which shows the song as it starts.
+                    if self.state.search.as_ref().is_some_and(|card| card.results.iter().any(|result| result.uri == uri)) {
+                        self.close_search();
+                    }
+                }
+                News::PlayFailed { why, .. } => {
+                    if let Some(mut card) = self.state.search.clone() {
+                        card.starting = None;
+                        self.dispatch(IslandEvent::SetSearch(Some(card)));
+                    }
+                    self.notify("Couldn't play that", why);
+                }
+            }
+        }
+        // The account may have changed (connected, signed out).
+        self.dispatch_all([]);
+    }
+
+    /// Looks the playing song's lyrics up as it starts (the answer is kept
+    /// for the view), so the lyrics button shows only when there are some.
+    fn sync_lyrics_found(&mut self) -> bool {
+        use islet_core::lyrics::LyricsBody;
+        let found = match (self.state.media.as_ref(), self.demo.is_some()) {
+            (Some(media), false) if !media.title.is_empty() => {
+                let song = crate::lyrics::Song { title: media.title.clone(), artist: media.artist.clone() };
+                let duration = media.timeline.map_or(0.0, |timeline| timeline.duration);
+                let hwnd = self.hwnd;
+                let lookups = self.lyrics.get_or_insert_with(|| crate::lyrics::Lyrics::new(hwnd));
+                matches!(lookups.get(&song, duration), LyricsBody::Synced(_) | LyricsBody::Plain(_))
+                    .then_some((song.title, song.artist))
+            }
+            _ => None,
+        };
+        self.state.lyrics_found != found && self.reduce_one(IslandEvent::SetLyricsFound(found))
+    }
+
+    /// Keeps the lyrics view in step with the player (its song, play state
+    /// and position, and the words once found). Returns whether the island
+    /// changed. It closes when the player goes away.
+    fn sync_lyrics(&mut self) -> bool {
+        let mut changed = false;
+        if self.lyrics_open && self.state.media.is_none() {
+            // The music stopped: the lyrics go, and the pill they held
+            // open closes unless the pointer is on it.
+            self.lyrics_open = false;
+            if self.state.expanded && !self.state.pointer_inside {
+                changed |= self.reduce_one(IslandEvent::SetExpanded(false));
+            }
+        }
+        let card = if self.lyrics_open { self.lyrics_card() } else { None };
+        if !self.lyrics_open {
+            self.lyrics_scroll = None;
+            self.lyrics_song = None;
+        }
+        (self.state.lyrics != card && self.reduce_one(IslandEvent::SetLyrics(card))) | changed
+    }
+
+    fn lyrics_card(&mut self) -> Option<islet_core::lyrics::LyricsCard> {
+        let media = self.state.media.clone()?;
+        let song = crate::lyrics::Song { title: media.title.clone(), artist: media.artist.clone() };
+        if self.lyrics_song.as_ref() != Some(&song) {
+            // A new song starts at its first line.
+            self.lyrics_scroll = None;
+            self.lyrics_song = Some(song.clone());
+        }
+        let duration = media.timeline.map_or(0.0, |timeline| timeline.duration);
+        let hwnd = self.hwnd;
+        let lookups = self.lyrics.get_or_insert_with(|| crate::lyrics::Lyrics::new(hwnd));
+        let body = lookups.get(&song, duration);
+        Some(islet_core::lyrics::LyricsCard {
+            title: media.title,
+            artist: media.artist,
+            art: media.art,
+            accent: media.accent,
+            playing: media.playing,
+            timeline: media.timeline,
+            body,
+            scroll: self.lyrics_scroll,
+            search: self.state.spotify_pill == islet_core::spotify::SpotifyPill::Search,
+            skips: media.skips,
+        })
+    }
+
+    /// The wheel on the lyrics view: the lines move by `by` pixels, and
+    /// follow the song again a few seconds after.
+    fn scroll_lyrics(&mut self, by: f32) {
+        let Some(card) = &self.state.lyrics else { return };
+        let Some(scroll) = card.scrolled(by, clock_now()) else { return };
+        let synced = matches!(card.body, islet_core::lyrics::LyricsBody::Synced(_));
+        self.lyrics_scroll = Some(scroll);
+        if synced {
+            unsafe {
+                SetTimer(Some(self.hwnd), TIMER_LYRICS_FOLLOW, LYRICS_FOLLOW_MS, None);
+            }
+        }
+        if self.sync_lyrics() {
+            self.send_snapshot();
+        }
+        self.update_widget_hover();
+    }
+
+    /// A click on the lyrics view: close it, play from a line, or the
+    /// playback controls.
+    fn handle_lyrics_click(&mut self, lparam: LPARAM) -> bool {
+        use islet_core::lyrics::{LyricsBody, LyricsItem};
+        if !self.state.lyrics_visible() {
+            return false;
+        }
+        let Some(card) = self.state.lyrics.clone() else { return false };
+        let Some((x, y)) = self.widget_point(point_from_lparam(lparam)) else { return false };
+        let now = clock_now();
+        match card.item_at(x, y, now) {
+            Some(LyricsItem::Close) => {
+                // Back to the music player, still open.
+                self.lyrics_open = false;
+                self.set_widget_hover(None);
+                self.dispatch_all([]);
+                self.update_media_hover();
+            }
+            Some(LyricsItem::Search) => self.open_search(),
+            Some(LyricsItem::PlayPause) => self.media_action(MediaAction::PlayPause),
+            Some(LyricsItem::Previous) => self.media_action(MediaAction::Previous),
+            Some(LyricsItem::Next) => self.media_action(MediaAction::Next),
+            Some(LyricsItem::Bar) => {
+                if let Some(fraction) = card.bar_fraction(x, y, false) {
+                    self.media_action(MediaAction::Seek(fraction));
+                }
+            }
+            Some(LyricsItem::Line(index)) => {
+                let duration = card.timeline.map_or(0.0, |timeline| timeline.duration);
+                if let (Some(time), true) = (card.line_time(index), duration > 0.0) {
+                    // Back to following, from that line.
+                    self.lyrics_scroll = None;
+                    unsafe {
+                        let _ = KillTimer(Some(self.hwnd), TIMER_LYRICS_FOLLOW);
+                    }
+                    self.media_action(MediaAction::Seek((time / duration) as f32));
+                }
+            }
+            None => {
+                // A failed lookup is tried again on a click.
+                if card.body == LyricsBody::Unavailable {
+                    if let (Some(lookups), Some(song)) = (&mut self.lyrics, &self.lyrics_song) {
+                        lookups.retry(song, card.timeline.map_or(0.0, |timeline| timeline.duration));
+                    }
+                    if self.sync_lyrics() {
+                        self.send_snapshot();
+                    }
+                }
+            }
+        }
+        self.update_widget_hover();
+        true
     }
 
     /// A control on the remembered song. A player still open in the
@@ -2102,7 +2949,7 @@ impl IslandHost {
             MediaAction::PlayPause => Some(MediaCommand::TogglePlayPause),
             MediaAction::Next => Some(MediaCommand::Next),
             MediaAction::Previous => Some(MediaCommand::Previous),
-            MediaAction::Seek(_) | MediaAction::OpenApp => None,
+            MediaAction::Seek(_) | MediaAction::OpenApp | MediaAction::Lyrics | MediaAction::Spotify => None,
         };
         if let Some(app) = &live {
             match (command, &self.media) {
@@ -2395,6 +3242,9 @@ impl IslandHost {
     fn effective_anchor_top(&self) -> bool {
         if self.preview.is_some() {
             self.preview_property(w!("IsletCustomize")) != 2
+        } else if self.state.lens.is_some() {
+            // The lens's toolbar is at the top, wherever the island lives.
+            true
         } else {
             self.anchor_top && !self.state.tucked && self.state.dictation.is_none()
         }
@@ -2443,6 +3293,14 @@ impl IslandHost {
     }
 
     fn arm_timer(&self, kind: TimerKind, after_ms: u32) {
+        // Search was just closed from under the pointer: wait out the grace.
+        let after_ms = match (kind, self.collapse_grace_until) {
+            (TimerKind::HoverCollapse, Some(until)) => {
+                let left = ((until - clock_now()) * 1000.0).ceil();
+                if left > 0.0 { after_ms.max(left as u32) } else { after_ms }
+            }
+            _ => after_ms,
+        };
         let id = match kind {
             TimerKind::HoverExpand => TIMER_HOVER_EXPAND,
             TimerKind::HoverCollapse => TIMER_HOVER_COLLAPSE,
@@ -2471,6 +3329,39 @@ impl IslandHost {
 
     fn on_timer(&mut self, id: usize) {
         match id {
+            TIMER_TASKS => self.on_tasks_timer(),
+            TIMER_SPOTIFY_SEARCH => {
+                unsafe {
+                    let _ = KillTimer(Some(self.hwnd), TIMER_SPOTIFY_SEARCH);
+                }
+                self.run_search();
+            }
+            TIMER_LYRICS_FOLLOW => {
+                unsafe {
+                    let _ = KillTimer(Some(self.hwnd), TIMER_LYRICS_FOLLOW);
+                }
+                self.lyrics_scroll = None;
+                if self.sync_lyrics() {
+                    self.send_snapshot();
+                }
+            }
+            TIMER_LENS_ALIVE => {
+                let gone = !self.lens.as_mut().is_some_and(|lens| lens.running());
+                if gone || self.state.lens.is_none() {
+                    if self.state.lens.is_some() {
+                        tracing::info!("the lens ended with its overlay open");
+                    }
+                    self.set_lens_card(None);
+                }
+            }
+            TIMER_LENS_CAPTURE => {
+                unsafe {
+                    let _ = KillTimer(Some(self.hwnd), TIMER_LENS_CAPTURE);
+                }
+                if let Some(lens) = &mut self.lens {
+                    lens.show_to_capture();
+                }
+            }
             TIMER_GESTURE => {
                 if self.gesture.is_some() {
                     self.move_gesture();
@@ -2536,6 +3427,7 @@ impl IslandHost {
                     icon: None,
                     action: None,
                     progress: None,
+                    device: None,
                 })));
             }
             TIMER_INTRO => {
@@ -2657,9 +3549,13 @@ impl IslandHost {
         self.release_calculator_focus();
         self.set_click_through(true);
         if let Some(target) = self.last_target {
+            // As wide as during a drag: after a swipe to a corner the pill is
+            // still springing back from the pull as it sinks, and a region of
+            // just its resting shape would slice it in half.
             self.morph_box = self
                 .target_frame(target, self.effective_anchor_top())
-                .bounds();
+                .bounds()
+                .map(|bounds| bounds.inflate(GESTURE_REGION_MARGIN_DP));
             self.update_region();
         }
         let _ = self.tx.send(RenderCommand::Suspend(false));
@@ -2866,9 +3762,28 @@ impl IslandHost {
         } else {
             unsafe {
                 let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
+                // Back on top: a full-screen game makes its own window
+                // topmost while the pill is away, and showing a window
+                // keeps it where it was in the order, under the game.
+                let _ = SetWindowPos(
+                    self.hwnd,
+                    Some(HWND_TOPMOST),
+                    0,
+                    0,
+                    0,
+                    0,
+                    windows::Win32::UI::WindowsAndMessaging::SWP_NOMOVE
+                        | windows::Win32::UI::WindowsAndMessaging::SWP_NOSIZE
+                        | SWP_NOACTIVATE,
+                );
             }
             let _ = self.tx.send(RenderCommand::Suspend(false));
             self.send_snapshot();
+        }
+        // No warm screen over a game or a full-screen video: their colours
+        // are theirs (and games set their own gamma).
+        if let Some(night_light) = &self.night_light {
+            night_light.pause(hidden);
         }
         tracing::debug!(hidden, "full-screen visibility changed");
         self.update_poll_timer();
@@ -2914,6 +3829,14 @@ impl IslandHost {
         if exact && (!framed || !maximized) {
             return Some("covers the screen without a frame");
         }
+        // A maximized window spilling past the screen by its frame is an
+        // ordinary window, whatever runs behind it. Windows' state below is
+        // for the whole system: a game left running after an Alt+Tab keeps
+        // reporting full-screen, and the pill would stay away over the
+        // browser.
+        if maximized && !exact {
+            return None;
+        }
         // Exclusive full-screen games, presentations and full-screen Store
         // apps (Media Player, Netflix) are reported by Windows itself.
         match unsafe { SHQueryUserNotificationState() }.ok() {
@@ -2933,7 +3856,21 @@ impl IslandHost {
         if self.preview.is_some() || self.demo.is_some() {
             return;
         }
-        let reason = self.hide_in_fullscreen.then(|| self.should_hide_for_fullscreen()).flatten();
+        // The lens's full-screen overlay never changes whether the island
+        // shows: open on the island's screen, the island is its toolbar
+        // (and must not blink out first); elsewhere, or over a full-screen
+        // app the island made way for, it stays as it was.
+        if self.hide_in_fullscreen && self.state.lens.is_none() {
+            let foreground = unsafe { GetForegroundWindow() };
+            if window_owner(foreground).1 == "onyx-lens.exe" {
+                return;
+            }
+        }
+        let reason = self
+            .hide_in_fullscreen
+            .then(|| self.should_hide_for_fullscreen())
+            .flatten()
+            .filter(|_| self.state.lens.is_none());
         if reason.is_some() != self.fullscreen_hidden {
             // Which program and why, never its window title.
             let foreground = unsafe { GetForegroundWindow() };
@@ -3297,8 +4234,42 @@ fn apply_command(
             }
             false
         }
+        RenderCommand::Glass(glass) => {
+            renderer.set_glass(glass);
+            *dirty = true;
+            false
+        }
         RenderCommand::Stop => true,
     }
+}
+
+/// The see-through look. Its frost is Windows' blur, which Windows only
+/// provides while its transparency effects are on (Settings >
+/// Personalization > Colors); without it the glass is clear.
+fn wants_glass(config: &Config) -> Option<islet_render::Glass> {
+    (config.general.look == islet_core::config::IslandLook::Glass).then(|| islet_render::Glass {
+        tint: config.general.glass_tint.clamp(0.0, 1.0),
+        frost: windows_transparency_on(),
+    })
+}
+
+fn windows_transparency_on() -> bool {
+    use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
+    let mut value = 1u32;
+    let mut size = std::mem::size_of::<u32>() as u32;
+    // SAFETY: reads one DWORD into a local of that size.
+    let read = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
+            w!("EnableTransparency"),
+            RRF_RT_REG_DWORD,
+            None,
+            Some((&mut value as *mut u32).cast()),
+            Some(&mut size),
+        )
+    };
+    read.is_err() || value != 0
 }
 
 type WaitForCompositorClock = unsafe extern "system" fn(u32, *const HANDLE, u32) -> u32;
@@ -3516,6 +4487,11 @@ fn demo_media() -> MediaCard {
         accent,
         scrub: None,
         volume: Some(0.66),
+        device: None,
+        source_icon: None,
+        lyrics: false,
+        spotify: Default::default(),
+        skips: Default::default(),
     }
 }
 
@@ -3565,6 +4541,7 @@ fn demo_needs_input() -> NotificationCard {
         icon: None,
         action: None,
         progress: None,
+        device: None,
     }
 }
 
@@ -3577,6 +4554,7 @@ fn demo_done() -> NotificationCard {
         icon: None,
         action: None,
         progress: None,
+        device: None,
     }
 }
 
@@ -3603,6 +4581,14 @@ fn demo_dictation_as(phase: DictationPhase, hands_free: bool) -> DictationCard {
         hands_free,
         command: false,
     }
+}
+
+/// Settings asks the island to connect Spotify (`wparam` 1) or
+/// disconnect it (0).
+fn spotify_message() -> u32 {
+    static MESSAGE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    // SAFETY: registers a message name.
+    *MESSAGE.get_or_init(|| unsafe { windows::Win32::UI::WindowsAndMessaging::RegisterWindowMessageW(w!("Onyx.Spotify")) })
 }
 
 fn open_media_source(app_id: &str, source: &str) {
@@ -3931,5 +4917,34 @@ mod resume_tests {
         assert!(is_browser("MSEdge", "Microsoft Edge"));
         assert!(!is_browser("Spotify.exe", "Spotify"));
         assert_eq!(url_encode("Hey Jude & co"), "Hey+Jude+%26+co");
+    }
+}
+
+/// The clipboard's text, for pasting a task.
+fn clipboard_text() -> Option<String> {
+    use windows::Win32::Foundation::HGLOBAL;
+    use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
+    use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
+    const CF_UNICODETEXT: u32 = 13;
+    // SAFETY: the clipboard is opened and closed here; the locked memory
+    // is read up to its terminator and unlocked before closing.
+    unsafe {
+        OpenClipboard(None).ok()?;
+        let text = GetClipboardData(CF_UNICODETEXT).ok().and_then(|handle| {
+            let memory = HGLOBAL(handle.0);
+            let pointer = GlobalLock(memory) as *const u16;
+            if pointer.is_null() {
+                return None;
+            }
+            let mut length = 0;
+            while *pointer.add(length) != 0 && length < 4096 {
+                length += 1;
+            }
+            let text = String::from_utf16_lossy(std::slice::from_raw_parts(pointer, length));
+            let _ = GlobalUnlock(memory);
+            Some(text)
+        });
+        let _ = CloseClipboard();
+        text
     }
 }

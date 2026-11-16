@@ -119,9 +119,16 @@ impl MusicFilter {
         Self { music_only, sites }
     }
 
-    /// Whether the session should appear on the island.
+    /// Whether the session should appear on the island. `audible` lists
+    /// the tabs playing sound; it is only asked for when no tab names the
+    /// track (reading it is slower than the titles).
     #[must_use]
-    pub fn is_music(&self, facts: SessionFacts<'_>, tab_titles: &[String]) -> bool {
+    pub fn is_music(
+        &self,
+        facts: SessionFacts<'_>,
+        tab_titles: &[String],
+        audible: &mut dyn FnMut() -> Vec<String>,
+    ) -> bool {
         if !self.music_only {
             return true;
         }
@@ -144,10 +151,14 @@ impl MusicFilter {
             },
             // Music sites often show the song in the player but keep their
             // own name as the page title. If no tab names the track, accept
-            // it when a listed music site is open.
-            None => tab_titles
-                .iter()
-                .any(|tab| self.site_of(tab) == Site::Listed),
+            // it when a listed music site is the one playing sound. Merely
+            // open is not enough: a video on another site (an x.com post,
+            // which reports no title) would pass whenever any tab
+            // mentioned a music site ("Spotify for Developers").
+            None => {
+                tab_titles.iter().any(|tab| self.site_of(tab) == Site::Listed)
+                    && audible().iter().any(|tab| self.site_of(tab) == Site::Listed)
+            }
         }
     }
 
@@ -435,13 +446,14 @@ mod tests {
             title: "White Iverson",
             artist: "Post Malone",
         };
-        assert!(filter().is_music(app, &[]));
+        assert!(filter().is_music(app, &[], &mut Vec::new));
         assert!(!filter().is_music(
             SessionFacts {
                 flagged_video: true,
                 ..app
             },
-            &[]
+            &[],
+            &mut Vec::new
         ));
     }
 
@@ -454,7 +466,7 @@ mod tests {
             title: "(65) WhatsApp",
             artist: "",
         };
-        assert!(!filter().is_music(whatsapp, &[]));
+        assert!(!filter().is_music(whatsapp, &[], &mut Vec::new));
         assert!(is_chat_app("Discord"));
         assert!(!is_chat_app("SpotifyAB.SpotifyMusic_zpdnekdrzrea0!Spotify"));
     }
@@ -466,58 +478,70 @@ mod tests {
             "(2) Don Toliver - Secondhand (feat. Rema) [Official Visualizer] - YouTube",
             "Home / X",
         ]);
-        assert!(!filter().is_music(browser("Home / X", ""), &open));
+        assert!(!filter().is_music(browser("Home / X", ""), &open, &mut || open.clone()));
         assert!(filter().is_music(
             browser(
                 "Don Toliver - Secondhand (feat. Rema) [Official Visualizer]",
                 "Don Toliver"
             ),
-            &open
+            &open, &mut || open.clone()
         ));
+    }
+
+    #[test]
+    fn a_video_on_another_site_is_not_music_because_a_music_site_tab_is_open() {
+        // An x.com video reports no title; a Spotify page is open but
+        // silent (the developer dashboard, a sign-in page).
+        let open = tabs(&["Dashboard | Spotify for Developers", "(3) Someone on X: \"look at this\" / X"]);
+        let playing = tabs(&["(3) Someone on X: \"look at this\" / X"]);
+        assert!(!filter().is_music(browser("", ""), &open, &mut || playing.clone()));
+        // The same open Spotify tab playing the song: music.
+        let open = tabs(&["Spotify - Web Player"]);
+        assert!(filter().is_music(browser("Starboy", "The Weeknd"), &open, &mut || open.clone()));
     }
 
     #[test]
     fn non_music_youtube_videos_are_hidden() {
         let open = tabs(&["How to fix a bike chain - YouTube"]);
-        assert!(!filter().is_music(browser("How to fix a bike chain", "Park Tool"), &open));
+        assert!(!filter().is_music(browser("How to fix a bike chain", "Park Tool"), &open, &mut || open.clone()));
         let open = tabs(&["Dune: Part Three | Official Trailer - YouTube"]);
         assert!(!filter().is_music(
             browser("Dune: Part Three | Official Trailer", "Warner Bros."),
-            &open
+            &open, &mut || open.clone()
         ));
     }
 
     #[test]
     fn music_sites_count_whatever_the_title() {
         let open = tabs(&["Stream Lofi beat by someone | Listen online for free on SoundCloud"]);
-        assert!(filter().is_music(browser("Lofi beat", "someone"), &open));
+        assert!(filter().is_music(browser("Lofi beat", "someone"), &open, &mut || open.clone()));
         let open = tabs(&["Blinding Lights • The Weeknd - YouTube Music"]);
-        assert!(filter().is_music(browser("Blinding Lights", "The Weeknd"), &open));
+        assert!(filter().is_music(browser("Blinding Lights", "The Weeknd"), &open, &mut || open.clone()));
         // Deezer keeps its own name as the title: no tab names the song.
         let open = tabs(&["Deezer", "Home / X"]);
-        assert!(filter().is_music(browser("Starboy", "The Weeknd"), &open));
+        assert!(filter().is_music(browser("Starboy", "The Weeknd"), &open, &mut || open.clone()));
     }
 
     #[test]
     fn unknown_sites_are_not_music_until_added() {
         let open = tabs(&["Kesariya - JioSaavn"]);
         let none = MusicFilter::new(true, &[]);
-        assert!(!none.is_music(browser("Kesariya", "Arijit Singh"), &open));
+        assert!(!none.is_music(browser("Kesariya", "Arijit Singh"), &open, &mut || open.clone()));
         let custom = MusicFilter::new(true, &["https://www.jiosaavn.com/song/abc".to_owned()]);
-        assert!(custom.is_music(browser("Kesariya", "Arijit Singh"), &open));
+        assert!(custom.is_music(browser("Kesariya", "Arijit Singh"), &open, &mut || open.clone()));
     }
 
     #[test]
     fn listing_youtube_trusts_all_of_youtube() {
         let open = tabs(&["How to fix a bike chain - YouTube"]);
         let filter = MusicFilter::new(true, &["youtube.com".to_owned()]);
-        assert!(filter.is_music(browser("How to fix a bike chain", "Park Tool"), &open));
+        assert!(filter.is_music(browser("How to fix a bike chain", "Park Tool"), &open, &mut || open.clone()));
     }
 
     #[test]
     fn filter_off_shows_everything() {
         let filter = MusicFilter::new(false, &[]);
-        assert!(filter.is_music(browser("Home / X", ""), &tabs(&["Home / X"])));
+        assert!(filter.is_music(browser("Home / X", ""), &tabs(&["Home / X"]), &mut Vec::new));
     }
 
     #[test]
@@ -570,7 +594,7 @@ mod tests {
             "INDIA\u{2019}S GOT LATENT S2 EP8 ft. MC Stan, Tanmay Bhat, Madhur Virli, Arpit Bala";
         assert!(!looks_like_music(title, "Samay Raina"));
         let open = tabs(&[&format!("{title} - YouTube")]);
-        assert!(!filter().is_music(browser(title, "Samay Raina"), &open));
+        assert!(!filter().is_music(browser(title, "Samay Raina"), &open, &mut || open.clone()));
 
         assert!(!looks_like_music(
             "The Late Show Ep 12 ft. Some Guest",

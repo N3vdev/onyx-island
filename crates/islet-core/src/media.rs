@@ -285,6 +285,20 @@ fn hsl_to_rgb(hue: f32, saturation: f32, lightness: f32) -> [f32; 3] {
     [r + m, g + m, b + m]
 }
 
+/// Which of previous and next the player offers (a radio stream, a single
+/// video or a podcast app may offer neither). Both, unless it says so.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Skips {
+    pub previous: bool,
+    pub next: bool,
+}
+
+impl Default for Skips {
+    fn default() -> Self {
+        Self { previous: true, next: true }
+    }
+}
+
 /// Something the user can do in the expanded media view.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum MediaAction {
@@ -295,6 +309,10 @@ pub enum MediaAction {
     Seek(f32),
     /// Open or activate the source music application.
     OpenApp,
+    /// Open the lyrics view.
+    Lyrics,
+    /// The Spotify pill: connect, or search.
+    Spotify,
 }
 
 /// The expanded control under the pointer. Separate from track data so hover
@@ -309,6 +327,8 @@ pub enum MediaHover {
     Next,
     Seek,
     Volume,
+    Lyrics,
+    Spotify,
 }
 
 /// Uses the same hit zones and precedence as mouse presses. Unavailable
@@ -332,6 +352,8 @@ pub fn expanded_hover_at(
         Some(MediaAction::Previous) => Some(MediaHover::Previous),
         Some(MediaAction::PlayPause) => Some(MediaHover::PlayPause),
         Some(MediaAction::Next) => Some(MediaHover::Next),
+        Some(MediaAction::Lyrics) => Some(MediaHover::Lyrics),
+        Some(MediaAction::Spotify) => Some(MediaHover::Spotify),
         Some(MediaAction::OpenApp) if expanded::ART_HIT.contains(x, y) => Some(MediaHover::Artwork),
         Some(MediaAction::OpenApp) if expanded::title_area(pill_width).contains(x, y) => {
             Some(MediaHover::Title)
@@ -368,6 +390,8 @@ pub mod expanded {
     pub const ARTIST_HEIGHT: f32 = 16.0;
     pub const CHIP_Y: f32 = 18.0;
     pub const CHIP_HEIGHT: f32 = 38.0;
+    /// Between the round pills of the upper row.
+    pub const PILL_GAP: f32 = 8.0;
     pub const SCRUBBER_Y: f32 = 96.0;
     pub const SCRUBBER_HEIGHT: f32 = 2.0;
     /// Vertical slack around the thin scrubber for comfortable clicking.
@@ -401,6 +425,13 @@ pub mod expanded {
         ]
     }
 
+    /// The lyrics button, at the end of the controls' row, right-aligned
+    /// with the title.
+    #[must_use]
+    pub fn lyrics_button(_pill_width: f32) -> (f32, f32) {
+        (TEXT_X + TEXT_WIDTH - CONTROL_HIT_RADIUS, CONTROLS_Y)
+    }
+
     /// First feature column. Additional columns can grow to its right without
     /// moving playback controls or their hit zones.
     #[must_use]
@@ -413,11 +444,24 @@ pub mod expanded {
         )
     }
 
-    /// The source shortcut in the upper feature slot.
+    /// The upper row holds round pills, side by side from the left; the
+    /// first is the playing app's (it opens the app).
+    #[must_use]
+    pub fn pill(pill_width: f32, index: usize) -> Rect {
+        let area = feature_area(pill_width);
+        Rect::new(area.x + index as f32 * (CHIP_HEIGHT + PILL_GAP), CHIP_Y, CHIP_HEIGHT, CHIP_HEIGHT)
+    }
+
+    /// The playing app's round button.
     #[must_use]
     pub fn chip(pill_width: f32, _source: &str) -> Rect {
-        let area = feature_area(pill_width);
-        Rect::new(area.x, CHIP_Y, area.width, CHIP_HEIGHT)
+        pill(pill_width, 0)
+    }
+
+    /// The Spotify pill (connect, or search), beside the app's button.
+    #[must_use]
+    pub fn spotify_pill(pill_width: f32) -> Rect {
+        pill(pill_width, 1)
     }
 
     #[must_use]
@@ -479,8 +523,14 @@ pub fn expanded_action_at(x: f32, y: f32, pill_width: f32) -> Option<MediaAction
     if hit(next) {
         return Some(MediaAction::Next);
     }
+    if hit(expanded::lyrics_button(pill_width)) {
+        return Some(MediaAction::Lyrics);
+    }
     if let Some(fraction) = scrub_fraction(x, y, pill_width, false) {
         return Some(MediaAction::Seek(fraction));
+    }
+    if expanded::spotify_pill(pill_width).contains(x, y) {
+        return Some(MediaAction::Spotify);
     }
     if expanded::ART_HIT.contains(x, y)
         || expanded::title_area(pill_width).contains(x, y)

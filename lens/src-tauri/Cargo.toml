@@ -1,0 +1,115 @@
+[package]
+name = "onyx-lens"
+version = "1.0.0"
+description = "Onyx Lens: circle anything on screen to search, copy or ask AI"
+authors = ["Onyx"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[workspace]
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "circle_search_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-clipboard-manager = "2"
+tauri-plugin-single-instance = "2"
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+base64 = "0.22"
+fxtranslate = { version = "0.4.2", features = ["net", "icu-segmenter"] }
+whatlang = "0.16"
+geo = "0.28"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+rfd = "0.16"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+uuid = { version = "1", features = ["v4"] }
+windows-capture = "1"
+# Verify-only: no signing, no rand_core. The private signing key never lives
+# in this binary — only the Supabase edge function that issues tokens holds
+# it. See src/license.rs. Email normalization/hashing lives server-side
+# (Deno) too, as the single source of truth for the trials/licenses tables,
+# so no hashing crate is needed here.
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
+# Already resolved in the tree today via fxtranslate's `net` feature; this
+# just promotes it to a direct dependency for license.rs's own HTTP calls,
+# rather than adding a second HTTP client.
+ureq = { version = "2", features = ["json"] }
+# objectnet.rs: checks the downloaded Edit-mode model against a pinned hash,
+# so a truncated or swapped download is rejected rather than loaded.
+sha2 = "0.10"
+# Already resolved in the tree transitively (tracing-subscriber's env-filter
+# feature); promoted to direct for redact.rs's pattern matching.
+regex = "1"
+# screenlinks.rs: finds and reads QR codes in the frame (pure Rust, MIT/Apache).
+rqrr = "0.11"
+
+[dev-dependencies]
+# Full-featured build (signing + rand) used only by license.rs's own tests,
+# which sign test fixtures locally to prove the verify path — the release
+# binary never links signing code (see the [dependencies] entry above).
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "rand_core"] }
+rand = "0.8"
+# screenlinks.rs tests draw a real QR code to read back.
+qrcode = { version = "0.14", default-features = false }
+
+[profile.release]
+# Tuned for the latency targets in CLAUDE.md: full cross-crate optimization
+# and a single codegen unit, with symbols stripped to keep the shipped
+# binary small. Panics deliberately keep unwinding rather than aborting, so
+# a panicking capture/OCR worker degrades into a logged error (see the
+# JoinError handling in commands.rs) instead of killing the whole app.
+codegen-units = 1
+lto = true
+strip = true
+
+[target.'cfg(windows)'.dependencies]
+# overlay_memory.rs: tells the hidden overlay's WebView2 to trim its memory
+# between sessions. Same versions Tauri itself already links (no new crates).
+webview2-com = "0.38"
+windows-core-061 = { package = "windows-core", version = "0.61" }
+windows = { version = "0.58", features = [
+  "Media_Ocr",
+  "Graphics_Imaging",
+  "Globalization",
+  "Foundation_Collections",
+  "Storage_Streams",
+  "Win32_Foundation",
+  "Win32_Graphics_Gdi",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_UI_HiDpi",
+  # Onyx's glass look needs Windows' transparency switch (island.rs).
+  "Win32_System_Registry",
+  # Share (share.rs): IDataTransferManagerInterop is the Win32-side
+  # interop for DataTransferManager (DataTransferManager::GetForCurrentView
+  # is UWP-only and needs a CoreWindow this app doesn't have). Pulls in
+  # "ApplicationModel" and "Foundation" transitively via windows' own
+  # Cargo.toml feature chain.
+  "ApplicationModel_DataTransfer",
+  "Win32_UI_Shell",
+  # aichat.rs: synthesizes the Ctrl+V that lands the copied selection in the
+  # AI chat window's own message box.
+  "Win32_UI_Input_KeyboardAndMouse",
+  # aichat.rs: identifies a newly-opened Firefox window (by owning process
+  # name) so it can be resized down to something closer to a mini window.
+  "Win32_System_Threading",
+  # hotkey.rs: Onyx signals captures through named events.
+  "Win32_Security",
+  # objectnet.rs: Windows ML — the ONNX Runtime + DirectML that ship inside
+  # Windows itself, so running the Edit-mode model adds nothing to the
+  # installer.
+  "AI_MachineLearning",
+] }

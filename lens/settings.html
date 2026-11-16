@@ -1,0 +1,267 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Onyx Lens Settings</title>
+    <link rel="stylesheet" href="/src/settings.css" />
+    <link rel="stylesheet" href="/src/overlay-controls.css" />
+    <script type="module" src="/src/settings.ts" defer></script>
+  </head>
+
+  <body>
+    <div id="app-shell">
+      <div id="titlebar" data-tauri-drag-region>
+        <div class="titlebar-brand" data-tauri-drag-region>
+          <img class="brand-mark" src="/src/assets/trace-icon.png" width="20" height="20" alt="" draggable="false" data-tauri-drag-region />
+          <span class="brand-name" data-tauri-drag-region>Onyx Lens Settings</span>
+        </div>
+        <div class="titlebar-controls">
+          <button id="win-minimize" class="titlebar-btn" type="button" title="Minimize">
+            <svg viewBox="0 0 10 10" fill="none"><path d="M1 5h8" stroke="currentColor" stroke-width="1" /></svg>
+          </button>
+          <button id="win-maximize" class="titlebar-btn" type="button" title="Maximize">
+            <svg viewBox="0 0 10 10" fill="none"><rect x="1.5" y="1.5" width="7" height="7" rx="0.5" stroke="currentColor" stroke-width="1" /></svg>
+          </button>
+          <button id="win-close" class="titlebar-btn close" type="button" title="Close">
+            <svg viewBox="0 0 10 10" fill="none"><path d="M1 1l8 8M9 1l-8 8" stroke="currentColor" stroke-width="1" /></svg>
+          </button>
+        </div>
+      </div>
+
+      <div id="body">
+        <nav id="sidebar" aria-label="Settings sections">
+          <div class="sidebar-brand">
+            <img class="app-mark" src="/src/assets/trace-icon.png" width="32" height="32" alt="" draggable="false" />
+            <span>Onyx Lens</span>
+          </div>
+          <button type="button" class="nav-item" data-section="hotkey" aria-controls="section-hotkey" aria-current="false" hidden><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="6" width="18" height="12" rx="2.5"/><path d="M7 10h.01M11 10h.01M15 10h2M8 14h8"/></svg><span>Shortcut</span></button>
+          <button type="button" class="nav-item active" data-section="theme" aria-controls="section-theme" aria-current="page"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><path d="M12 3.5v17M12 3.5a8.5 8.5 0 0 1 0 17"/></svg><span>Appearance</span></button>
+          <button type="button" class="nav-item" data-section="ai" aria-controls="section-ai" aria-current="false"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 3.5 1.9 5.6 5.6 1.9-5.6 1.9-1.9 5.6-1.9-5.6L4.5 11l5.6-1.9L12 3.5Z"/></svg><span>AI &amp; search</span></button>
+          <button type="button" class="nav-item" data-section="actions" aria-controls="section-actions" aria-current="false"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="8" width="18" height="8" rx="4"/><path d="M8 12h.01M12 12h.01M16 12h.01"/></svg><span>Actions</span></button>
+          <button type="button" class="nav-item" data-section="behavior" aria-controls="section-behavior" aria-current="false"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 7h10M18 7h2M4 17h2M10 17h10"/><circle cx="16" cy="7" r="2"/><circle cx="8" cy="17" r="2"/></svg><span>General</span></button>
+          <button type="button" class="nav-item" data-section="plan" aria-controls="section-plan" aria-current="false" hidden><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 3.5 2.6 5.3 5.9.9-4.3 4.1 1 5.8L12 16.8l-5.2 2.8 1-5.8-4.3-4.1 5.9-.9L12 3.5Z"/></svg><span>Plan</span></button>
+          <div class="sidebar-footer">
+            <span class="workspace-tag">Shortcut and startup are in Onyx settings</span>
+          </div>
+        </nav>
+
+        <main id="content">
+          <div class="content-inner">
+            <section class="settings-section" id="section-hotkey">
+              <header class="section-header">
+                <h1>Shortcut</h1>
+                <p>The key combination that opens Onyx Lens from any app.</p>
+              </header>
+
+              <div class="panel">
+                <div class="field">
+                  <div class="field-label">Capture shortcut<span class="field-hint" id="shortcut-hint">Click to change your shortcut.</span></div>
+                  <div class="field-control">
+                    <div id="shortcut-card" class="shortcut-card" tabindex="0" role="button" aria-label="Keyboard shortcut. Click, then press your new shortcut.">
+                      <div id="shortcut-preview" class="key-combination" aria-live="polite"><kbd>Shift</kbd><span>+</span><kbd>Enter</kbd></div>
+                      <span id="shortcut-badge" class="mini-badge"><span id="shortcut-badge-dot" class="mini-badge-dot" aria-hidden="true"></span><span id="shortcut-badge-text">Global</span></span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <h2 class="group-heading">In the overlay</h2>
+              <div class="panel">
+                <dl class="gesture-list">
+                  <div><dt>Select something</dt><dd>Circle it, or swipe straight across it</dd></div>
+                  <div><dt>Select text</dt><dd>Drag across any text on screen</dd></div>
+                  <div><dt>Draw over text</dt><dd><kbd>Alt</kbd> + drag</dd></div>
+                  <div><dt>Close</dt><dd><kbd>Esc</kbd> or right-click</dd></div>
+                </dl>
+              </div>
+            </section>
+
+            <section class="settings-section active" id="section-theme">
+              <header class="section-header">
+                <h1>Appearance</h1>
+                <p>How the overlay looks while you select something.</p>
+              </header>
+              <div class="appearance-preview" aria-label="Selection appearance preview">
+                <div class="preview-scene">
+                  <div class="preview-selection"><span>Quarterly report, page 4</span></div>
+                  <div class="preview-actions capture-controls" aria-hidden="true"><span class="capture-control primary" data-icon="copy">Copy</span><span class="capture-control" data-icon="search">Search</span><span class="capture-control" data-icon="ai">Ask AI</span></div>
+                </div>
+              </div>
+              <div class="panel">
+                <div class="field">
+                  <label for="accent-color">Accent color<span class="field-hint">The highlighted action and the active tool</span></label>
+                  <div class="field-control">
+                    <input id="accent-color" type="color" />
+                  </div>
+                </div>
+                <div class="field">
+                  <label for="spotlight-dim">Dim around the selection<span class="field-hint">How dark the rest of the screen gets</span></label>
+                  <div class="field-control">
+                    <input id="spotlight-dim" type="range" min="0" max="0.9" step="0.01" />
+                    <span id="spotlight-dim-value"></span>
+                  </div>
+                </div>
+                <div class="field">
+                  <label for="card-padding">Padding<span class="field-hint">Space around a revealed selection, in pixels</span></label>
+                  <div class="field-control">
+                    <input id="card-padding" type="number" min="0" max="60" step="1" />
+                  </div>
+                </div>
+                <div class="field">
+                  <label for="card-radius">Corner radius<span class="field-hint">Roundness of the selection, in pixels</span></label>
+                  <div class="field-control">
+                    <input id="card-radius" type="number" min="0" max="60" step="1" />
+                  </div>
+                </div>
+              </div>
+              <h2 class="group-heading">Visual pack <span class="pro-badge">Pro</span></h2>
+              <div class="panel">
+                <div class="field">
+                  <label for="theme-preset">Overlay theme<span class="field-hint">Colors for the action bar, hints and selections</span></label>
+                  <div class="field-control">
+                    <select id="theme-preset"></select>
+                  </div>
+                </div>
+                <div class="field">
+                  <label for="lasso-style">Lasso style<span class="field-hint">How the selection stroke is drawn</span></label>
+                  <div class="field-control">
+                    <select id="lasso-style"></select>
+                  </div>
+                </div>
+              </div>
+              <p class="section-tip pro-note" hidden>Themes and lasso styles marked Pro need a Pro plan.</p>
+            </section>
+
+            <section class="settings-section" id="section-ai">
+              <header class="section-header">
+                <h1>AI &amp; search</h1>
+                <p>Where Ask AI and Search send your selection.</p>
+              </header>
+              <div class="panel">
+                <div class="field">
+                  <label for="ai-provider">Ask AI opens</label>
+                  <div class="field-control">
+                    <select id="ai-provider">
+                      <option value="chatgpt">ChatGPT</option>
+                      <option value="claude">Claude</option>
+                      <option value="gemini">Gemini</option>
+                      <option value="custom">Custom URL</option>
+                    </select>
+                  </div>
+                </div>
+                <div class="custom-url-row" id="ai-custom-url-row" hidden>
+                  <input aria-label="Custom AI URL" id="ai-custom-url" type="text" placeholder="https://example.com/?q={q}" />
+                </div>
+                <div class="field">
+                  <label for="search-engine">Search uses</label>
+                  <div class="field-control">
+                    <select id="search-engine">
+                      <option value="google">Google</option>
+                      <option value="bing">Bing</option>
+                      <option value="duck-duck-go">DuckDuckGo</option>
+                      <option value="perplexity">Perplexity</option>
+                      <option value="custom">Custom URL</option>
+                    </select>
+                  </div>
+                </div>
+                <div class="custom-url-row" id="search-custom-url-row" hidden>
+                  <input aria-label="Custom search URL" id="search-custom-url" type="text" placeholder="https://example.com/search?q={q}" />
+                </div>
+              </div>
+            </section>
+
+            <section class="settings-section" id="section-actions">
+              <header class="section-header">
+                <h1>Actions</h1>
+                <p>Which buttons appear after a selection, and in what order.</p>
+              </header>
+              <h2 class="group-heading">After you select something</h2>
+              <div class="panel">
+                <ol class="action-list" id="choice-actions-list"></ol>
+              </div>
+              <h2 class="group-heading">After you select text</h2>
+              <div class="panel">
+                <ol class="action-list" id="text-actions-list"></ol>
+              </div>
+              <h2 class="group-heading">Custom actions <span class="pro-badge">Pro</span></h2>
+              <div class="panel" id="custom-actions-panel">
+                <p class="panel-hint">A button that opens any site with your selected text. Put <code>{q}</code> where the text goes.</p>
+                <ul class="custom-list" id="custom-actions-list"></ul>
+                <div class="custom-form">
+                  <input id="custom-label" data-draft type="text" maxlength="32" placeholder="Label, e.g. Search Jira" aria-label="Custom action label" />
+                  <input id="custom-url" data-draft type="text" placeholder="https://example.com/search?q={q}" aria-label="Custom action URL" />
+                  <button id="custom-add" type="button">Add</button>
+                </div>
+              </div>
+            </section>
+
+            <section class="settings-section" id="section-behavior">
+              <header class="section-header">
+                <h1>General</h1>
+                <p>Defaults for capturing, copying and translating.</p>
+              </header>
+              <div class="panel">
+                <div class="field">
+                  <label for="auto-copy">Copy text as soon as you select it</label>
+                  <div class="field-control">
+                    <input id="auto-copy" type="checkbox" />
+                  </div>
+                </div>
+                <div class="field">
+                  <label for="hide-cursor">Leave the cursor out of captures<span class="field-hint">The pointer won't appear in copies, saves or pins.</span></label>
+                  <div class="field-control">
+                    <input id="hide-cursor" type="checkbox" />
+                  </div>
+                </div>
+                <div class="field">
+                  <label for="translate-lang">Translate into<span class="field-hint">Runs on this device. Each language downloads once, the first time you use it.</span></label>
+                  <div class="field-control">
+                    <select id="translate-lang"></select>
+                  </div>
+                </div>
+                <div class="field" hidden>
+                  <label for="launch-at-startup">Start with Windows</label>
+                  <div class="field-control">
+                    <input id="launch-at-startup" type="checkbox" />
+                  </div>
+                </div>
+              </div>
+            </section>
+
+            <section class="settings-section" id="section-plan">
+              <header class="section-header">
+                <h1>Plan</h1>
+                <p>Your Onyx Lens license on this computer.</p>
+              </header>
+              <div class="plan-status">
+                <h2 id="plan-heading">Try Onyx Lens Pro, free for 7 days.</h2>
+                <p id="plan-subheading">Custom actions and the visual pack unlock instantly. No card required to start.</p>
+              </div>
+              <div class="panel" id="plan-panel">
+                <div class="field">
+                  <label for="plan-email">Email<span class="field-hint" id="plan-email-hint">Used to start your trial and to recover your purchase later.</span></label>
+                  <div class="field-control">
+                    <input id="plan-email" data-draft type="email" placeholder="you@example.com" autocomplete="email" />
+                  </div>
+                </div>
+              </div>
+              <div class="plan-actions">
+                <button id="plan-start-trial" type="button" class="plan-primary">Start free trial</button>
+                <button id="plan-buy" type="button" class="plan-primary" hidden>Buy Onyx Lens Pro (one time)</button>
+                <button id="plan-restore" type="button" class="plan-secondary">Restore purchase</button>
+              </div>
+              <p class="section-tip" id="plan-waiting" hidden>Waiting for your purchase to complete in the browser…</p>
+              <p class="section-tip error" id="plan-error" hidden></p>
+            </section>
+          </div>
+        </main>
+      </div>
+
+      <footer id="footer"><div class="footer-inner"><span id="save-state" role="status"><span class="save-dot"></span>All changes saved</span><div class="footer-actions">
+        <button id="reset-button" type="button">Reset to defaults</button>
+        <span id="status" role="status" aria-live="polite"></span></div></div>
+      </footer>
+    </div>
+  </body>
+</html>

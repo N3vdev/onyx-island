@@ -6,6 +6,10 @@
 //! the night begins or ends, every quarter second for the minute a fade
 //! takes, and once a minute while warm (Windows resets the ramp after sleep
 //! or a display change, so it is put back).
+//!
+//! It steps aside while a full-screen game or video has the island hidden,
+//! once that has lasted a few seconds (a screenshot tool's overlay is not
+//! worth a fade), and comes back as soon as the pill does.
 
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -32,9 +36,12 @@ const REAPPLY: Duration = Duration::from_secs(60);
 /// Asleep before the night, it still checks the clock this often (the PC
 /// may have slept, or the clock changed).
 const MAX_SLEEP: Duration = Duration::from_secs(5 * 60);
+/// How long something full-screen stays before the warmth steps aside.
+const PAUSE_AFTER: Duration = Duration::from_secs(3);
 
 enum Command {
     Configure(NightLightConfig),
+    Pause(bool),
     Shutdown,
 }
 
@@ -60,6 +67,7 @@ impl NightLight {
                     let wait = light.step(&on_change);
                     match rx.recv_timeout(wait) {
                         Ok(Command::Configure(config)) => light.configure(config),
+                        Ok(Command::Pause(paused)) => light.pause(paused),
                         Ok(Command::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
                         Err(RecvTimeoutError::Timeout) => {}
                     }
@@ -74,6 +82,11 @@ impl NightLight {
 
     pub fn configure(&self, config: &NightLightConfig) {
         let _ = self.tx.send(Command::Configure(config.clone()));
+    }
+
+    /// Steps aside (`true`) for a full-screen game or video, or comes back.
+    pub fn pause(&self, paused: bool) {
+        let _ = self.tx.send(Command::Pause(paused));
     }
 }
 
@@ -94,6 +107,8 @@ struct Schedule {
     was_night: Option<bool>,
     last_step: Instant,
     last_applied: Option<(Instant, [f32; 3])>,
+    /// Since when something full-screen has had the island hidden.
+    paused_since: Option<Instant>,
 }
 
 impl Schedule {
@@ -105,6 +120,27 @@ impl Schedule {
             was_night: None,
             last_step: Instant::now(),
             last_applied: None,
+            paused_since: None,
+        }
+    }
+
+    fn pause(&mut self, paused: bool) {
+        if paused == self.paused_since.is_some() {
+            return;
+        }
+        self.paused_since = paused.then(Instant::now);
+        // Out of the way, and back, quickly.
+        self.fade = QUICK_FADE;
+        self.last_step = Instant::now();
+    }
+
+    /// Whether the warmth is stepped aside now, and if it is about to be,
+    /// how long until then.
+    fn paused(&self) -> (bool, Option<Duration>) {
+        match self.paused_since {
+            Some(since) if since.elapsed() >= PAUSE_AFTER => (true, None),
+            Some(since) => (false, Some(PAUSE_AFTER - since.elapsed())),
+            None => (false, None),
         }
     }
 
@@ -156,8 +192,12 @@ impl Schedule {
         }
         self.was_night = Some(night);
 
-        let target = if night { 1.0 } else { 0.0 };
-        let elapsed = self.last_step.elapsed().min(Duration::from_secs(1));
+        // The schedule (and the eyes' greeting) carries on; only the
+        // screens are left alone.
+        let (paused, pausing_in) = self.paused();
+        let target = if night && !paused { 1.0 } else { 0.0 };
+        // Capped, so the first step after a sleep is not a jump.
+        let elapsed = self.last_step.elapsed().min(FADE_STEP * 2);
         self.last_step = Instant::now();
         let step = elapsed.as_secs_f32() / self.fade.as_secs_f32().max(0.001);
         self.level = if self.level < target {
@@ -178,6 +218,9 @@ impl Schedule {
 
         if (self.level - target).abs() > f32::EPSILON {
             return FADE_STEP;
+        }
+        if let Some(wait) = pausing_in.filter(|_| night) {
+            return wait.max(FADE_STEP);
         }
         // Settled: later changes are slow unless Settings asks otherwise.
         self.fade = SCHEDULED_FADE;
@@ -258,6 +301,19 @@ mod tests {
     /// Warms the real screens for a moment, reads the ramp back from the
     /// driver, and puts them back. Changes what is on screen, so it only
     /// runs on request.
+    #[test]
+    fn it_steps_aside_only_once_full_screen_has_lasted() {
+        let mut light = Schedule::new(NightLightConfig::default());
+        assert_eq!(light.paused(), (false, None));
+        light.pause(true);
+        let (paused, wait) = light.paused();
+        assert!(!paused && wait.is_some_and(|wait| wait <= PAUSE_AFTER));
+        light.paused_since = Some(Instant::now() - PAUSE_AFTER);
+        assert_eq!(light.paused(), (true, None));
+        light.pause(false);
+        assert_eq!(light.paused(), (false, None));
+    }
+
     #[test]
     #[ignore = "briefly warms the real screens"]
     fn the_screens_take_the_warm_ramp_and_get_it_back_off() {

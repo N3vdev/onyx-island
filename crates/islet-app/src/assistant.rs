@@ -185,6 +185,8 @@ impl Assistant {
                 Reply::quiet()
             }
             Command::Media(verb) => Reply { media: Some(*verb), ..Reply::quiet() },
+            // Added by the island, not here.
+            Command::AddTask(_) => Reply::quiet(),
             Command::Play { query, app } => self.play(query, app.as_deref()),
             Command::Volume(change) => volume(*change),
             Command::Search { query, site } => {
@@ -521,7 +523,10 @@ fn best_match<'a>(query: &str, names: impl Iterator<Item = &'a str>) -> Option<u
 fn site_url(name: &str) -> Option<String> {
     let lower = name.trim().to_lowercase();
     if !lower.contains(' ') && lower.contains('.') {
-        return Some(if lower.starts_with("http") { lower } else { format!("https://{lower}") });
+        // Always a web address: a name like "setup.bat" must never be opened
+        // as a file on this PC.
+        let site = lower.strip_prefix("https://").or_else(|| lower.strip_prefix("http://")).unwrap_or(&lower);
+        return Some(format!("https://{site}"));
     }
     let joined: String = lower.split_whitespace().collect();
     let url = match joined.as_str() {
@@ -749,7 +754,13 @@ const ICON_PIXELS: i32 = 96;
 
 /// An app's icon as the Start menu draws it, as premultiplied BGRA.
 fn app_icon(target: &str) -> Option<ArtImage> {
-    let target = target.to_owned();
+    shell_icon(&format!("shell:AppsFolder\\{target}"))
+}
+
+/// The icon the shell shows for `name` (a `shell:` path or a file), as
+/// premultiplied BGRA. Blocks for the few milliseconds it takes.
+pub(crate) fn shell_icon(name: &str) -> Option<ArtImage> {
+    let target = name.to_owned();
     std::thread::spawn(move || {
         // SAFETY: this thread owns its apartment until CoUninitialize; the
         // factory is dropped and the bitmap deleted before that.
@@ -776,7 +787,7 @@ unsafe fn load_icon(target: &str) -> Option<ArtImage> {
     use windows::Win32::UI::Shell::{
         IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_BIGGERSIZEOK, SIIGBF_ICONONLY,
     };
-    let path: Vec<u16> = format!("shell:AppsFolder\\{target}").encode_utf16().chain(std::iter::once(0)).collect();
+    let path: Vec<u16> = target.encode_utf16().chain(std::iter::once(0)).collect();
     let factory: IShellItemImageFactory = SHCreateItemFromParsingName(PCWSTR(path.as_ptr()), None).ok()?;
     let bitmap = factory
         .GetImage(SIZE { cx: ICON_PIXELS, cy: ICON_PIXELS }, SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK)
@@ -1092,6 +1103,9 @@ mod tests {
     #[test]
     fn websites_and_searches() {
         assert_eq!(site_url("youtube.com").as_deref(), Some("https://youtube.com"));
+        // Never a local file, whatever the name starts with.
+        assert_eq!(site_url("httpsetup.bat").as_deref(), Some("https://httpsetup.bat"));
+        assert_eq!(site_url("http://example.com").as_deref(), Some("https://example.com"));
         assert_eq!(site_url("YouTube").as_deref(), Some("https://www.youtube.com"));
         assert_eq!(site_url("g mail").as_deref(), Some("https://mail.google.com"));
         assert_eq!(site_url("my notes"), None);

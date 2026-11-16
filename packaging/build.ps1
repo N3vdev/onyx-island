@@ -31,13 +31,14 @@ Write-Host "Onyx $version"
 
 # --- Build ---------------------------------------------------------------
 if (-not $SkipBuild) {
-    $workspaceExecutables = @('islet.exe','islet-settings.exe','islet-asr-worker.exe') | ForEach-Object { Join-Path $release $_ }
-    Get-Process islet, islet-settings, islet-asr-worker -ErrorAction SilentlyContinue |
+    $workspaceExecutables = @('islet.exe','islet-settings.exe','islet-asr-worker.exe','onyx-lens.exe') | ForEach-Object { Join-Path $release $_ }
+    Get-Process islet, islet-settings, islet-asr-worker, onyx-lens -ErrorAction SilentlyContinue |
         Where-Object { $_.Path -in $workspaceExecutables } | Stop-Process -Force
     Start-Sleep -Seconds 1
     Push-Location $root
     try {
         & (Join-Path $root 'tools\build-converter.ps1')
+        & (Join-Path $root 'tools\build-lens.ps1')
         # Through cmd: Windows PowerShell turns cargo's progress on stderr into
         # errors whenever the output is redirected.
         cmd /c "cargo build --release -p islet-app -p islet-settings -p islet-asr-worker 2>&1"
@@ -89,7 +90,7 @@ if ((Test-Path -LiteralPath $resolvedWork) -and
 Remove-Item -LiteralPath $resolvedWork -Recurse -Force -ErrorAction SilentlyContinue
 $stage = Join-Path $work "stage"
 New-Item -ItemType Directory -Force $stage, $dist | Out-Null
-foreach ($exe in "islet.exe", "islet-settings.exe", "islet-asr-worker.exe") {
+foreach ($exe in "islet.exe", "islet-settings.exe", "islet-asr-worker.exe", "onyx-lens.exe") {
     Copy-Item (Join-Path $release $exe) $stage
 }
 if (-not (Test-Path -LiteralPath (Join-Path $release 'converter\Onyx.Converter.exe') -PathType Leaf)) {

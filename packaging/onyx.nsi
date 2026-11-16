@@ -50,6 +50,7 @@ VIAddVersionKey "LegalCopyright" "(c) 2026 ${PUBLISHER}"
   nsExec::Exec 'taskkill /F /IM islet.exe'
   nsExec::Exec 'taskkill /F /IM islet-settings.exe'
   nsExec::Exec 'taskkill /F /IM islet-asr-worker.exe'
+  nsExec::Exec 'taskkill /F /IM onyx-lens.exe'
   Sleep 600
 !macroend
 
@@ -62,6 +63,7 @@ Section "Onyx"
   File "${STAGE}\islet.exe"
   File "${STAGE}\islet-settings.exe"
   File "${STAGE}\islet-asr-worker.exe"
+  File "${STAGE}\onyx-lens.exe"
   File "${STAGE}\vcruntime140.dll"
   File "${STAGE}\vcruntime140_1.dll"
   SetOutPath "$INSTDIR\models"
@@ -87,6 +89,7 @@ Section "Uninstall"
   Delete "$INSTDIR\islet.exe"
   Delete "$INSTDIR\islet-settings.exe"
   Delete "$INSTDIR\islet-asr-worker.exe"
+  Delete "$INSTDIR\onyx-lens.exe"
   RMDir /r "$INSTDIR\converter"
   Delete "$INSTDIR\vcruntime140.dll"
   Delete "$INSTDIR\vcruntime140_1.dll"

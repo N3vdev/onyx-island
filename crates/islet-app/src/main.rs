@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod assistant;
+mod bluetooth;
 mod clock;
 mod config_watch;
 mod context_menu;
@@ -10,6 +11,8 @@ mod file_drop;
 mod icon;
 mod last_music;
 mod learn;
+mod lens;
+mod lyrics;
 mod island_window;
 mod logging;
 mod night_light;
@@ -17,7 +20,10 @@ mod occlusion;
 mod paths;
 mod restart;
 mod settings;
+mod source_icon;
+mod spotify;
 mod sysstats;
+mod tasks;
 mod tray;
 
 use std::process::ExitCode;

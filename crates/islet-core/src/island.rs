@@ -78,6 +78,14 @@ pub const STATS: PillSize = PillSize::new(
 );
 /// Small and sleek: just six bars (see the renderer), no text or timer.
 pub const DICTATION: PillSize = PillSize::new(92.0, 32.0, 16.0);
+/// The opened island's to-do list.
+pub const TASKS: PillSize = PillSize::new(crate::tasks::WIDTH, crate::tasks::HEIGHT, 38.0);
+/// Spotify search.
+pub const SEARCH: PillSize = PillSize::new(crate::spotify::WIDTH, crate::spotify::HEIGHT, crate::spotify::CORNER);
+/// The lyrics view.
+pub const LYRICS: PillSize = PillSize::new(crate::lyrics::WIDTH, crate::lyrics::HEIGHT, crate::lyrics::CORNER);
+/// The pill while the focus timer runs: a ring and the time left.
+pub const FOCUS: PillSize = PillSize::new(crate::tasks::FOCUS_PILL_WIDTH, 32.0, 16.0);
 /// The startup pill, shaped like the pill on the app icon, shown once when
 /// the app starts.
 pub const INTRO: PillSize = PillSize::new(112.0, 40.0, 20.0);
@@ -363,6 +371,31 @@ pub struct MediaCard {
     pub scrub: Option<f32>,
     /// System output volume, 0..=1, when it can be read.
     pub volume: Option<f32>,
+    /// The Bluetooth earbuds or headphones playing it, with their battery.
+    pub device: Option<DeviceBadge>,
+    /// The playing app's icon, for its round button.
+    pub source_icon: Option<crate::media::ArtImage>,
+    /// The Spotify pill beside it.
+    pub spotify: crate::spotify::SpotifyPill,
+    /// Lyrics were found for it: the lyrics button shows.
+    pub lyrics: bool,
+    /// Which skip buttons work (the others are dimmed).
+    pub skips: crate::media::Skips,
+}
+
+/// A Bluetooth audio device, for its notices and the music card.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeviceBadge {
+    pub kind: DeviceKind,
+    /// Percent, when the device reports it.
+    pub battery: Option<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceKind {
+    Earbuds,
+    Headphones,
+    Speaker,
 }
 
 impl MediaCard {
@@ -388,6 +421,9 @@ pub struct NotificationCard {
     pub action: Option<NoticeAction>,
     /// How far along what it reports is (a download), 0..=1.
     pub progress: Option<f32>,
+    /// Bluetooth earbuds that connected, left, or are running low: drawn
+    /// with their icon and battery.
+    pub device: Option<DeviceBadge>,
 }
 
 /// What a notice's button does.
@@ -395,6 +431,12 @@ pub struct NotificationCard {
 pub enum NoticeAction {
     /// Download the on-device AI cleanup model ("AI dictation").
     DownloadAiCleanup,
+    /// A reminder's task is done.
+    TaskDone(u64),
+    /// Start the break after a focus session.
+    StartBreak,
+    /// Start another focus session.
+    StartFocus,
 }
 
 impl NotificationCard {
@@ -404,6 +446,9 @@ impl NotificationCard {
         self.action.map(|action| match (action, self.level) {
             (NoticeAction::DownloadAiCleanup, AlertLevel::Error) => "Retry",
             (NoticeAction::DownloadAiCleanup, _) => "Download",
+            (NoticeAction::TaskDone(_), _) => "Done",
+            (NoticeAction::StartBreak, _) => "Break",
+            (NoticeAction::StartFocus, _) => "Focus",
         })
     }
 
@@ -502,10 +547,18 @@ pub enum ContentCard {
     Glance(GlanceCard),
     Calculator(crate::widgets::Calculator),
     Stats(crate::widgets::SystemStats),
+    /// The to-do list (opened), or the focus timer (collapsed).
+    Tasks(crate::tasks::TasksCard),
     Media(MediaCard),
+    /// The lyrics view, opened from the music card.
+    Lyrics(crate::lyrics::LyricsCard),
+    /// Spotify search, opened from the music card or the lyrics.
+    Search(crate::spotify::SearchCard),
     Notification(NotificationCard),
     Agent(AgentCard),
     Dictation(DictationCard),
+    /// The lens's toolbar, while Onyx Lens is open.
+    Lens(crate::lens::LensCard),
     /// The startup greeting: the renderer animates it from when it appears.
     Intro,
 }
@@ -516,10 +569,14 @@ pub enum CardKind {
     Glance,
     Calculator,
     Stats,
+    Tasks,
     Media,
+    Lyrics,
+    Search,
     Notification,
     Agent,
     Dictation,
+    Lens,
     Intro,
 }
 
@@ -531,10 +588,14 @@ impl ContentCard {
             Self::Glance(_) => CardKind::Glance,
             Self::Calculator(_) => CardKind::Calculator,
             Self::Stats(_) => CardKind::Stats,
+            Self::Tasks(_) => CardKind::Tasks,
             Self::Media(_) => CardKind::Media,
+            Self::Lyrics(_) => CardKind::Lyrics,
+            Self::Search(_) => CardKind::Search,
             Self::Notification(_) => CardKind::Notification,
             Self::Agent(_) => CardKind::Agent,
             Self::Dictation(_) => CardKind::Dictation,
+            Self::Lens(_) => CardKind::Lens,
             Self::Intro => CardKind::Intro,
         }
     }
@@ -548,8 +609,12 @@ impl ContentCard {
             (Self::Calculator(_), Self::Calculator(_)) => true,
             (Self::Glance(a), Self::Glance(b)) => a.kind == b.kind,
             (Self::Stats(_), Self::Stats(_)) => true,
+            (Self::Tasks(_), Self::Tasks(_)) => true,
+            (Self::Lyrics(_), Self::Lyrics(_)) => true,
+            (Self::Search(_), Self::Search(_)) => true,
             (Self::Media(a), Self::Media(b)) => a.same_track(b) && a.art == b.art,
             (Self::Dictation(a), Self::Dictation(b)) => a.phase == b.phase,
+            (Self::Lens(_), Self::Lens(_)) => true,
             (a, b) => a == b,
         }
     }
@@ -558,12 +623,16 @@ impl ContentCard {
     pub fn animates(&self) -> bool {
         match self {
             Self::Media(media) => media.playing,
+            Self::Lyrics(lyrics) => lyrics.playing,
+            Self::Search(_) => false,
             Self::Dictation(_) | Self::Intro => true,
             Self::Notification(_)
+            | Self::Lens(_)
             | Self::Converter(_)
             | Self::Agent(_)
             | Self::Calculator(_)
             | Self::Stats(_)
+            | Self::Tasks(_)
             | Self::Glance(_) => false,
         }
     }
@@ -612,6 +681,7 @@ impl ContentSnapshot {
 pub enum WidgetKind {
     /// The running agent, while there is one.
     Agent,
+    Tasks,
     Calculator,
     Stats,
 }
@@ -628,6 +698,11 @@ fn idle_player() -> MediaCard {
         accent: None,
         scrub: None,
         volume: None,
+        device: None,
+        source_icon: None,
+        lyrics: false,
+        spotify: Default::default(),
+        skips: Default::default(),
     }
 }
 
@@ -637,6 +712,8 @@ pub struct IslandState {
     pub calculator: Option<crate::widgets::Calculator>,
     /// Live system readings while the stats widget is enabled.
     pub stats: Option<crate::widgets::SystemStats>,
+    /// The to-do list and focus timer, while the tasks widget is on.
+    pub tasks: Option<crate::tasks::TasksCard>,
     /// The page the user scrolled to; `None` is the music player, which
     /// the opened island always starts on. Kept across collapse.
     pub widget: Option<WidgetKind>,
@@ -653,11 +730,27 @@ pub struct IslandState {
     /// The time and readings the glance shows (`kind` is set when drawn).
     pub glance_info: GlanceCard,
     pub dictation: Option<DictationCard>,
+    /// Onyx Lens is open: the island is its toolbar, at the top.
+    pub lens: Option<crate::lens::LensCard>,
     pub needs_input: Option<NotificationCard>,
     pub done: Option<NotificationCard>,
     pub running: Option<AgentCard>,
     /// The player shown in the main pill.
     pub media: Option<MediaCard>,
+    /// Bluetooth earbuds or headphones connected, for the music card.
+    pub audio_device: Option<DeviceBadge>,
+    /// The song (title, artist) that has lyrics, for the lyrics button.
+    pub lyrics_found: Option<(String, String)>,
+    /// Icons of the apps that played, by their short name ("Spotify").
+    pub source_icons: Vec<(String, crate::media::ArtImage)>,
+    /// Spotify search is open: shown over the player and the lyrics until
+    /// closed.
+    pub search: Option<crate::spotify::SearchCard>,
+    /// What the music card's Spotify pill offers.
+    pub spotify_pill: crate::spotify::SpotifyPill,
+    /// The lyrics view is open: the opened island shows it in place of the
+    /// player until it is closed.
+    pub lyrics: Option<crate::lyrics::LyricsCard>,
     /// A second player, playing at the same time. It waits in the round
     /// bubble beside the pill until it is clicked.
     pub other_media: Option<MediaCard>,
@@ -694,6 +787,7 @@ impl Default for IslandState {
             converter: None,
             calculator: None,
             stats: None,
+            tasks: None,
             widget: None,
             cpu_hot: false,
             intro: false,
@@ -702,10 +796,17 @@ impl Default for IslandState {
             compact_widget: None,
             glance_info: GlanceCard::default(),
             dictation: None,
+            lens: None,
             needs_input: None,
             done: None,
             running: None,
             media: None,
+            audio_device: None,
+            source_icons: Vec::new(),
+            lyrics_found: None,
+            search: None,
+            spotify_pill: crate::spotify::SpotifyPill::Hidden,
+            lyrics: None,
             other_media: None,
             media_dismissed: false,
             media_condensed: false,
@@ -761,9 +862,24 @@ impl IslandState {
         self.expanded
             && self.converter.is_none()
             && self.dictation.is_none()
+            && self.lens.is_none()
             && self.needs_input.is_none()
             && self.done.is_none()
             && self.pages().len() >= 2
+            && !self.lyrics_visible()
+            && !self.search_visible()
+    }
+
+    /// Spotify search is on screen (it takes the keyboard).
+    #[must_use]
+    pub fn search_visible(&self) -> bool {
+        self.expanded && self.primary_kind() == Some(CardKind::Search)
+    }
+
+    /// The lyrics view is on screen (its wheel scrolls the lines).
+    #[must_use]
+    pub fn lyrics_visible(&self) -> bool {
+        self.expanded && self.primary_kind() == Some(CardKind::Lyrics)
     }
 
     fn widget_enabled(&self, kind: WidgetKind) -> bool {
@@ -771,6 +887,7 @@ impl IslandState {
             WidgetKind::Agent => self.running.is_some(),
             WidgetKind::Calculator => self.calculator.is_some(),
             WidgetKind::Stats => self.stats.is_some(),
+            WidgetKind::Tasks => self.tasks.is_some(),
         }
     }
 
@@ -779,7 +896,7 @@ impl IslandState {
     fn pages(&self) -> Vec<Option<WidgetKind>> {
         let mut pages = Vec::with_capacity(4);
         pages.push(None);
-        for kind in [WidgetKind::Agent, WidgetKind::Calculator, WidgetKind::Stats] {
+        for kind in [WidgetKind::Agent, WidgetKind::Tasks, WidgetKind::Calculator, WidgetKind::Stats] {
             if self.widget_enabled(kind) {
                 pages.push(Some(kind));
             }
@@ -795,11 +912,28 @@ impl IslandState {
     /// The opened island's player: the live one, else the last song
     /// played, else an empty player.
     fn player_card(&self) -> MediaCard {
-        self.media
+        let mut card = self
+            .media
             .clone()
             .or_else(|| self.other_media.clone())
             .or_else(|| self.remembered.clone())
-            .unwrap_or_else(idle_player)
+            .unwrap_or_else(idle_player);
+        card.device = self.audio_device;
+        card.source_icon = self
+            .source_icons
+            .iter()
+            .find(|(source, _)| *source == card.source)
+            .map(|(_, icon)| icon.clone());
+        card.lyrics = self
+            .lyrics_found
+            .as_ref()
+            .is_some_and(|(title, artist)| *title == card.title && *artist == card.artist);
+        card.spotify = match self.spotify_pill {
+            // Offered while Spotify is what plays.
+            crate::spotify::SpotifyPill::Connect if card.source != "Spotify" => crate::spotify::SpotifyPill::Hidden,
+            pill => pill,
+        };
+        card
     }
 
     fn widget_card(&self, kind: WidgetKind) -> Option<ContentCard> {
@@ -807,6 +941,7 @@ impl IslandState {
             WidgetKind::Agent => self.running.clone().map(ContentCard::Agent),
             WidgetKind::Calculator => self.calculator.clone().map(ContentCard::Calculator),
             WidgetKind::Stats => self.stats.clone().map(ContentCard::Stats),
+            WidgetKind::Tasks => self.tasks.clone().map(ContentCard::Tasks),
         }
     }
 
@@ -818,7 +953,7 @@ impl IslandState {
 
     #[must_use]
     pub fn has_activity(&self) -> bool {
-        self.converter.is_some() || self.dictation.is_some()
+        self.converter.is_some() || self.dictation.is_some() || self.lens.is_some()
             || self.needs_input.is_some()
             || self.done.is_some()
             || self.running.is_some()
@@ -826,8 +961,21 @@ impl IslandState {
             || self.other_media.is_some()
             || self.calculator.is_some()
             || self.stats.is_some()
+            || self.focus_running()
             || self.glance.is_some()
             || self.compact_widget.is_some()
+    }
+
+    /// The focus timer is counting (a session or its break).
+    #[must_use]
+    pub fn focus_running(&self) -> bool {
+        self.tasks.as_ref().is_some_and(|tasks| tasks.focus.is_some())
+    }
+
+    /// The tasks page is on screen.
+    #[must_use]
+    pub fn tasks_visible(&self) -> bool {
+        self.expanded && self.primary_kind() == Some(CardKind::Tasks)
     }
 
     fn glance_card(&self) -> Option<ContentCard> {
@@ -856,6 +1004,9 @@ impl IslandState {
 
     #[must_use]
     pub fn primary_card(&self) -> Option<ContentCard> {
+        if let Some(lens) = self.lens {
+            return Some(ContentCard::Lens(lens));
+        }
         if let Some(dictation) = &self.dictation {
             return Some(ContentCard::Dictation(dictation.clone()));
         }
@@ -884,8 +1035,16 @@ impl IslandState {
             // Opened: the music player, unless another page was chosen.
             return match self.current_page() {
                 Some(kind) => self.widget_card(kind),
-                None => Some(ContentCard::Media(self.player_card())),
+                None => match (&self.search, &self.lyrics) {
+                    (Some(search), _) => Some(ContentCard::Search(search.clone())),
+                    (None, Some(lyrics)) => Some(ContentCard::Lyrics(lyrics.clone())),
+                    (None, None) => Some(ContentCard::Media(self.player_card())),
+                },
             };
+        }
+        // The focus timer keeps its countdown on the pill.
+        if let Some(tasks) = self.tasks.as_ref().filter(|tasks| tasks.focus.is_some()) {
+            return Some(ContentCard::Tasks(tasks.clone()));
         }
         if let Some(kind) = self.compact_widget {
             return Some(ContentCard::Glance(GlanceCard { kind, ..self.glance_info.clone() }));
@@ -942,7 +1101,7 @@ impl IslandState {
 
     /// Whether the main pill is the music player (and so can shrink).
     fn media_is_main(&self) -> bool {
-        if self.dictation.is_some() || self.media.is_none() {
+        if self.dictation.is_some() || self.lens.is_some() || self.media.is_none() {
             return false;
         }
         if self.splits() {
@@ -964,6 +1123,7 @@ impl IslandState {
             Some(ContentCard::Glance(glance)) if glance.kind == IdleGlance::Stats => GLANCE_STATS,
             Some(ContentCard::Glance(glance)) if glance.kind == IdleGlance::Eyes => GLANCE_EYES,
             Some(ContentCard::Glance(_)) => GLANCE_CLOCK,
+            Some(ContentCard::Tasks(_)) => FOCUS,
             _ => COMPACT,
         }
     }
@@ -978,6 +1138,9 @@ impl IslandState {
 
     #[must_use]
     pub fn layout(&self) -> LayoutTarget {
+        if let Some(lens) = self.lens {
+            return LayoutTarget::single(lens.size());
+        }
         if self.dictation.is_some() {
             return LayoutTarget::single(DICTATION);
         }
@@ -1006,6 +1169,9 @@ impl IslandState {
                 Some(CardKind::Calculator) => LayoutTarget::single(CALCULATOR),
                 Some(CardKind::Converter) => LayoutTarget::single(PillSize::new(crate::converter::WIDTH,crate::converter::HEIGHT,38.0)),
                 Some(CardKind::Stats) => LayoutTarget::single(STATS),
+                Some(CardKind::Tasks) => LayoutTarget::single(TASKS),
+                Some(CardKind::Lyrics) => LayoutTarget::single(LYRICS),
+                Some(CardKind::Search) => LayoutTarget::single(SEARCH),
                 Some(CardKind::Media) if self.expanded_switcher() => {
                     LayoutTarget::split(MEDIA, SWITCH_BUBBLE)
                 }
@@ -1034,10 +1200,11 @@ impl IslandState {
         }
 
         let (primary, secondary) = if self.dictation.is_some()
+            || self.lens.is_some()
             || (self.expanded
                 && matches!(
                     self.primary_kind(),
-                    Some(CardKind::Calculator | CardKind::Stats | CardKind::Converter)
+                    Some(CardKind::Calculator | CardKind::Stats | CardKind::Tasks | CardKind::Converter | CardKind::Lyrics | CardKind::Search)
                 ))
         {
             (self.primary_card(), None)
@@ -1116,6 +1283,21 @@ pub enum IslandEvent {
     SetConverter(Option<crate::converter::ConverterCard>),
     SetCalculatorEnabled(bool),
     SetStatsEnabled(bool),
+    /// The to-do list and focus timer as shown, or `None` with the widget off.
+    SetTasks(Option<crate::tasks::TasksCard>),
+    /// Spotify search as shown, or `None` once closed.
+    SetSearch(Option<crate::spotify::SearchCard>),
+    /// What the music card's Spotify pill offers.
+    SetSpotifyPill(crate::spotify::SpotifyPill),
+    /// The song (title, artist) that has lyrics, or `None`.
+    SetLyricsFound(Option<(String, String)>),
+    /// An app's icon, for its round button on the music card.
+    SetSourceIcon(String, crate::media::ArtImage),
+    /// Bluetooth earbuds or headphones connected (with their battery), or
+    /// `None`.
+    SetAudioDevice(Option<DeviceBadge>),
+    /// The lyrics view as shown, or `None` once closed.
+    SetLyrics(Option<crate::lyrics::LyricsCard>),
     /// A new reading (ignored unless the stats widget is enabled).
     SetStats(crate::widgets::SystemStats),
     SetCpuHot(bool),
@@ -1153,6 +1335,8 @@ pub enum IslandEvent {
     SetExpandTrigger(ExpandTrigger),
     SetTucked(bool),
     SetDictation(Option<DictationCard>),
+    /// Onyx Lens opened, changed its tools, or closed (`None`).
+    SetLens(Option<crate::lens::LensCard>),
     SetMedia(Option<MediaCard>),
     /// The second player, or `None` when only one is active.
     SetOtherMedia(Option<MediaCard>),
@@ -1265,9 +1449,16 @@ pub fn reduce(state: &mut IslandState, event: IslandEvent, now: f64) -> Vec<Effe
                 let pages = state.pages();
                 let current = state.current_page();
                 let index = pages.iter().position(|page| *page == current).unwrap_or(0);
-                let step = if forward { 1 } else { pages.len() - 1 };
-                state.widget = pages[(index + step) % pages.len()];
-                Effect::changed()
+                // Like a list: down goes on, up goes back, and the ends
+                // stop rather than wrap round to the other end.
+                let next = if forward { index + 1 } else { index.wrapping_sub(1) };
+                match pages.get(next) {
+                    Some(&page) => {
+                        state.widget = page;
+                        Effect::changed()
+                    }
+                    None => Vec::new(),
+                }
             } else {
                 Vec::new()
             }
@@ -1304,7 +1495,8 @@ pub fn reduce(state: &mut IslandState, event: IslandEvent, now: f64) -> Vec<Effe
             }
             state.pointer_inside = false;
             let mut effects = vec![Effect::CancelTimer(TimerKind::HoverExpand)];
-            if state.expanded && state.converter.is_none() {
+            // The converter, the lyrics and search stay open until closed.
+            if state.expanded && state.converter.is_none() && state.lyrics.is_none() && state.search.is_none() {
                 effects.push(Effect::ArmTimer {
                     kind: TimerKind::HoverCollapse,
                     after_ms: HOVER_COLLAPSE_MS,
@@ -1346,7 +1538,7 @@ pub fn reduce(state: &mut IslandState, event: IslandEvent, now: f64) -> Vec<Effe
             }
         }
         IslandEvent::HoverCollapseElapsed => {
-            if state.converter.is_some() { return Vec::new(); }
+            if state.converter.is_some() || state.lyrics.is_some() || state.search.is_some() { return Vec::new(); }
             if !state.pointer_inside && state.expanded {
                 state.expanded = false;
                 vec![Effect::LayoutChanged]
@@ -1355,6 +1547,10 @@ pub fn reduce(state: &mut IslandState, event: IslandEvent, now: f64) -> Vec<Effe
             }
         }
         IslandEvent::Click => {
+            // Open lyrics close only with their own button.
+            if state.expanded && (state.lyrics.is_some() || state.search.is_some()) {
+                return Vec::new();
+            }
             if state.has_activity() {
                 state.expanded = !state.expanded;
                 let mut effects = vec![Effect::LayoutChanged];
@@ -1423,6 +1619,82 @@ pub fn reduce(state: &mut IslandState, event: IslandEvent, now: f64) -> Vec<Effe
         IslandEvent::SetDictation(card) => {
             if state.dictation != card {
                 state.dictation = card;
+                Effect::changed()
+            } else {
+                Vec::new()
+            }
+        }
+        IslandEvent::SetSearch(card) => {
+            if state.search == card {
+                return Vec::new();
+            }
+            state.search = card;
+            Effect::changed()
+        }
+        IslandEvent::SetSpotifyPill(pill) => {
+            if state.spotify_pill == pill {
+                return Vec::new();
+            }
+            state.spotify_pill = pill;
+            if state.expanded && state.primary_kind() == Some(CardKind::Media) {
+                Effect::changed()
+            } else {
+                Vec::new()
+            }
+        }
+        IslandEvent::SetLyricsFound(song) => {
+            if state.lyrics_found == song {
+                return Vec::new();
+            }
+            state.lyrics_found = song;
+            if state.expanded && state.primary_kind() == Some(CardKind::Media) {
+                Effect::changed()
+            } else {
+                Vec::new()
+            }
+        }
+        IslandEvent::SetSourceIcon(source, icon) => {
+            if state.source_icons.iter().any(|(known, _)| *known == source) {
+                return Vec::new();
+            }
+            state.source_icons.push((source, icon));
+            if state.expanded && state.primary_kind() == Some(CardKind::Media) {
+                Effect::changed()
+            } else {
+                Vec::new()
+            }
+        }
+        IslandEvent::SetAudioDevice(device) => {
+            if state.audio_device == device {
+                return Vec::new();
+            }
+            state.audio_device = device;
+            if state.expanded && state.primary_kind() == Some(CardKind::Media) {
+                Effect::changed()
+            } else {
+                Vec::new()
+            }
+        }
+        IslandEvent::SetLyrics(card) => {
+            if state.lyrics == card {
+                return Vec::new();
+            }
+            state.lyrics = card;
+            Effect::changed()
+        }
+        IslandEvent::SetTasks(card) => {
+            if state.tasks == card {
+                return Vec::new();
+            }
+            if card.is_none() && state.widget == Some(WidgetKind::Tasks) {
+                state.widget = None;
+            }
+            state.tasks = card;
+            Effect::changed()
+        }
+        IslandEvent::SetLens(card) => {
+            if state.lens != card {
+                state.lens = card;
                 Effect::changed()
             } else {
                 Vec::new()
@@ -1621,7 +1893,14 @@ fn accent_for_card(card: &ContentCard) -> [u8; 3] {
         ContentCard::Glance(_) => [214, 218, 228],
         ContentCard::Calculator(_) => [164, 204, 180],
         ContentCard::Stats(_) => [110, 190, 255],
+        ContentCard::Tasks(tasks) => match tasks.focus.map(|focus| focus.phase) {
+            Some(crate::tasks::FocusPhase::Break) => [110, 214, 160],
+            _ => [255, 176, 92],
+        },
         ContentCard::Media(media) => media.accent.unwrap_or(DEFAULT_MEDIA_ACCENT),
+        ContentCard::Lyrics(lyrics) => lyrics.accent.unwrap_or(DEFAULT_MEDIA_ACCENT),
+        // Spotify's green.
+        ContentCard::Search(_) => [30, 215, 96],
         ContentCard::Notification(notification) => match notification.level {
             AlertLevel::Info => [110, 150, 255],
             AlertLevel::Success => [64, 210, 122],
@@ -1635,7 +1914,7 @@ fn accent_for_card(card: &ContentCard) -> [u8; 3] {
         },
         // Chosen in `IslandState::content` from the last music colour.
         ContentCard::Dictation(_) => DICTATION_FALLBACK_ACCENT,
-        ContentCard::Intro => INTRO_ACCENT,
+        ContentCard::Intro | ContentCard::Lens(_) => INTRO_ACCENT,
     }
 }
 
@@ -1714,20 +1993,21 @@ mod tests {
             ..Default::default()
         };
         assert!(state.widget_navigation_available());
-        // Music first, then the agent, then the widgets, and round again.
+        // Music first, then the agent, then the widgets; the last page
+        // is the end (down does not wrap round to the music).
         assert_eq!(state.primary_kind(), Some(CardKind::Media));
         reduce(&mut state, IslandEvent::CycleWidget { forward: true }, 0.0);
         assert_eq!(state.primary_kind(), Some(CardKind::Agent));
         reduce(&mut state, IslandEvent::CycleWidget { forward: true }, 0.5);
         assert_eq!(state.primary_kind(), Some(CardKind::Calculator));
-        reduce(&mut state, IslandEvent::CycleWidget { forward: true }, 1.0);
-        assert_eq!(state.primary_kind(), Some(CardKind::Media));
-        // Scrolling up goes back the same way, wrapping round.
-        reduce(&mut state, IslandEvent::CycleWidget { forward: false }, 1.1);
+        assert!(reduce(&mut state, IslandEvent::CycleWidget { forward: true }, 1.0).is_empty());
         assert_eq!(state.primary_kind(), Some(CardKind::Calculator));
+        // Scrolling up goes back the same way, and stops at the music.
         reduce(&mut state, IslandEvent::CycleWidget { forward: false }, 1.2);
         assert_eq!(state.primary_kind(), Some(CardKind::Agent));
         reduce(&mut state, IslandEvent::CycleWidget { forward: false }, 1.3);
+        assert_eq!(state.primary_kind(), Some(CardKind::Media));
+        assert!(reduce(&mut state, IslandEvent::CycleWidget { forward: false }, 1.4).is_empty());
         assert_eq!(state.primary_kind(), Some(CardKind::Media));
         // Collapsed, the agent keeps the pill as before.
         reduce(&mut state, IslandEvent::SetExpanded(false), 1.5);
@@ -1804,6 +2084,77 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_lyrics_view_takes_the_players_place_until_closed() {
+        let lyrics = crate::lyrics::LyricsCard {
+            title: "Song".into(),
+            artist: "Artist".into(),
+            art: None,
+            accent: None,
+            playing: true,
+            timeline: None,
+            body: crate::lyrics::LyricsBody::Loading,
+            scroll: None,
+            search: false,
+            skips: Default::default(),
+        };
+        let mut state = IslandState {
+            media: Some(media()),
+            stats: Some(crate::widgets::SystemStats::default()),
+            lyrics: Some(lyrics),
+            expanded: true,
+            ..IslandState::default()
+        };
+        assert_eq!(state.primary_kind(), Some(CardKind::Lyrics));
+        assert_eq!(state.layout(), LayoutTarget::single(LYRICS));
+        assert!(state.lyrics_visible());
+        assert!(!state.widget_navigation_available(), "the wheel scrolls the lines");
+        // They stay open when the pointer leaves, and a click on them does
+        // not close them.
+        state.pointer_inside = true;
+        reduce(&mut state, IslandEvent::HoverLeave, 0.0);
+        reduce(&mut state, IslandEvent::HoverCollapseElapsed, 0.0);
+        reduce(&mut state, IslandEvent::Click, 0.0);
+        assert!(state.expanded);
+        // Collapsed, the pill is the music as usual.
+        state.expanded = false;
+        assert_eq!(state.primary_kind(), Some(CardKind::Media));
+        // Closed: the player again.
+        state.expanded = true;
+        reduce(&mut state, IslandEvent::SetLyrics(None), 0.0);
+        assert_eq!(state.primary_kind(), Some(CardKind::Media));
+        assert!(state.widget_navigation_available());
+    }
+
+    #[test]
+    fn the_lyrics_button_is_only_for_the_song_with_lyrics() {
+        let mut state = IslandState { media: Some(media()), expanded: true, ..IslandState::default() };
+        let lyrics = |state: &IslandState| match state.primary_card() {
+            Some(ContentCard::Media(card)) => card.lyrics,
+            other => panic!("{other:?}"),
+        };
+        assert!(!lyrics(&state));
+        let song = state.media.as_ref().map(|card| (card.title.clone(), card.artist.clone()));
+        reduce(&mut state, IslandEvent::SetLyricsFound(song), 0.0);
+        assert!(lyrics(&state));
+        // The next song has none until it is found.
+        if let Some(card) = state.media.as_mut() {
+            card.title = "Another song".into();
+        }
+        assert!(!lyrics(&state));
+    }
+
+    #[test]
+    fn earbuds_show_on_the_opened_player() {
+        let badge = DeviceBadge { kind: DeviceKind::Earbuds, battery: Some(64) };
+        let mut state = IslandState { media: Some(media()), expanded: true, ..IslandState::default() };
+        assert!(!reduce(&mut state, IslandEvent::SetAudioDevice(Some(badge)), 0.0).is_empty());
+        match state.primary_card() {
+            Some(ContentCard::Media(card)) => assert_eq!(card.device, Some(badge)),
+            other => panic!("{other:?}"),
+        }
+    }
+
     fn media() -> MediaCard {
         MediaCard {
             title: "Midnight City".to_owned(),
@@ -1815,6 +2166,11 @@ mod tests {
             accent: None,
             scrub: None,
             volume: None,
+            device: None,
+            source_icon: None,
+            lyrics: false,
+            spotify: Default::default(),
+            skips: Default::default(),
         }
     }
 
@@ -2047,6 +2403,7 @@ mod tests {
             icon: None,
             action: None,
             progress: None,
+            device: None,
         }
     }
 
@@ -2755,8 +3112,9 @@ mod tests {
         assert_eq!(state.layout(), LayoutTarget::single(STATS));
         assert_eq!(state.content().widget_page, 2);
         assert!(state.stats_visible());
+        // The end: down stays on the last page.
         reduce(&mut state, IslandEvent::CycleWidget { forward: true }, 0.2);
-        assert_eq!(state.primary_kind(), Some(CardKind::Media));
+        assert_eq!(state.primary_kind(), Some(CardKind::Stats));
     }
 
     #[test]

@@ -6,7 +6,9 @@ use eframe::egui::{
     self, Align, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Layout,
     Margin, RichText, Stroke, TextStyle,
 };
-use islet_core::config::{ExpandTrigger, IdleGlance, IdleStyle, MonitorChoice, ScreenPosition};
+use islet_core::config::{
+    ExpandTrigger, IdleGlance, IdleStyle, IslandLook, MonitorChoice, ScreenPosition,
+};
 
 use crate::{Page, SettingsApp};
 
@@ -242,7 +244,9 @@ pub fn draw(app: &mut SettingsApp, ctx: &egui::Context) {
                     Page::NowPlaying => now_playing(app, ui),
                     Page::Dictation => crate::dictation_page::show(app, ui),
                     Page::Widgets => widgets(app, ui),
+                    Page::Tasks => crate::tasks_page::show(app, ui),
                     Page::NightLight => crate::night_light_page::show(app, ui),
+                    Page::Lens => crate::lens_page::show(app, ui),
                     Page::About => about(app, ui),
                 }
                 if let Some(status) = &app.status {
@@ -273,7 +277,9 @@ fn sidebar(app: &mut SettingsApp, ui: &mut egui::Ui) {
         (Page::NowPlaying, "Now Playing"),
         (Page::Dictation, "Dictation"),
         (Page::Widgets, "Widgets"),
+        (Page::Tasks, "To-do"),
         (Page::NightLight, "Night light"),
+        (Page::Lens, "Lens"),
     ];
     for (page, label) in pages {
         let (rect, response) =
@@ -420,6 +426,32 @@ fn nav_item(
                 .collect();
             ui.painter().add(egui::Shape::closed_line(points, stroke));
         }
+        Page::Tasks => {
+            // A ticked box.
+            ui.painter().rect_stroke(
+                egui::Rect::from_center_size(center, egui::vec2(13.0, 13.0)),
+                CornerRadius::same(3),
+                stroke,
+                egui::StrokeKind::Middle,
+            );
+            ui.painter().line_segment(
+                [center + egui::vec2(-3.5, 0.2), center + egui::vec2(-1.0, 2.8)],
+                stroke,
+            );
+            ui.painter().line_segment(
+                [center + egui::vec2(-1.0, 2.8), center + egui::vec2(3.8, -2.6)],
+                stroke,
+            );
+        }
+        Page::Lens => {
+            // A magnifying glass: a lens and its handle.
+            let lens = center + egui::vec2(-1.5, -1.5);
+            ui.painter().circle_stroke(lens, 5.0, stroke);
+            ui.painter().line_segment(
+                [lens + egui::vec2(3.6, 3.6), center + egui::vec2(6.5, 6.5)],
+                Stroke::new(1.8, color),
+            );
+        }
         Page::About => {
             ui.painter().circle_stroke(center, 7.0, stroke);
             ui.painter()
@@ -551,6 +583,43 @@ pub(crate) fn segmented<T: PartialEq + Copy>(
     }
 }
 
+/// Windows' "Transparency effects" switch (Settings > Personalization >
+/// Colors). Acrylic, the island's glass included, is solid while it is off.
+fn windows_transparency_on() -> bool {
+    use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
+    let mut value = 1u32;
+    let mut size = std::mem::size_of::<u32>() as u32;
+    // SAFETY: reads one DWORD into a local of that size.
+    let read = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            windows::core::w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
+            windows::core::w!("EnableTransparency"),
+            RRF_RT_REG_DWORD,
+            None,
+            Some((&mut value as *mut u32).cast()),
+            Some(&mut size),
+        )
+    };
+    read.is_err() || value != 0
+}
+
+fn open_color_settings() {
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    // SAFETY: opens a fixed settings URI.
+    unsafe {
+        ShellExecuteW(
+            None,
+            windows::core::w!("open"),
+            windows::core::w!("ms-settings:colors"),
+            None,
+            None,
+            SW_SHOWNORMAL,
+        );
+    }
+}
+
 fn general(app: &mut SettingsApp, ui: &mut egui::Ui) {
     header(ui, "General", "Where your island lives and how it behaves.");
     let mut customize = false;
@@ -572,6 +641,48 @@ fn general(app: &mut SettingsApp, ui: &mut egui::Ui) {
                 );
             },
         );
+        divider(ui);
+        row(
+            ui,
+            "Look",
+            match general.look {
+                IslandLook::Black => "Solid black, like a phone's island.",
+                IslandLook::Glass => "Frosted glass: what's behind shows through, blurred, under a dark tint.",
+            },
+            |ui| {
+                segmented(
+                    ui,
+                    &mut general.look,
+                    &[(IslandLook::Black, "Black"), (IslandLook::Glass, "Glass")],
+                );
+            },
+        );
+        if general.look == IslandLook::Glass {
+            divider(ui);
+            row(
+                ui,
+                "Glass tint",
+                "How dark the glass is. Darker keeps text easy to read over bright pages.",
+                |ui| {
+                    let mut percent = (general.glass_tint * 100.0).round();
+                    ui.add(egui::Slider::new(&mut percent, 0.0..=90.0).suffix("%").integer());
+                    general.glass_tint = (percent / 100.0).clamp(0.0, 0.9);
+                },
+            );
+        }
+        if general.look == IslandLook::Glass && !windows_transparency_on() {
+            divider(ui);
+            row(
+                ui,
+                "Transparency effects are off",
+                "Without them Windows gives no blur, so the glass is clear. Turn them on in Windows' color settings.",
+                |ui| {
+                    if ui.button("Open color settings").clicked() {
+                        open_color_settings();
+                    }
+                },
+            );
+        }
         divider(ui);
         row(
             ui,
@@ -753,6 +864,33 @@ fn now_playing(app: &mut SettingsApp, ui: &mut egui::Ui) {
                 toggle(ui, &mut media.color_tint, "Tint from album art");
             },
         );
+        divider(ui);
+        row(
+            ui,
+            "Earbuds and headphones",
+            "Show when Bluetooth earbuds connect or run low, with their battery.",
+            |ui| {
+                toggle(ui, &mut media.bluetooth, "Earbuds and headphones");
+            },
+        );
+        divider(ui);
+        let status = spotify_status();
+        let detail = match status {
+            SpotifyStatus::Premium => "Connected. Search and play songs from the music card.",
+            SpotifyStatus::Free => "Connected, but searching and playing from Onyx needs Premium.",
+            SpotifyStatus::Disconnected => "Search and play songs from the island. Needs Spotify Premium.",
+        };
+        row(ui, "Spotify", detail, |ui| {
+            ui.horizontal(|ui| {
+                if media.spotify {
+                    let connected = status != SpotifyStatus::Disconnected;
+                    if ui.button(if connected { "Disconnect" } else { "Connect" }).clicked() {
+                        tell_island_spotify(!connected);
+                    }
+                }
+                toggle(ui, &mut media.spotify, "Spotify");
+            });
+        });
     });
 
     let mut remove = None;
@@ -855,7 +993,7 @@ fn widgets(app: &mut SettingsApp, ui: &mut egui::Ui) {
     });
     ui.add_space(4.0);
     ui.label(RichText::new("Using widgets").font(bold_font(14.0)));
-    ui.label(RichText::new("Expand the island, then scroll to switch between your current activity and each widget.").color(MUTED));
+    ui.label(RichText::new("Expand the island, then scroll to switch between your current activity and each widget. The to-do list has its own page in the sidebar.").color(MUTED));
     ui.add_space(4.0);
     ui.label(RichText::new("Widgets appear only in expanded mode. The collapsed island keeps your current activity or configured idle appearance.").small().color(MUTED));
 }
@@ -915,4 +1053,40 @@ fn about(app: &mut SettingsApp, ui: &mut egui::Ui) {
             .color(MUTED),
         );
     });
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SpotifyStatus {
+    Premium,
+    Free,
+    Disconnected,
+}
+
+/// What the island last found of the Spotify account (Settings never sees
+/// the sign-in itself).
+fn spotify_status() -> SpotifyStatus {
+    let path = std::env::var_os("APPDATA")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default()
+        .join("Islet")
+        .join("spotify-status.txt");
+    match std::fs::read_to_string(path).as_deref().map(str::trim) {
+        Ok("premium") => SpotifyStatus::Premium,
+        Ok("free") => SpotifyStatus::Free,
+        _ => SpotifyStatus::Disconnected,
+    }
+}
+
+/// Asks the island to connect Spotify (it opens the sign-in page) or to
+/// forget the account.
+fn tell_island_spotify(connect: bool) {
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, PostMessageW, RegisterWindowMessageW};
+    // SAFETY: registers a message name and posts it to the island window.
+    unsafe {
+        let message = RegisterWindowMessageW(windows::core::w!("Onyx.Spotify"));
+        if let Ok(island) = FindWindowW(windows::core::w!("IsletIslandWindow"), None) {
+            let _ = PostMessageW(Some(island), message, WPARAM(usize::from(connect)), LPARAM(0));
+        }
+    }
 }

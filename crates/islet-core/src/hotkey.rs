@@ -281,6 +281,8 @@ pub enum HotkeyError {
     NeedsSide,
     /// Esc cancels a dictation, so it cannot be a hotkey.
     ReservedKey,
+    /// A system-wide shortcut needs an ordinary key, not modifiers alone.
+    NeedsKey,
 }
 
 impl fmt::Display for HotkeyError {
@@ -295,6 +297,7 @@ impl fmt::Display for HotkeyError {
             ),
             Self::NeedsSide => write!(f, "choose the left or right key, or add a second key"),
             Self::ReservedKey => write!(f, "Esc is reserved for cancelling a dictation"),
+            Self::NeedsKey => write!(f, "add a key such as S or Space; modifiers alone can't be a shortcut"),
         }
     }
 }
@@ -509,6 +512,27 @@ impl fmt::Display for Combo {
         }
         Ok(())
     }
+}
+
+/// `MOD_ALT`, `MOD_CONTROL`, `MOD_SHIFT` and `MOD_WIN` for `RegisterHotKey`.
+const SYSTEM_MODIFIERS: [(Group, u32); 4] = [
+    (Group::Alt, 0x1),
+    (Group::Ctrl, 0x2),
+    (Group::Shift, 0x4),
+    (Group::Win, 0x8),
+];
+
+/// A combo as a system-wide shortcut for `RegisterHotKey`: its `MOD_*`
+/// flags and virtual key. Windows does not tell left from right there, so
+/// a side ("Right Ctrl+S") is accepted as either side.
+pub fn system_shortcut(text: &str) -> Result<(u32, u16), HotkeyError> {
+    let combo = Combo::parse(text)?;
+    let key = combo.key.ok_or(HotkeyError::NeedsKey)?;
+    let modifiers = SYSTEM_MODIFIERS
+        .iter()
+        .filter(|(group, _)| combo.modifiers.group(*group).is_some())
+        .fold(0, |flags, (_, flag)| flags | flag);
+    Ok((modifiers, key))
 }
 
 /// What the dictation controller should do. Delivered in order.
@@ -1481,5 +1505,16 @@ mod tests {
             all(&release(&mut fsm, &[VK_RWIN, VK_RCONTROL], 2.0)),
             [Action::Stop]
         );
+    }
+
+    #[test]
+    fn system_shortcuts_need_a_key_and_map_modifiers() {
+        assert_eq!(system_shortcut("Ctrl+Shift+Space"), Ok((0x2 | 0x4, VK_SPACE)));
+        assert_eq!(system_shortcut("Right Alt+S"), Ok((0x1, u16::from(b'S'))));
+        assert_eq!(system_shortcut("Win+Shift+F9"), Ok((0x8 | 0x4, 0x78)));
+        assert_eq!(system_shortcut("F9"), Ok((0, 0x78)));
+        assert_eq!(system_shortcut("Ctrl+Win"), Err(HotkeyError::NeedsKey));
+        assert_eq!(system_shortcut("B"), Err(HotkeyError::NeedsModifier));
+        assert_eq!(system_shortcut(""), Err(HotkeyError::Empty));
     }
 }

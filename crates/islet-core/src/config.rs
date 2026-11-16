@@ -26,6 +26,28 @@ pub struct Config {
     pub agents: AgentConfig,
     pub widgets: WidgetConfig,
     pub night_light: NightLightConfig,
+    pub lens: LensConfig,
+}
+
+/// Onyx Lens: press a shortcut, then circle anything on screen to copy its
+/// text, translate it, search it or ask AI about it. It runs in its own
+/// helper process (`onyx-lens.exe`), which Onyx starts and ends.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LensConfig {
+    pub enabled: bool,
+    /// A key plus modifiers, as `"Ctrl+Shift+Space"`. A modifier-only combo
+    /// cannot be a system-wide shortcut, so it is not accepted here.
+    pub hotkey: String,
+}
+
+impl Default for LensConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            hotkey: "Ctrl+Shift+Space".to_owned(),
+        }
+    }
 }
 
 /// Warms the screen at night (less blue light), like f.lux.
@@ -62,6 +84,7 @@ impl Default for Config {
             agents: AgentConfig::default(),
             widgets: WidgetConfig::default(),
             night_light: NightLightConfig::default(),
+            lens: LensConfig::default(),
         }
     }
 }
@@ -98,6 +121,22 @@ pub struct GeneralConfig {
     /// With only the eyes showing, the island waits as a small circle in
     /// this corner (swiped there); anything else shows in the middle.
     pub corner: IslandCorner,
+    /// What the island is made of.
+    pub look: IslandLook,
+    /// With the glass look: how dark its tint is, 0 (clear) to 1 (black).
+    pub glass_tint: f32,
+}
+
+/// The island's material.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IslandLook {
+    /// Solid black, as on a phone.
+    #[default]
+    Black,
+    /// Frosted glass: what is behind shows, blurred (while Windows'
+    /// transparency effects are on; clear otherwise), under a dark tint.
+    Glass,
 }
 
 /// Where the eyes-only island waits along its edge.
@@ -122,10 +161,28 @@ pub struct WidgetConfig {
     /// only while it is on screen; the CPU alone, every two seconds, for the
     /// hot-CPU glow otherwise.
     pub system_stats: bool,
+    /// The to-do list page, with reminders and the focus timer.
+    pub tasks: bool,
+    /// A focus session's length, in minutes.
+    pub focus_minutes: u32,
+    /// The break after one, in minutes.
+    pub break_minutes: u32,
+    /// A sound with reminders and when a focus session or break ends.
+    pub task_sound: bool,
 }
 
 impl Default for WidgetConfig {
-    fn default()->Self { Self { file_converter:true,calculator:false,system_stats:false } }
+    fn default() -> Self {
+        Self {
+            file_converter: true,
+            calculator: false,
+            system_stats: false,
+            tasks: true,
+            focus_minutes: 25,
+            break_minutes: 5,
+            task_sound: true,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -293,6 +350,12 @@ pub struct MediaConfig {
     /// and "JioSaavn" both work). youtube.com is handled separately: only
     /// music videos count, unless "youtube" itself is listed here.
     pub music_sites: Vec<String>,
+    /// Say when Bluetooth earbuds or headphones connect and leave, and when
+    /// they run low, with their battery.
+    pub bluetooth: bool,
+    /// Offer Spotify search and play on the island (with a connected
+    /// Premium account).
+    pub spotify: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -332,6 +395,8 @@ impl Default for GeneralConfig {
             top_expanded_scale: 1.0,
             bottom_expanded_scale: 1.0,
             corner: IslandCorner::Middle,
+            look: IslandLook::Black,
+            glass_tint: 0.45,
         }
     }
 }
@@ -381,6 +446,8 @@ impl Default for MediaConfig {
                 .iter()
                 .map(|site| (*site).to_owned())
                 .collect(),
+            bluetooth: true,
+            spotify: true,
         }
     }
 }
@@ -492,6 +559,7 @@ impl Config {
         self.dictation.push_to_talk = self.dictation.push_to_talk.trim().to_owned();
         self.dictation.hands_free = self.dictation.hands_free.trim().to_owned();
         self.dictation.assistant_hotkey = self.dictation.assistant_hotkey.trim().to_owned();
+        self.lens.hotkey = self.lens.hotkey.trim().to_owned();
         self.media.pause_hide_seconds = self.media.pause_hide_seconds.clamp(1, 300);
         for list in [&mut self.dictation.dictionary, &mut self.dictation.snippets] {
             list.retain(|entry| !entry.from.trim().is_empty());

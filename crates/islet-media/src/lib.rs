@@ -70,6 +70,8 @@ pub struct MediaInfo {
     pub rate: f64,
     pub art: Option<ArtImage>,
     pub accent: Option<[u8; 3]>,
+    /// Which of previous and next the player offers.
+    pub skips: islet_core::media::Skips,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -81,65 +83,129 @@ pub enum MediaCommand {
     Seek(f64),
 }
 
-/// One-shot pause independent of the island's music filter and visibility.
-/// WinRT work stays off the recording/UI threads; nothing runs while disabled.
-pub fn pause_playing_media() {
-    static RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if RUNNING.swap(true, Ordering::AcqRel) {
-        return;
-    }
-    let spawned = std::thread::Builder::new()
-        .name("islet-pause-media".to_owned())
-        .spawn(|| {
-            struct Reset;
-            impl Drop for Reset {
-                fn drop(&mut self) {
-                    RUNNING.store(false, Ordering::Release);
-                }
-            }
-            let _reset = Reset;
-            // SAFETY: initialization and cleanup occur on this worker thread.
-            if let Err(error) = unsafe { RoInitialize(RO_INIT_MULTITHREADED) } {
-                tracing::debug!(%error, "media pause initialization failed");
-                return;
-            }
-            let result = (|| -> WinResult<()> {
-                let manager = Manager::RequestAsync()?.join()?;
-                let sessions = manager.GetSessions()?;
-                // Issue every request before waiting for any individual player.
-                let mut pending = Vec::new();
-                for index in 0..sessions.Size()? {
-                    let Ok(session) = sessions.GetAt(index) else {
-                        continue;
-                    };
-                    let status = session
-                        .GetPlaybackInfo()
-                        .and_then(|info| info.PlaybackStatus());
-                    if matches!(status, Ok(PlaybackStatus::Playing)) {
-                        match session.TryPauseAsync() {
-                            Ok(operation) => pending.push(operation),
-                            Err(error) => tracing::debug!(%error, "media pause request failed"),
+/// What dictation asks of the players it pauses.
+enum PauseRequest {
+    Pause,
+    Resume,
+}
+
+/// The worker that pauses players for dictation and plays them again after.
+/// Started on first use (only with "Pause media during dictation" on), it
+/// sleeps on its channel between requests. One thread keeps them in order:
+/// a short dictation's resume never overtakes its own pause.
+fn pause_worker() -> Option<Sender<PauseRequest>> {
+    static WORKER: std::sync::OnceLock<Option<Sender<PauseRequest>>> = std::sync::OnceLock::new();
+    WORKER
+        .get_or_init(|| {
+            let (tx, rx) = unbounded::<PauseRequest>();
+            let spawned = std::thread::Builder::new()
+                .name("islet-pause-media".to_owned())
+                .spawn(move || {
+                    // SAFETY: initialization and cleanup occur on this worker thread.
+                    if let Err(error) = unsafe { RoInitialize(RO_INIT_MULTITHREADED) } {
+                        tracing::debug!(%error, "media pause initialization failed");
+                        return;
+                    }
+                    // The players this paused, by app id, until resumed.
+                    let mut paused: Vec<HSTRING> = Vec::new();
+                    for request in rx {
+                        let result = match request {
+                            PauseRequest::Pause => pause_sessions(&mut paused),
+                            PauseRequest::Resume => resume_sessions(std::mem::take(&mut paused)),
+                        };
+                        if let Err(error) = result {
+                            tracing::debug!(%error, "could not reach media players for dictation");
                         }
                     }
+                    unsafe { RoUninitialize() };
+                });
+            match spawned {
+                Ok(_) => Some(tx),
+                Err(error) => {
+                    tracing::warn!(%error, "could not start media pause worker");
+                    None
                 }
-                for operation in pending {
-                    match operation.join() {
-                        Ok(true) => {}
-                        Ok(false) => tracing::debug!("media app declined pause"),
-                        Err(error) => tracing::debug!(%error, "media pause failed"),
-                    }
-                }
-                Ok(())
-            })();
-            if let Err(error) = result {
-                tracing::debug!(%error, "could not enumerate media for dictation");
             }
-            unsafe { RoUninitialize() };
-        });
-    if let Err(error) = spawned {
-        RUNNING.store(false, Ordering::Release);
-        tracing::warn!(%error, "could not start media pause worker");
+        })
+        .clone()
+}
+
+/// Pauses every playing player, independent of the island's music filter
+/// and visibility, and remembers which ones for [`resume_paused_media`].
+/// WinRT work stays off the recording and UI threads.
+pub fn pause_playing_media() {
+    if let Some(worker) = pause_worker() {
+        let _ = worker.send(PauseRequest::Pause);
     }
+}
+
+/// Plays again what [`pause_playing_media`] paused, if it is still paused
+/// (a player the user started or closed meanwhile is left alone).
+pub fn resume_paused_media() {
+    if let Some(worker) = pause_worker() {
+        let _ = worker.send(PauseRequest::Resume);
+    }
+}
+
+fn pause_sessions(paused: &mut Vec<HSTRING>) -> WinResult<()> {
+    let manager = Manager::RequestAsync()?.join()?;
+    let sessions = manager.GetSessions()?;
+    // Issue every request before waiting for any individual player.
+    let mut pending = Vec::new();
+    for index in 0..sessions.Size()? {
+        let Ok(session) = sessions.GetAt(index) else {
+            continue;
+        };
+        let status = session.GetPlaybackInfo().and_then(|info| info.PlaybackStatus());
+        if matches!(status, Ok(PlaybackStatus::Playing)) {
+            match session.TryPauseAsync() {
+                Ok(operation) => pending.push((session.SourceAppUserModelId().ok(), operation)),
+                Err(error) => tracing::debug!(%error, "media pause request failed"),
+            }
+        }
+    }
+    for (app, operation) in pending {
+        match operation.join() {
+            Ok(true) => {
+                if let Some(app) = app.filter(|app| !paused.contains(app)) {
+                    paused.push(app);
+                }
+            }
+            Ok(false) => tracing::debug!("media app declined pause"),
+            Err(error) => tracing::debug!(%error, "media pause failed"),
+        }
+    }
+    Ok(())
+}
+
+fn resume_sessions(paused: Vec<HSTRING>) -> WinResult<()> {
+    if paused.is_empty() {
+        return Ok(());
+    }
+    let manager = Manager::RequestAsync()?.join()?;
+    let sessions = manager.GetSessions()?;
+    let mut pending = Vec::new();
+    for index in 0..sessions.Size()? {
+        let Ok(session) = sessions.GetAt(index) else {
+            continue;
+        };
+        let ours = session.SourceAppUserModelId().is_ok_and(|app| paused.contains(&app));
+        let status = session.GetPlaybackInfo().and_then(|info| info.PlaybackStatus());
+        if ours && matches!(status, Ok(PlaybackStatus::Paused)) {
+            match session.TryPlayAsync() {
+                Ok(operation) => pending.push(operation),
+                Err(error) => tracing::debug!(%error, "media resume request failed"),
+            }
+        }
+    }
+    for operation in pending {
+        match operation.join() {
+            Ok(true) => {}
+            Ok(false) => tracing::debug!("media app declined resume"),
+            Err(error) => tracing::debug!(%error, "media resume failed"),
+        }
+    }
+    Ok(())
 }
 
 enum Message {
@@ -149,6 +215,9 @@ enum Message {
     Filter(MusicFilter),
     PauseHold(Duration),
     Held(bool),
+    /// A hidden tab's cover, downloaded off this thread: the song it is
+    /// for and the image file.
+    Cover(String, Vec<u8>),
     Stop,
 }
 
@@ -365,6 +434,7 @@ struct TrackCache {
 struct Playback {
     playing: bool,
     rate: f64,
+    skips: islet_core::media::Skips,
 }
 
 struct TimelineSample {
@@ -423,9 +493,12 @@ fn run(
         .map_err(|error| tracing::warn!(%error, "browser tab titles unavailable"))
         .ok();
     let mut state = State {
+        tx: tx.clone(),
         filter,
         hidden: None,
         hidden_poll_at: None,
+        art_retry_at: None,
+        art_retry: (String::new(), 0),
         last_played: None,
         tabs,
         recheck_at: None,
@@ -461,6 +534,7 @@ fn run(
                 state.players.clear();
             }
             let info = state.info();
+            state.plan_art_retry(&info);
             if let Some(playing) = info.iter().find(|info| info.playing) {
                 if state.last_played.as_deref() != Some(playing.app_id.as_str()) {
                     state.last_played = Some(playing.app_id.clone());
@@ -475,7 +549,7 @@ fn run(
 
         // Idle: block, except for a pending tab re-check or a paused player
         // whose hold runs out.
-        let wake = [state.recheck_at, state.next_expiry(), state.hidden_poll_at]
+        let wake = [state.recheck_at, state.next_expiry(), state.hidden_poll_at, state.art_retry_at]
             .into_iter()
             .flatten()
             .min();
@@ -495,6 +569,12 @@ fn run(
                             .is_some_and(|at| at <= std::time::Instant::now())
                         {
                             state.hidden_poll_at = None;
+                        }
+                        if state.art_retry_at.is_some_and(|at| at <= std::time::Instant::now()) {
+                            // Read the players' details again, cover and all.
+                            state.art_retry_at = None;
+                            pending.merge(Refresh::ALL);
+                            continue;
                         }
                         pending.merge(Refresh {
                             sessions: true,
@@ -605,7 +685,15 @@ impl Player {
                 .ok()
                 .filter(|rate| *rate > 0.0)
                 .unwrap_or(1.0);
-            self.playback = Some(Playback { playing, rate });
+            // What the player says it can do; read failures leave both on.
+            let skips = info
+                .Controls()
+                .map(|controls| islet_core::media::Skips {
+                    previous: controls.IsPreviousEnabled().unwrap_or(true),
+                    next: controls.IsNextEnabled().unwrap_or(true),
+                })
+                .unwrap_or_default();
+            self.playback = Some(Playback { playing, rate, skips });
         }
 
         if flags.timeline {
@@ -626,10 +714,10 @@ impl Player {
         if self.cache.title.is_empty() && self.cache.artist.is_empty() {
             return None;
         }
-        let (playing, rate) = self
+        let (playing, rate, skips) = self
             .playback
             .as_ref()
-            .map_or((false, 1.0), |playback| (playback.playing, playback.rate));
+            .map_or((false, 1.0, islet_core::media::Skips::default()), |playback| (playback.playing, playback.rate, playback.skips));
         let (position, duration) = self.timeline.as_ref().map_or((0.0, 0.0), |timeline| {
             let mut position = timeline.position;
             if playing && timeline.updated > 0 {
@@ -652,6 +740,7 @@ impl Player {
             rate,
             art: self.cache.art.clone(),
             accent: self.cache.accent,
+            skips,
         })
     }
 
@@ -699,6 +788,9 @@ struct HiddenTab {
     artist: String,
     playing: bool,
     heard_at: std::time::Instant,
+    /// The cover, from the video in the tab's address (YouTube).
+    art: Option<ArtImage>,
+    accent: Option<[u8; 3]>,
 }
 
 impl HiddenTab {
@@ -726,10 +818,51 @@ impl HiddenTab {
             position: 0.0,
             duration: 0.0,
             rate: 1.0,
-            art: None,
-            accent: None,
+            art: self.art.clone(),
+            accent: self.accent,
+            skips: islet_core::media::Skips::default(),
         }
     }
+}
+
+/// Sites recognised by their address when their tab's title does not say
+/// (a music player's page titled with just the song).
+const MUSIC_HOSTS: &[&str] = &["music.youtube.com", "open.spotify.com", "soundcloud.com", "www.deezer.com", "music.apple.com", "listen.tidal.com", "www.jiosaavn.com"];
+
+fn host_of(address: &str) -> &str {
+    address.split("://").nth(1).unwrap_or("").split(['/', '?', '#']).next().unwrap_or("")
+}
+
+/// The YouTube video in an address (`watch?v=ID`, also on YouTube Music).
+fn youtube_video(address: &str) -> Option<&str> {
+    let host = host_of(address);
+    if !(host == "youtube.com" || host.ends_with(".youtube.com")) {
+        return None;
+    }
+    let query = address.split_once('?')?.1;
+    let id = query.split('&').find_map(|pair| pair.strip_prefix("v="))?;
+    let id = id.split('#').next().unwrap_or(id);
+    (id.len() >= 6 && id.len() <= 20 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')).then_some(id)
+}
+
+/// A YouTube video's thumbnail, from YouTube's own image server (the page
+/// already shows it). Small: the island crops it square.
+/// Downloads on a thread of its own (the media thread never waits on the
+/// network) and posts the file back as [`Message::Cover`].
+fn fetch_youtube_cover(id: String, song: String, tx: Sender<Message>) {
+    let _ = std::thread::Builder::new().name("cover".to_owned()).spawn(move || {
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(3))
+            .timeout_read(Duration::from_secs(4))
+            .build();
+        let Ok(response) = agent.get(&format!("https://i.ytimg.com/vi/{id}/mqdefault.jpg")).call() else {
+            return;
+        };
+        let mut bytes = Vec::new();
+        if std::io::Read::read_to_end(&mut std::io::Read::take(response.into_reader(), 1_000_000), &mut bytes).is_ok() {
+            let _ = tx.send(Message::Cover(song, bytes));
+        }
+    });
 }
 
 /// While a hidden tab plays, how often its player bar is read again (the
@@ -737,6 +870,8 @@ impl HiddenTab {
 const HIDDEN_TAB_POLL: Duration = Duration::from_secs(2);
 
 struct State {
+    /// For work done off the media thread to report back.
+    tx: Sender<Message>,
     filter: MusicFilter,
     hidden: Option<HiddenTab>,
     hidden_poll_at: Option<std::time::Instant>,
@@ -750,6 +885,11 @@ struct State {
     /// an hour costs one re-check, not a timer.
     rechecked: std::collections::HashSet<String>,
     artist_badges: ArtistBadges,
+    /// A shown player has no cover yet (browsers often send it a moment
+    /// after the title, without telling Windows it changed): look again
+    /// then. With the song it was for, and how many looks so far.
+    art_retry_at: Option<std::time::Instant>,
+    art_retry: (String, u8),
     /// The shown players, first-started first.
     players: Vec<Player>,
     /// Music sessions that started playing, in that order.
@@ -761,6 +901,31 @@ struct State {
 }
 
 impl State {
+    /// Up to three more looks, a second and a half apart, for the cover of
+    /// a shown song that has none.
+    fn plan_art_retry(&mut self, info: &[MediaInfo]) {
+        const LOOKS: u8 = 3;
+        let missing = info
+            .iter()
+            .find(|info| info.art.is_none() && !info.title.is_empty() && !info.app_id.contains('#'));
+        let Some(missing) = missing else {
+            self.art_retry_at = None;
+            return;
+        };
+        let song = format!("{}|{}", missing.app_id, missing.title);
+        if self.art_retry.0 != song {
+            self.art_retry = (song, 0);
+        }
+        if self.art_retry.1 >= LOOKS {
+            self.art_retry_at = None;
+            return;
+        }
+        if self.art_retry_at.is_none() {
+            self.art_retry.1 += 1;
+            self.art_retry_at = Some(std::time::Instant::now() + Duration::from_millis(1_500 * u64::from(self.art_retry.1)));
+        }
+    }
+
     fn handle(&mut self, message: Message, pending: &mut Refresh) {
         let sessions = Refresh {
             sessions: true,
@@ -796,6 +961,13 @@ impl State {
             Message::Held(held) => {
                 self.held = held;
                 if !held {
+                    pending.merge(sessions);
+                }
+            }
+            Message::Cover(song, bytes) => {
+                if let Some(hidden) = self.hidden.as_mut().filter(|hidden| hidden.title == song && hidden.art.is_none()) {
+                    hidden.art = decode_image(&bytes);
+                    hidden.accent = hidden.art.as_ref().and_then(|art| dominant_color(&art.pixels, art.width, art.height));
                     pending.merge(sessions);
                 }
             }
@@ -961,10 +1133,14 @@ impl State {
             .collect();
         let audible = reader.audible_titles();
         let found = audible.iter().find(|tab| {
+            let names_reported = reported.iter().any(|(_, track)| MusicFilter::tab_names_track(tab, track));
+            if names_reported {
+                return false;
+            }
+            // By its title, or (a page titled with just the song) by its
+            // address.
             self.filter.is_music_site_tab(tab)
-                && !reported
-                    .iter()
-                    .any(|(_, track)| MusicFilter::tab_names_track(tab, track))
+                || reader.page_address(tab).is_some_and(|address| MUSIC_HOSTS.contains(&host_of(&address)))
         });
         match found {
             Some(tab) => {
@@ -980,6 +1156,17 @@ impl State {
                         (title, artist)
                     })
                     .unwrap_or_else(|| (site_trimmed(tab), String::new()));
+                // The same song keeps its cover; a new one fetches its own.
+                let (art, accent) = match self.hidden.as_ref().filter(|hidden| hidden.title == title) {
+                    Some(hidden) => (hidden.art.clone(), hidden.accent),
+                    None => {
+                        // Arrives as `Message::Cover`.
+                        if let Some(id) = reader.page_address(tab).as_deref().and_then(youtube_video) {
+                            fetch_youtube_cover(id.to_owned(), title.clone(), self.tx.clone());
+                        }
+                        (None, None)
+                    }
+                };
                 self.hidden = Some(HiddenTab {
                     browser,
                     tab: tab.clone(),
@@ -987,6 +1174,8 @@ impl State {
                     artist,
                     playing: true,
                     heard_at: now,
+                    art,
+                    accent,
                 });
             }
             None => {
@@ -1057,6 +1246,62 @@ impl ArtistBadges {
     }
 }
 
+/// Like [`explain_sessions`], but yes/no facts only: no titles of songs
+/// or tabs, so it is fine to share.
+pub fn explain_sessions_privately(filter: &MusicFilter) -> Vec<String> {
+    // SAFETY: balanced with RoUninitialize below on success.
+    let initialised = unsafe { RoInitialize(RO_INIT_MULTITHREADED) }.is_ok();
+    let lines = (|| -> WinResult<Vec<String>> {
+        let manager = Manager::RequestAsync()?.join()?;
+        let mut reader = tabs::TabReader::new().ok();
+        let titles = reader.as_mut().map(tabs::TabReader::titles).unwrap_or_default();
+        let audible_tabs = reader.as_mut().map(tabs::TabReader::audible_titles).unwrap_or_default();
+        let sessions = manager.GetSessions()?;
+        let by_address = audible_tabs
+            .iter()
+            .filter(|tab| reader.as_mut().and_then(|reader| reader.page_address(tab)).is_some_and(|address| MUSIC_HOSTS.contains(&host_of(&address))))
+            .count();
+        let mut lines = vec![format!(
+            "playing-sound tabs on a music site by address: {by_address}"
+        ), format!(
+            "tabs: {}  music-site tabs: {}  tabs playing sound: {}  music-site tabs playing sound: {}",
+            titles.len(),
+            titles.iter().filter(|tab| filter.is_music_site_tab(tab)).count(),
+            audible_tabs.len(),
+            audible_tabs.iter().filter(|tab| filter.is_music_site_tab(tab)).count(),
+        )];
+        for index in 0..sessions.Size()? {
+            let session = sessions.GetAt(index)?;
+            let app_id = session.SourceAppUserModelId()?.to_string_lossy();
+            let properties = session.TryGetMediaPropertiesAsync()?.join()?;
+            let title = properties.Title()?.to_string_lossy();
+            let artist = properties.Artist()?.to_string_lossy();
+            let is_browser = is_browser_name(&app_display_name(&app_id));
+            let status = session
+                .GetPlaybackInfo()
+                .and_then(|info| info.PlaybackStatus())
+                .map_or_else(|_| "unknown".to_owned(), |status| format!("{status:?}"));
+            let facts = SessionFacts { app: &app_id, is_browser, flagged_video: false, title: &title, artist: &artist };
+            let named_by = titles.iter().find(|tab| MusicFilter::tab_names_track(tab, &title));
+            let mut audible = || audible_tabs.clone();
+            let accepted = filter.is_music(facts, &titles, &mut audible);
+            lines.push(format!(
+                "{app_id} [{status}] browser: {is_browser}  has title: {}  a tab names it: {}  that tab is a music site: {}  => accepted: {accepted}",
+                !title.is_empty(),
+                named_by.is_some(),
+                named_by.is_some_and(|tab| filter.is_music_site_tab(tab)),
+            ));
+        }
+        Ok(lines)
+    })()
+    .unwrap_or_else(|error| vec![format!("failed: {error}")]);
+    if initialised {
+        // SAFETY: balances the successful RoInitialize above.
+        unsafe { RoUninitialize() };
+    }
+    lines
+}
+
 /// For the `media_why` example: one line per media session saying how the
 /// music filter judged it. Never called by the app; prints titles, so only
 /// for the user's own console.
@@ -1100,7 +1345,8 @@ pub fn explain_sessions(filter: &MusicFilter) -> Vec<String> {
                 title: &title,
                 artist: &artist,
             };
-            let accepted = filter.is_music(facts, &titles);
+            let mut audible = || reader.as_mut().map(tabs::TabReader::audible_titles).unwrap_or_default();
+            let accepted = filter.is_music(facts, &titles, &mut audible);
             let doubtful = filter.doubtful_youtube_tab(facts, &titles);
             let found = match (doubtful, reader.as_mut()) {
                 (Some(tab), Some(reader)) => Some(reader.official_artist(tab)),
@@ -1203,7 +1449,10 @@ fn pick_session(
             title: &title,
             artist: &artist,
         };
-        let mut is_music = filter.is_music(facts, titles);
+        let mut is_music = {
+            let mut audible = || tabs.as_deref_mut().map(tabs::TabReader::audible_titles).unwrap_or_default();
+            filter.is_music(facts, titles, &mut audible)
+        };
         // The title did not look like a song: an artist's own channel still
         // makes it music.
         if !is_music {
@@ -1310,6 +1559,15 @@ fn read_stream(reference: &IRandomAccessStreamReference) -> WinResult<Vec<u8>> {
     Ok(bytes)
 }
 
+/// Decodes a cover (JPEG, PNG...) into square premultiplied BGRA, on the
+/// calling thread (which must have COM initialised).
+pub fn decode_image(bytes: &[u8]) -> Option<ArtImage> {
+    // SAFETY: in-process COM activation on the caller's initialised thread.
+    let wic: IWICImagingFactory =
+        unsafe { CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER) }.ok()?;
+    decode_art(&wic, bytes).ok()
+}
+
 /// Decodes any WIC-supported image, centre-crops it square, and scales it to
 /// `ART_SIZE` premultiplied BGRA.
 fn decode_art(wic: &IWICImagingFactory, bytes: &[u8]) -> WinResult<ArtImage> {
@@ -1324,6 +1582,10 @@ fn decode_art(wic: &IWICImagingFactory, bytes: &[u8]) -> WinResult<ArtImage> {
         let frame = decoder.GetFrame(0)?;
         let (mut width, mut height) = (0u32, 0u32);
         frame.GetSize(&mut width, &mut height)?;
+        // Covers are small; a giant (or lying) header is not decoded.
+        if width == 0 || height == 0 || width > 8_192 || height > 8_192 {
+            return Err(windows::core::Error::from(windows::Win32::Foundation::E_INVALIDARG));
+        }
         let side = width.min(height).max(1);
         let clipper = wic.CreateBitmapClipper()?;
         clipper.Initialize(
@@ -1387,6 +1649,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_youtube_address_gives_its_video() {
+        assert_eq!(youtube_video("https://music.youtube.com/watch?v=Sz-zo83cogY&list=RDAMVM"), Some("Sz-zo83cogY"));
+        assert_eq!(youtube_video("https://www.youtube.com/watch?v=Sz-zo83cogY"), Some("Sz-zo83cogY"));
+        assert_eq!(youtube_video("https://www.youtube.com/watch?list=x&v=abcDEF_12-x#t=3"), Some("abcDEF_12-x"));
+        assert_eq!(youtube_video("https://example.com/watch?v=Sz-zo83cogY"), None);
+        assert_eq!(youtube_video("https://www.youtube.com/feed/subscriptions"), None);
+        assert_eq!(host_of("https://music.youtube.com/watch?v=1"), "music.youtube.com");
+    }
+
+    #[test]
     fn a_hidden_music_tab_reads_as_a_player() {
         assert_eq!(site_trimmed("Lofi beat - SoundCloud"), "Lofi beat");
         assert_eq!(site_trimmed("Song | Bandcamp"), "Song");
@@ -1398,6 +1670,8 @@ mod tests {
             artist: "Hozie".to_owned(),
             playing: true,
             heard_at: std::time::Instant::now(),
+            art: None,
+            accent: None,
         };
         let info = hidden.info();
         assert_eq!(info.app_id, "308046B0AF4A39CB#YouTube Music");
@@ -1416,6 +1690,8 @@ mod tests {
             artist: String::new(),
             playing: true,
             heard_at: std::time::Instant::now(),
+            art: None,
+            accent: None,
         };
         let firefox = MediaInfo {
             app_id: "308046B0AF4A39CB".to_owned(),
@@ -1428,6 +1704,7 @@ mod tests {
             rate: 1.0,
             art: None,
             accent: None,
+            skips: islet_core::media::Skips::default(),
         };
         assert!(hidden.shown_by(std::slice::from_ref(&firefox)));
         // A different song in the browser's session leaves the tab its own.

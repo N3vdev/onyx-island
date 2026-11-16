@@ -26,6 +26,38 @@ pub fn now() -> (String, String) {
     }
 }
 
+/// Seconds the local clock is ahead of UTC (negative behind), to the minute.
+pub fn utc_offset() -> i64 {
+    use windows::Win32::System::SystemInformation::GetSystemTime;
+    // SAFETY: no arguments; both return times by value.
+    let (local, utc) = unsafe { (GetLocalTime(), GetSystemTime()) };
+    let offset = civil_seconds(&local) - civil_seconds(&utc);
+    (offset as f64 / 60.0).round() as i64 * 60
+}
+
+/// Whether the user's time format is 12-hour ("1:00 PM", not "13:00").
+pub fn twelve_hour() -> bool {
+    use windows::Win32::Foundation::SYSTEMTIME;
+    let afternoon = SYSTEMTIME { wYear: 2026, wMonth: 1, wDay: 1, wHour: 13, ..Default::default() };
+    let mut buffer = [0u16; 64];
+    // SAFETY: as in `now`.
+    let written = unsafe {
+        GetTimeFormatEx(PCWSTR::null(), TIME_NOSECONDS, Some(&afternoon), PCWSTR::null(), Some(&mut buffer))
+    };
+    !text(&buffer, written).contains("13")
+}
+
+fn civil_seconds(time: &windows::Win32::Foundation::SYSTEMTIME) -> i64 {
+    islet_core::tasks::civil_seconds(
+        time.wYear.into(),
+        time.wMonth.into(),
+        time.wDay.into(),
+        time.wHour.into(),
+        time.wMinute.into(),
+        time.wSecond.into(),
+    )
+}
+
 fn text(buffer: &[u16], written: i32) -> String {
     let length = usize::try_from(written).unwrap_or(0).saturating_sub(1);
     String::from_utf16_lossy(&buffer[..length.min(buffer.len())])
@@ -51,5 +83,11 @@ mod tests {
         assert!(date.len() > 6, "{date}");
         let wait = until_next_minute();
         assert!((50..=60_050).contains(&wait));
+    }
+
+    #[test]
+    fn the_utc_offset_is_whole_minutes() {
+        assert_eq!(utc_offset() % 60, 0);
+        assert!(utc_offset().abs() <= 14 * 3600);
     }
 }

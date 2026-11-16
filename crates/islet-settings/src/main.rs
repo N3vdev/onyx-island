@@ -10,6 +10,8 @@ mod autostart;
 mod customize;
 mod dictation_page;
 mod folder_picker;
+mod lens_page;
+mod tasks_page;
 mod night_light_page;
 mod onboarding;
 mod practice;
@@ -63,6 +65,8 @@ fn main() -> eframe::Result {
         Some("dictation" | "models") => Page::Dictation,
         Some("widgets") => Page::Widgets,
         Some("night-light" | "night") => Page::NightLight,
+        Some("lens") => Page::Lens,
+        Some("tasks" | "todo") => Page::Tasks,
         Some("about") => Page::About,
         _ => Page::General,
     };
@@ -107,7 +111,9 @@ pub enum Page {
     NowPlaying,
     Dictation,
     Widgets,
+    Tasks,
     NightLight,
+    Lens,
     About,
 }
 
@@ -124,6 +130,7 @@ pub struct SettingsApp {
     status: Option<String>,
     dictation_ui: dictation_page::DictationUi,
     night_light_ui: night_light_page::NightLightUi,
+    tasks_ui: tasks_page::TasksUi,
     /// One-shot initial scroll position (`--scroll <px>`, for development).
     initial_scroll: Option<f32>,
 }
@@ -151,6 +158,7 @@ impl SettingsApp {
             status: None,
             dictation_ui: dictation_page::DictationUi::new(),
             night_light_ui: night_light_page::NightLightUi::default(),
+            tasks_ui: tasks_page::TasksUi::default(),
             initial_scroll: std::env::args()
                 .skip_while(|arg| arg != "--scroll")
                 .nth(1)

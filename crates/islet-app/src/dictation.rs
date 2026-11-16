@@ -43,6 +43,8 @@ use crate::settings;
 pub enum UiUpdate {
     /// One-shot request after a real recording has been confirmed.
     PauseMedia,
+    /// The dictation that paused the media is over: play it again.
+    ResumeMedia,
     /// Show (or update) the dictation pill; `None` hides it.
     Card(Option<DictationCard>),
     /// A transient message ("model not installed", an error).
@@ -51,6 +53,8 @@ pub enum UiUpdate {
     Media(islet_core::command::MediaVerb),
     /// The AI dictation download started from the island.
     AiDownload(AiDownload),
+    /// "Remind me to…": add this to the to-do list.
+    AddTask(String),
 }
 
 /// How the AI dictation download started from the island is going.
@@ -132,6 +136,7 @@ fn command_kind(command: &islet_core::command::Command) -> &'static str {
         Command::Search { .. } => "search",
         Command::Screenshot => "screenshot",
         Command::Lock => "lock",
+        Command::AddTask(_) => "add task",
     }
 }
 
@@ -238,6 +243,8 @@ struct Controller {
     config: DictationConfig,
     text_options: TextOptions,
     paused: bool,
+    /// This dictation paused the media; it resumes when the dictation ends.
+    media_paused: bool,
     ui: Sender<UiUpdate>,
     notify: Arc<dyn Fn() + Send + Sync>,
 
@@ -326,6 +333,7 @@ impl Controller {
             text_options: TextOptions::from_config(&config),
             config,
             paused: false,
+            media_paused: false,
             ui,
             notify,
             hook,
@@ -765,6 +773,7 @@ impl Controller {
         }
         if self.config.pause_media {
             self.send(UiUpdate::PauseMedia);
+            self.media_paused = true;
         }
         self.warm_polisher();
         if self.config.tones {
@@ -851,6 +860,7 @@ impl Controller {
         self.phase = Phase::Idle;
         self.last_used = Instant::now();
         self.recording_ended();
+        self.resume_media();
         self.hide();
     }
 
@@ -865,8 +875,17 @@ impl Controller {
         self.model = ModelState::NotLoaded;
         self.asr.shutdown();
         self.recording_ended();
+        self.resume_media();
         self.hide();
         self.notice(title, body, AlertLevel::Error);
+    }
+
+    /// The dictation is over (typed, cancelled or failed): media it paused
+    /// plays again.
+    fn resume_media(&mut self) {
+        if std::mem::take(&mut self.media_paused) {
+            self.send(UiUpdate::ResumeMedia);
+        }
     }
 
     /// Tells the hotkey state machine a recording ended on our side.
@@ -1111,6 +1130,7 @@ impl Controller {
         if text.is_empty() {
             self.phase = Phase::Idle;
             self.recording_ended();
+            self.resume_media();
             self.hide();
             if heard_silence {
                 // Most often the wrong input device (a virtual or muted one).
@@ -1140,6 +1160,17 @@ impl Controller {
     fn run_command(&mut self, said: &str) {
         self.phase = Phase::Idle;
         self.recording_ended();
+        // "Pause", "next song", "play lo-fi": a music command decides what
+        // plays now, so what dictation paused stays paused.
+        let music_command = islet_core::command::parse_all(said).is_some_and(|commands| {
+            commands.iter().any(|command| {
+                matches!(command, islet_core::command::Command::Media(_) | islet_core::command::Command::Play { .. })
+            })
+        });
+        if music_command {
+            self.media_paused = false;
+        }
+        self.resume_media();
         self.hide();
         self.last_used = Instant::now();
         use islet_core::command::Command;
@@ -1183,6 +1214,13 @@ impl Controller {
                 if let Some((title, body)) = reply.notice {
                     last_notice = Some((title, body, reply.icon));
                 }
+                opened = None;
+                continue;
+            }
+            if let Command::AddTask(text) = command {
+                tracing::info!("assistant: add task");
+                // The island adds it and says so.
+                self.send(UiUpdate::AddTask(text.clone()));
                 opened = None;
                 continue;
             }
@@ -1342,6 +1380,7 @@ impl Controller {
                 // if it was playing.
                 self.phase = Phase::Idle;
                 self.recording_ended();
+                self.resume_media();
                 self.hide();
                 if self.config.copy_to_clipboard && !report.clipboard_saved {
                     self.notice(
@@ -1357,6 +1396,7 @@ impl Controller {
                 tracing::error!(%error, "could not insert the dictated text");
                 self.phase = Phase::Idle;
                 self.recording_ended();
+                self.resume_media();
                 self.hide();
                 self.notice("Can't insert", &error.to_string(), AlertLevel::Error);
             }
@@ -1429,6 +1469,7 @@ impl Controller {
             icon,
             action: None,
             progress: None,
+            device: None,
         }));
     }
 
@@ -1452,6 +1493,7 @@ impl Controller {
             icon: None,
             action: Some(NoticeAction::DownloadAiCleanup),
             progress: None,
+            device: None,
         }));
     }
 
@@ -1493,6 +1535,7 @@ mod tests {
             text_options: TextOptions::from_config(&config),
             config,
             paused: false,
+            media_paused: false,
             ui,
             notify: Arc::new(|| {}),
             hook: None,
@@ -1622,7 +1665,7 @@ mod tests {
     }
 
     #[test]
-    fn media_pause_is_opt_in_and_sent_once_per_confirmed_recording() {
+    fn media_pause_is_opt_in_and_resumes_once_when_the_dictation_ends() {
         for enabled in [false, true] {
             let (tx, rx) = unbounded();
             let mut controller = controller(tx);
@@ -1655,6 +1698,14 @@ mod tests {
                 .filter(|update| matches!(update, UiUpdate::PauseMedia))
                 .count();
             assert_eq!(pauses, usize::from(enabled));
+            // Ending the dictation plays it again, once.
+            controller.discard();
+            controller.discard();
+            let resumes = rx
+                .try_iter()
+                .filter(|update| matches!(update, UiUpdate::ResumeMedia))
+                .count();
+            assert_eq!(resumes, usize::from(enabled));
         }
     }
 

@@ -29,6 +29,8 @@ enum HotkeyTarget {
     PushToTalk,
     HandsFree,
     Assistant,
+    /// Onyx Lens, on its own page.
+    Lens,
 }
 
 /// A hotkey being captured: held keys are polled until all are released.
@@ -581,6 +583,49 @@ fn cross_button(ui: &mut egui::Ui) -> egui::Response {
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
+fn apply_capture(app: &mut SettingsApp, target: HotkeyTarget, text: String) {
+    match target {
+        HotkeyTarget::PushToTalk => app.config.dictation.push_to_talk = text,
+        HotkeyTarget::HandsFree => app.config.dictation.hands_free = text,
+        HotkeyTarget::Assistant => app.config.dictation.assistant_hotkey = text,
+        // A system-wide shortcut: it needs a key, not modifiers alone.
+        HotkeyTarget::Lens => match islet_core::hotkey::system_shortcut(&text) {
+            Ok(_) => app.config.lens.hotkey = text,
+            Err(error) => app.dictation_ui.capture_error = Some(sentence(&error.to_string())),
+        },
+    }
+}
+
+/// An error message as a sentence: capitalised, with a full stop.
+fn sentence(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => format!("{}{}.", first.to_uppercase(), chars.as_str()),
+        None => String::new(),
+    }
+}
+
+/// The Lens page's shortcut row. It shares the key capture the dictation
+/// hotkeys use.
+pub(crate) fn lens_hotkey_row(app: &mut SettingsApp, ui: &mut egui::Ui) {
+    if let Some((target, text)) = app.dictation_ui.poll_capture() {
+        apply_capture(app, target, text);
+    }
+    if app.dictation_ui.capture.is_some() {
+        ui.ctx().request_repaint();
+    }
+    hotkey_row(
+        app,
+        ui,
+        HotkeyTarget::Lens,
+        "Shortcut",
+        "Press it in any app, then circle what you want. Use a key with Ctrl, Alt, Shift or Win.",
+    );
+    if let Some(error) = &app.dictation_ui.capture_error {
+        ui.label(RichText::new(error).small().color(DANGER));
+    }
+}
+
 fn hotkey_row(
     app: &mut SettingsApp,
     ui: &mut egui::Ui,
@@ -597,6 +642,7 @@ fn hotkey_row(
         HotkeyTarget::PushToTalk => app.config.dictation.push_to_talk.clone(),
         HotkeyTarget::HandsFree => app.config.dictation.hands_free.clone(),
         HotkeyTarget::Assistant => app.config.dictation.assistant_hotkey.clone(),
+        HotkeyTarget::Lens => app.config.lens.hotkey.clone(),
     };
     let is_set = !current.trim().is_empty();
     let mut start_capture = false;
@@ -633,6 +679,7 @@ fn hotkey_row(
             HotkeyTarget::PushToTalk => app.config.dictation.push_to_talk.clear(),
             HotkeyTarget::HandsFree => app.config.dictation.hands_free.clear(),
             HotkeyTarget::Assistant => app.config.dictation.assistant_hotkey.clear(),
+            HotkeyTarget::Lens => app.config.lens.hotkey.clear(),
         }
         app.dictation_ui.capture = None;
         app.dictation_ui.capture_error = None;
@@ -955,11 +1002,7 @@ pub fn show(app: &mut SettingsApp, ui: &mut egui::Ui) {
     let ctx = ui.ctx().clone();
     app.dictation_ui.poll_jobs();
     if let Some((target, text)) = app.dictation_ui.poll_capture() {
-        match target {
-            HotkeyTarget::PushToTalk => app.config.dictation.push_to_talk = text,
-            HotkeyTarget::HandsFree => app.config.dictation.hands_free = text,
-            HotkeyTarget::Assistant => app.config.dictation.assistant_hotkey = text,
-        }
+        apply_capture(app, target, text);
     }
     if app.dictation_ui.capture.is_some()
         || !app.dictation_ui.jobs.is_empty()
@@ -1159,7 +1202,7 @@ pub fn show(app: &mut SettingsApp, ui: &mut egui::Ui) {
         row(
             ui,
             "Pause media during dictation",
-            "Pause playing music and videos when recording starts. Resume them yourself afterward.",
+            "Pause playing music and videos while you dictate. They play again when you finish.",
             |ui| {
                 toggle(
                     ui,

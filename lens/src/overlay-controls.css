@@ -1,0 +1,285 @@
+/* Floating bars, shared by the live overlay and the settings preview.
+   They wear Onyx's island look (black, or its glass; see the end), so the
+   island and the lens read as one thing. Each button is an icon plus a
+   short label. Motion is short and transform/opacity-only, so it stays on
+   the compositor and costs nothing once it has played. */
+:root {
+  /* The edge glow sits at 9. Keep interactive chrome above all canvas layers. */
+  --overlay-controls-layer: 10;
+  --overlay-feedback-layer: 11;
+  /* Onyx's island: black, a thin light outline, pill shapes, white text,
+     and the island's lavender for what is on (its lens toolbar's look). */
+  --bar-bg: #000;
+  --bar-border: rgba(255, 255, 255, 0.17);
+  --bar-text: rgb(240, 241, 244);
+  --bar-muted: rgb(150, 155, 166);
+  --bar-hover: rgba(255, 255, 255, 0.12);
+  --bar-active: rgba(255, 255, 255, 0.16);
+  --bar-shadow: 0 14px 34px -14px rgba(0, 0, 0, 0.65), 0 2px 6px rgba(0, 0, 0, 0.22);
+  --bar-accent: rgb(168, 178, 255);
+  --on-bar-accent: rgb(240, 241, 244);
+  --bar-pressed: rgba(168, 178, 255, 0.26);
+  --bar-pressed-hover: rgba(168, 178, 255, 0.34);
+  --bar-primary: rgba(168, 178, 255, 0.34);
+  --bar-radius: 22px;
+  --bar-font: "Inter", "Inter Variable", "Segoe UI Variable", "Segoe UI", sans-serif;
+  --control-ease: cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.capture-controls {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  align-items: center;
+  box-sizing: border-box;
+  gap: 2px;
+  padding: 4px;
+  background: var(--bar-bg);
+  border: 1px solid var(--bar-border);
+  border-radius: var(--bar-radius);
+  box-shadow: var(--bar-shadow);
+  color: var(--bar-text);
+  cursor: default;
+}
+
+#action-bar, #tool-bar {
+  position: absolute;
+  z-index: var(--overlay-controls-layer);
+  max-width: min(880px, calc(100vw - 24px));
+}
+
+#action-bar {
+  animation: bar-in 260ms var(--control-ease) both;
+  transform-origin: top center;
+}
+
+#tool-bar {
+  top: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  flex-wrap: nowrap;
+  max-width: calc(100vw - 112px);
+  flex-wrap: wrap;
+  animation: toolbar-in 300ms var(--control-ease) both;
+}
+
+#action-bar[hidden], #tool-bar[hidden], #tool-bar [hidden], #overlay-close[hidden] {
+  display: none !important;
+}
+
+@keyframes bar-in {
+  from { opacity: 0; transform: translateY(-6px) scale(0.98); }
+  to { opacity: 1; transform: none; }
+}
+
+@keyframes toolbar-in {
+  from { opacity: 0; transform: translate(-50%, -8px); }
+  to { opacity: 1; transform: translate(-50%, 0); }
+}
+
+@keyframes button-in {
+  from { opacity: 0; transform: translateY(3px); }
+  to { opacity: 1; transform: none; }
+}
+
+.capture-controls button, .capture-control {
+  appearance: none;
+  box-sizing: border-box;
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 34px;
+  padding: 0 13px 0 10px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--bar-text);
+  font: 500 12px/1 var(--bar-font);
+  letter-spacing: 0.005em;
+  white-space: nowrap;
+  cursor: pointer;
+  transition:
+    background-color 140ms var(--control-ease),
+    color 140ms var(--control-ease),
+    transform 90ms var(--control-ease);
+}
+
+/* Buttons arrive one after another (--i is set per button). */
+#action-bar button {
+  animation: button-in 240ms var(--control-ease) both;
+  animation-delay: calc(var(--i, 0) * 22ms + 40ms);
+}
+
+.capture-controls button:hover {
+  background: var(--bar-hover);
+}
+
+.capture-controls button:active {
+  transform: scale(0.96);
+  background: var(--bar-active);
+}
+
+.capture-controls button:focus-visible {
+  outline: 2px solid var(--bar-accent);
+  outline-offset: 1px;
+}
+
+.action-icon {
+  width: 16px;
+  height: 16px;
+  flex: 0 0 16px;
+  opacity: 0.86;
+  transition: opacity 140ms var(--control-ease), transform 200ms var(--control-ease);
+}
+
+#overlay-close {
+  position: absolute;
+  top: 20px;
+  right: 16px;
+  z-index: var(--overlay-feedback-layer);
+  width: 34px;
+  padding: 0;
+  justify-content: center;
+  background: var(--bar-bg);
+  border: 1px solid var(--bar-border);
+  box-shadow: var(--bar-shadow);
+}
+
+#overlay-close:hover { background: #1d1d20; }
+#overlay-close:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
+
+.capture-controls button:hover .action-icon {
+  opacity: 1;
+}
+
+.action-label {
+  display: inline-block;
+}
+
+/* The main action of a bar (Copy, Copy translation...) and the active tool
+   take the island's lavender, as its own toolbar shows the tool that is on. */
+.capture-controls button.primary,
+.capture-control.primary {
+  background: var(--bar-primary);
+  color: var(--bar-text);
+}
+
+.capture-controls button[aria-pressed="true"] {
+  background: var(--bar-pressed);
+  color: var(--bar-text);
+}
+
+.capture-controls button.primary .action-icon,
+.capture-controls button[aria-pressed="true"] .action-icon { opacity: 1; }
+
+.capture-controls button.primary:hover,
+.capture-controls button[aria-pressed="true"]:hover {
+  background: var(--bar-pressed-hover);
+}
+
+/* A result flash ("Copied", "Found 3") swaps the label in place. */
+#action-bar button.expanded .action-label {
+  animation: label-swap 220ms var(--control-ease);
+}
+
+@keyframes label-swap {
+  from { opacity: 0; transform: translateY(3px); }
+  to { opacity: 1; transform: none; }
+}
+
+#action-bar button:disabled {
+  cursor: default;
+  transform: none;
+}
+
+#action-bar button:disabled:not(.expanded) { opacity: 0.6; }
+
+/* While an action works, a small spinner sits on the button. */
+.capture-controls button[aria-busy="true"] { padding-right: 26px; }
+.capture-controls button[aria-busy="true"]::after {
+  content: "";
+  position: absolute;
+  top: calc(50% - 5px);
+  right: 9px;
+  width: 8px;
+  height: 8px;
+  border: 1.5px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: control-busy 650ms linear infinite;
+}
+@keyframes control-busy { to { transform: rotate(360deg); } }
+
+/* The text bar uses a slightly tighter set. */
+#action-bar[data-layout="text"] button { height: 32px; }
+
+/* Separates the shape tools from the Pro tools. */
+/* Onyx's island shows the tools at the top of the screen instead. The bar
+   stays in the DOM as the state the island mirrors (main.ts). */
+body.island-tools #tool-bar {
+  display: none !important;
+}
+
+#tool-bar-divider {
+  width: 1px;
+  height: 18px;
+  margin: 0 4px;
+  background: var(--bar-border);
+  flex: 0 0 auto;
+}
+
+/* Narrow screens: tool labels drop to icons (each still has a title),
+   action buttons keep theirs and wrap. */
+@media (max-width: 760px) {
+  #tool-bar .action-label { display: none; }
+  #tool-bar button { padding: 0 9px; }
+}
+
+@media (max-width: 520px) {
+  #action-bar button { height: 32px; padding: 0 10px 0 8px; font-size: 12px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .capture-controls, .capture-controls button, .capture-controls button::after, .action-icon {
+    animation: none !important;
+    transition: none !important;
+  }
+}
+
+/* The island's glass (Onyx's General > Look): a dark tint at the island's
+   own strength, a sheen down from the top and a rim lit along the top edge,
+   as Onyx draws its pill. Frosted with a blur of the frozen screen behind
+   while Windows' transparency effects are on (main.ts sets the classes
+   from what Onyx's config says). */
+body.island-glass {
+  --bar-bg: rgba(0, 0, 0, var(--island-tint, 0.45));
+}
+
+body.island-glass .capture-controls,
+body.island-glass #overlay-close,
+body.island-glass #hint,
+body.island-glass .code-chip,
+body.island-glass #designer-readout,
+body.island-glass #message {
+  background-color: var(--bar-bg);
+  background-image: linear-gradient(to bottom, rgba(255, 255, 255, 0.11), rgba(255, 255, 255, 0.025) 50%, rgba(255, 255, 255, 0));
+  border-color: rgba(255, 255, 255, 0.13);
+  border-top-color: rgba(255, 255, 255, 0.42);
+  border-bottom-color: rgba(255, 255, 255, 0.07);
+}
+
+body.island-glass.island-frost .capture-controls,
+body.island-glass.island-frost #overlay-close,
+body.island-glass.island-frost #hint,
+body.island-glass.island-frost .code-chip,
+body.island-glass.island-frost #designer-readout,
+body.island-glass.island-frost #message {
+  -webkit-backdrop-filter: blur(26px) saturate(1.7);
+  backdrop-filter: blur(26px) saturate(1.7);
+}
+
+body.island-glass #overlay-close:hover,
+body.island-glass .code-chip:hover {
+  background-color: rgba(30, 30, 34, calc(var(--island-tint, 0.45) + 0.1));
+}

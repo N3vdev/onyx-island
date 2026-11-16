@@ -23,6 +23,14 @@ pub enum CalculatorKey {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WidgetHover {
     Key(CalculatorKey),
+    /// A button on the lens toolbar.
+    Lens(crate::lens::LensItem),
+    /// A task, or a button, on the tasks page.
+    Task(crate::tasks::TaskItem),
+    /// A button or a line on the lyrics view.
+    Lyrics(crate::lyrics::LyricsItem),
+    /// The field, a result or the close button on Spotify search.
+    Search(crate::spotify::SearchItem),
 }
 
 #[derive(Default)]

@@ -268,7 +268,7 @@ impl Gfx {
         Ok(())
     }
 
-    unsafe fn round_stroke(&mut self) -> RenderResult<ID2D1StrokeStyle> {
+    pub(super) unsafe fn round_stroke(&mut self) -> RenderResult<ID2D1StrokeStyle> {
         if let Some(style) = &self.intro_stroke {
             return Ok(style.clone());
         }

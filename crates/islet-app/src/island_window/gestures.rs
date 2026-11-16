@@ -21,7 +21,7 @@ fn push_threshold(room: f32) -> f32 { (room * 0.6).clamp(4.0, 24.0) }
 
 impl IslandHost {
     pub(super) fn begin_gesture(&mut self) -> bool {
-        if self.cursor_on_media_bubble() || self.state.expanded || self.traveling || self.relocating || self.state.dictation.is_some()
+        if self.cursor_on_media_bubble() || self.state.expanded || self.traveling || self.relocating || self.state.dictation.is_some() || self.state.lens.is_some()
             || self.state.needs_input.is_some() || self.state.done.is_some()
             || self.state.converter.is_some() { return false; }
         let mut start = POINT::default();
@@ -69,7 +69,7 @@ impl IslandHost {
             None => (rubber(drag.dx), rubber(drag.dy) * give),
         };
         let target = self.last_target.unwrap_or(LayoutTarget::HIDDEN);
-        self.morph_box = self.target_frame(target, self.effective_anchor_top()).bounds().map(|r| r.inflate(140.0));
+        self.morph_box = self.target_frame(target, self.effective_anchor_top()).bounds().map(|r| r.inflate(GESTURE_REGION_MARGIN_DP));
         self.update_region();
         let _ = self.tx.send(RenderCommand::Pull(x, y, true));
     }

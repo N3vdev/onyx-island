@@ -133,6 +133,18 @@ pub struct RendererConfig {
     pub logical_width: f32,
     pub logical_height: f32,
     pub anchor_top: bool,
+    /// See-through instead of solid black.
+    pub glass: Option<Glass>,
+}
+
+/// The see-through look.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Glass {
+    /// The dark tint's opacity, 0 to 1.
+    pub tint: f32,
+    /// Frost what shows through (Windows' blur, while its transparency
+    /// effects are on). Without it the glass is clear.
+    pub frost: bool,
 }
 
 // SAFETY: HWND is an opaque window handle. The renderer owns all graphics
@@ -216,6 +228,12 @@ mod intro;
 mod voice;
 mod converter;
 mod eyes;
+mod acrylic;
+mod lens;
+mod tasks;
+mod lyrics;
+mod search;
+mod devices;
 
 /// How long the pill takes to grow in before the night light's eyes react.
 const NIGHT_EYES_DELAY: f64 = 1.0;
@@ -243,6 +261,7 @@ pub struct Renderer {
     handoff: Option<(Handoff, Sample)>,
     departure_reported: bool,
     hwnd: HWND,
+    glass: Option<Glass>,
     gfx: Option<Gfx>,
     animator: Animator,
     target: LayoutTarget,
@@ -298,6 +317,7 @@ impl Renderer {
             widget_hover: None,
             departure_reported: false,
             hwnd: config.hwnd,
+            glass: config.glass,
             gfx: None,
             animator,
             target: LayoutTarget::HIDDEN,
@@ -563,6 +583,7 @@ impl Renderer {
                 logical_width: self.logical_width,
                 logical_height: self.logical_height,
                 anchor_top: self.anchor_top,
+                glass: self.glass,
             };
             // SAFETY: the renderer owns all graphics state and is only used from
             // the render thread that created it.
@@ -778,12 +799,20 @@ impl Renderer {
             };
             match card {
                 ContentCard::Notification(_) | ContentCard::Calculator(_) => {}
+                ContentCard::Lens(card) => (card.visible, card.pressed).hash(&mut hasher),
                 ContentCard::Converter(card) => {
                     (&card.title, &card.subtitle, &card.message, card.progress, card.fully_succeeded, card.dragging).hash(&mut hasher);
                     format!("{:?}{:?}{:?}{:?}", card.stage, card.options, card.hover, card.keyboard_focus).hash(&mut hasher);
                     card.preview.as_ref().map(|art| art.id).hash(&mut hasher);
                 },
                 ContentCard::Stats(stats) => format!("{stats:?}").hash(&mut hasher),
+                ContentCard::Tasks(tasks) => format!("{tasks:?}").hash(&mut hasher),
+                ContentCard::Search(card) => format!("{card:?}{:?}", self.widget_hover).hash(&mut hasher),
+                ContentCard::Lyrics(card) => {
+                    crate::lyrics::lyrics_key(card, now).hash(&mut hasher);
+                    (card.scroll.map(f32::to_bits), &card.title, &card.artist, card.art.as_ref().map(|art| art.id)).hash(&mut hasher);
+                    format!("{:?}{:?}", card.body, self.widget_hover).hash(&mut hasher);
+                }
                 ContentCard::Glance(glance) => {
                     format!("{glance:?}").hash(&mut hasher);
                     if glance.kind == islet_core::config::IdleGlance::Eyes {
@@ -873,6 +902,20 @@ impl Renderer {
     fn eyes_visible(&self) -> bool {
         self.target.visible
             && matches!(&self.content.primary, Some(ContentCard::Glance(glance)) if glance.kind == islet_core::config::IdleGlance::Eyes)
+    }
+
+    /// See-through or black.
+    pub fn set_glass(&mut self, glass: Option<Glass>) {
+        if self.glass == glass {
+            return;
+        }
+        self.glass = glass;
+        self.presented = None;
+        if let Some(gfx) = &mut self.gfx {
+            // SAFETY: the renderer owns all graphics state and is only used
+            // from the render thread that created it.
+            unsafe { gfx.set_glass(self.hwnd, glass) };
+        }
     }
 
     pub fn release_graphics(&mut self) {
@@ -1262,11 +1305,14 @@ fn morph_of(
         ContentCard::Converter(_) => (COMPACT, PillSize::new(islet_core::converter::WIDTH, islet_core::converter::HEIGHT, 38.0)),
         ContentCard::Calculator(_) => (COMPACT, islet_core::island::CALCULATOR),
         ContentCard::Stats(_) => (COMPACT, islet_core::island::STATS),
+        ContentCard::Tasks(_) => (COMPACT, islet_core::island::TASKS),
         ContentCard::Media(_) => (media_rest, islet_core::island::MEDIA),
         ContentCard::Notification(_) | ContentCard::Agent(_) => {
             (COMPACT, islet_core::island::NOTIFICATION)
         }
-        ContentCard::Dictation(_) | ContentCard::Glance(_) | ContentCard::Intro => return None,
+        ContentCard::Dictation(_) | ContentCard::Glance(_) | ContentCard::Lens(_) | ContentCard::Lyrics(_) | ContentCard::Search(_) | ContentCard::Intro => {
+            return None
+        }
     };
     if big.height <= small.height + 1.0 {
         return None;
@@ -1575,6 +1621,8 @@ struct Gfx {
     intro_t: f32,
     intro_sheen: Option<windows::Win32::Graphics::Direct2D::ID2D1LinearGradientBrush>,
     intro_stroke: Option<ID2D1StrokeStyle>,
+    /// The lens toolbar's icons, by path data.
+    lens_icons: HashMap<&'static str, ID2D1PathGeometry1>,
     /// The dictation bars' springs, carried from frame to frame.
     voice_bars: voice::VoiceBars,
     /// How the resting eyes look this frame, set by the renderer.
@@ -1585,6 +1633,16 @@ struct Gfx {
     pixel_width: u32,
     pixel_height: u32,
     dpi: f32,
+    /// The see-through look, when on.
+    glass: Option<Glass>,
+    /// Its frost, when on (and available).
+    acrylic: Option<acrylic::Acrylic>,
+    /// The glass's sheen and rim light, made once.
+    glass_sheen: Option<windows::Win32::Graphics::Direct2D::ID2D1LinearGradientBrush>,
+    glass_rim: Option<windows::Win32::Graphics::Direct2D::ID2D1LinearGradientBrush>,
+    /// This frame's pill shapes, for the glass's silhouette: rect, corner,
+    /// alpha, taper, taper_top.
+    pills: Vec<(Rect, f32, f32, f32, bool)>,
 }
 
 struct ContentLayer {
@@ -1701,6 +1759,25 @@ impl Gfx {
         dc.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
 
         let bitmap = create_target_bitmap(&dc, &swap_chain, config.dpi)?;
+        let acrylic = if config.glass.is_some_and(|glass| glass.frost) {
+            match acrylic::Acrylic::new(
+                config.hwnd,
+                &dxgi_factory,
+                &device,
+                &dc,
+                config.pixel_width,
+                config.pixel_height,
+                config.dpi,
+            ) {
+                Ok(acrylic) => Some(acrylic),
+                Err(error) => {
+                    tracing::warn!(%error, "no frost behind the glass");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         dc.SetTarget(&bitmap);
         let brush = stage(
             "CreateSolidColorBrush",
@@ -1755,13 +1832,47 @@ impl Gfx {
             intro_t: 0.0,
             intro_sheen: None,
             intro_stroke: None,
+            lens_icons: HashMap::new(),
             voice_bars: voice::VoiceBars::default(),
             eyes: eyes::EyePose::REST,
             eyes_to_bars: None,
             pixel_width: config.pixel_width,
             pixel_height: config.pixel_height,
             dpi: config.dpi,
+            glass: config.glass,
+            acrylic,
+            glass_sheen: None,
+            glass_rim: None,
+            pills: Vec::with_capacity(2),
         })
+    }
+
+    unsafe fn set_glass(&mut self, hwnd: HWND, glass: Option<Glass>) {
+        self.glass = glass;
+        if !glass.is_some_and(|glass| glass.frost) {
+            self.acrylic = None;
+            return;
+        }
+        if self.acrylic.is_some() {
+            return;
+        }
+        let made = (|| -> RenderResult<acrylic::Acrylic> {
+            let dxgi: IDXGIDevice = self._device.cast()?;
+            let factory: IDXGIFactory2 = dxgi.GetAdapter()?.GetParent()?;
+            acrylic::Acrylic::new(
+                hwnd,
+                &factory,
+                &self._device,
+                &self.dc,
+                self.pixel_width,
+                self.pixel_height,
+                self.dpi,
+            )
+        })();
+        match made {
+            Ok(acrylic) => self.acrylic = Some(acrylic),
+            Err(error) => tracing::warn!(%error, "no frost behind the glass"),
+        }
     }
 
     unsafe fn resize(&mut self, width: u32, height: u32, dpi: f32) -> RenderResult<()> {
@@ -1771,6 +1882,9 @@ impl Gfx {
         self.mask_layer = None;
         self.dc.SetTarget(None::<&ID2D1Image>);
         self._bitmap = None;
+        if let Some(acrylic) = &mut self.acrylic {
+            acrylic.resize(&self.dc, width, height, dpi)?;
+        }
         self.swap_chain.ResizeBuffers(
             2,
             width.max(1),
@@ -1832,6 +1946,7 @@ impl Gfx {
                 )
             })
         };
+        self.pills.clear();
         self.dc.BeginDraw();
         self.dc.SetTransform(&Matrix3x2::identity());
         self.dc.Clear(Some(&TRANSPARENT));
@@ -1889,6 +2004,50 @@ impl Gfx {
         } else if let (Some(morph), Some(card)) = (morph, content.primary.as_ref()) {
             self.draw_morph(now, content_geometry, card, content.accent, morph)?;
         }
+        self.draw_silhouette()?;
+        Ok(())
+    }
+
+    /// The glass's shape this frame: the pills, filled.
+    unsafe fn draw_silhouette(&mut self) -> RenderResult<()> {
+        let Some(target) = self.acrylic.as_ref().and_then(|acrylic| acrylic.bitmap.clone()) else {
+            return Ok(());
+        };
+        let main = self._bitmap.clone().ok_or(RenderError::InvalidSize)?;
+        self.dc.SetTarget(&target);
+        let scale = acrylic::SILHOUETTE_SCALE;
+        self.dc.SetDpi(self.dpi * scale, self.dpi * scale);
+        self.dc.BeginDraw();
+        self.dc.SetTransform(&Matrix3x2::identity());
+        self.dc.Clear(Some(&TRANSPARENT));
+        let pills = std::mem::take(&mut self.pills);
+        let mut drawn = Ok(());
+        for &(rect, corner, alpha, taper, taper_top) in &pills {
+            let geometry = match self.geometries.get(
+                &self.factory,
+                rect.width,
+                rect.height,
+                corner.min(rect.width * 0.5).min(rect.height * 0.5),
+                taper,
+                taper_top,
+            ) {
+                Ok(geometry) => geometry,
+                Err(error) => {
+                    drawn = Err(error);
+                    break;
+                }
+            };
+            self.dc.SetTransform(&Matrix3x2::translation(rect.x, rect.y));
+            self.set_color(D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: alpha });
+            self.dc.FillGeometry(&geometry, &self.brush, None::<&ID2D1Brush>);
+        }
+        self.pills = pills;
+        self.dc.SetTransform(&Matrix3x2::identity());
+        let ended = self.dc.EndDraw(None, None);
+        self.dc.SetTarget(&main);
+        self.dc.SetDpi(self.dpi, self.dpi);
+        drawn?;
+        ended?;
         Ok(())
     }
 
@@ -2075,7 +2234,9 @@ impl Gfx {
         let draw_layer = |dc: &ID2D1DeviceContext,
                           rect: Rect,
                           old_output: &ID2D1Image,
-                          new_output: &ID2D1Image|
+                          new_output: &ID2D1Image,
+                          old_shift: Vector2,
+                          new_shift: Vector2|
          -> RenderResult<()> {
             if rect.width < 0.5 || rect.height < 0.5 {
                 return Ok(());
@@ -2089,14 +2250,14 @@ impl Gfx {
             dc.PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
             dc.DrawImage(
                 old_output,
-                None,
+                Some(&old_shift),
                 None,
                 D2D1_INTERPOLATION_MODE_LINEAR,
                 D2D1_COMPOSITE_MODE_SOURCE_OVER,
             );
             dc.DrawImage(
                 new_output,
-                None,
+                Some(&new_shift),
                 None,
                 D2D1_INTERPOLATION_MODE_LINEAR,
                 D2D1_COMPOSITE_MODE_SOURCE_OVER,
@@ -2104,9 +2265,20 @@ impl Gfx {
             dc.PopAxisAlignedClip();
             Ok(())
         };
-        draw_layer(&self.dc, geometry.main, &old_output, &new_output)?;
+        // Between pages the old one slides away and the new one in, the way
+        // the wheel went: down (a later page) moves things up.
+        let pages = previous.widget_pages >= 2 && content.widget_pages >= 2;
+        let direction = match previous.widget_page.cmp(&content.widget_page) {
+            _ if !pages => 0.0,
+            std::cmp::Ordering::Less => 1.0,
+            std::cmp::Ordering::Greater => -1.0,
+            std::cmp::Ordering::Equal => 0.0,
+        };
+        let old_shift = Vector2 { X: 0.0, Y: -direction * PAGE_SLIDE * old_ease };
+        let new_shift = Vector2 { X: 0.0, Y: direction * PAGE_SLIDE * (1.0 - new_ease) };
+        draw_layer(&self.dc, geometry.main, &old_output, &new_output, old_shift, new_shift)?;
         if let Some(bubble) = geometry.bubble {
-            draw_layer(&self.dc, bubble, &old_output, &new_output)?;
+            draw_layer(&self.dc, bubble, &old_output, &new_output, old_shift, new_shift)?;
         }
 
         self.dc.EndDraw(None, None)?;
@@ -2162,22 +2334,31 @@ impl Gfx {
         )?;
         self.dc
             .SetTransform(&Matrix3x2::translation(rect.x, rect.y));
+        if self.acrylic.is_some() {
+            // The frost is under this layer, in this shape.
+            self.pills.push((rect, corner, alpha, taper, taper_top));
+        }
+        let fill = self.glass.map_or(FRAME_COLOR.a, |glass| glass.tint);
         self.set_color(D2D1_COLOR_F {
-            a: FRAME_COLOR.a * alpha,
+            a: fill * alpha,
             ..FRAME_COLOR
         });
         self.dc
             .FillGeometry(&geometry, &self.brush, None::<&ID2D1Brush>);
-        self.set_color(D2D1_COLOR_F {
-            a: HAIRLINE_COLOR.a * alpha,
-            ..HAIRLINE_COLOR
-        });
-        self.dc.DrawGeometry(
-            &geometry,
-            &self.brush,
-            HAIRLINE_WIDTH,
-            None::<&ID2D1StrokeStyle>,
-        );
+        if self.glass.is_some() {
+            self.draw_glass_light(&geometry, rect.height, alpha)?;
+        } else {
+            self.set_color(D2D1_COLOR_F {
+                a: HAIRLINE_COLOR.a * alpha,
+                ..HAIRLINE_COLOR
+            });
+            self.dc.DrawGeometry(
+                &geometry,
+                &self.brush,
+                HAIRLINE_WIDTH,
+                None::<&ID2D1StrokeStyle>,
+            );
+        }
         self.dc.SetTransform(&Matrix3x2::identity());
         Ok(())
     }
@@ -2361,6 +2542,9 @@ impl Gfx {
             };
             return self.draw_eyes_to_bars(now, width, height, amount, dictation, accent, alpha);
         }
+        if let ContentCard::Lens(lens) = card {
+            return self.draw_lens(width, height, lens, accent, alpha);
+        }
         if width < 60.0 && height < 60.0 && !matches!(card, ContentCard::Dictation(_)) {
             return self.draw_bubble(now, width, height, corner, card, accent, alpha);
         }
@@ -2373,6 +2557,9 @@ impl Gfx {
                 self.draw_calculator(width, height, calculator, alpha)
             }
             ContentCard::Stats(stats) => self.draw_stats(width, height, stats, alpha),
+            ContentCard::Tasks(tasks) => self.draw_tasks(width, height, tasks, alpha),
+            ContentCard::Lyrics(card) => self.draw_lyrics(now, card, accent, alpha),
+            ContentCard::Search(card) => self.draw_search(card, alpha),
             ContentCard::Glance(glance) => self.draw_glance(width, height, glance, alpha),
             ContentCard::Media(media) => {
                 if height > 60.0 {
@@ -2394,6 +2581,7 @@ impl Gfx {
             ContentCard::Dictation(dictation) => {
                 self.draw_dictation(now, width, height, dictation, accent, alpha)
             }
+            ContentCard::Lens(lens) => self.draw_lens(width, height, lens, accent, alpha),
             ContentCard::Intro => Ok(()),
         };
         drawn?;
@@ -2404,6 +2592,7 @@ impl Gfx {
                 ContentCard::Media(_)
                     | ContentCard::Calculator(_)
                     | ContentCard::Stats(_)
+                    | ContentCard::Tasks(_)
                     | ContentCard::Agent(_)
             )
         {
@@ -2503,7 +2692,11 @@ impl Gfx {
                 self.draw_calculator(w, h, calculator, alpha)
             }
             (ContentCard::Stats(stats), _) => self.draw_stats(w, h, stats, alpha),
+            (ContentCard::Tasks(tasks), _) => self.draw_tasks(w, h, tasks, alpha),
             (ContentCard::Glance(glance), _) => self.draw_glance(w, h, glance, alpha),
+            (ContentCard::Lens(lens), _) => self.draw_lens(w, h, lens, accent, alpha),
+            (ContentCard::Lyrics(card), _) => self.draw_lyrics(now, card, accent, alpha),
+            (ContentCard::Search(card), _) => self.draw_search(card, alpha),
             (ContentCard::Dictation(_) | ContentCard::Intro, _) => Ok(()),
         };
         self.skip_art = false;
@@ -2626,8 +2819,12 @@ impl Gfx {
                 return self.draw_eyes(width, height, alpha);
             }
             ContentCard::Glance(glance) => (glance_line(glance), None),
+            ContentCard::Tasks(tasks) => match tasks.focus {
+                Some(focus) => (format!("Focus {}", islet_core::tasks::countdown(focus.left)), None),
+                None => return Ok(()),
+            },
             ContentCard::Converter(_) | ContentCard::Calculator(_) | ContentCard::Stats(_) => return Ok(()),
-            ContentCard::Dictation(_) | ContentCard::Intro => return Ok(()),
+            ContentCard::Dictation(_) | ContentCard::Lens(_) | ContentCard::Lyrics(_) | ContentCard::Search(_) | ContentCard::Intro => return Ok(()),
         };
 
         let text_x = if trailing_bars.is_some() {
@@ -2734,21 +2931,17 @@ impl Gfx {
             0.5,
             color([255, 255, 255], 0.085 * alpha),
         )?;
-        self.draw_source_chip(&media.source, width, alpha)?;
+        self.draw_source_chip(media, width, alpha)?;
 
         if let Some(timeline) = media.timeline.filter(|timeline| timeline.duration > 0.0) {
             let bar = expanded::scrubber(width);
-            if self.media_hover == Some(MediaHover::Seek) {
-                let hover = bar.inflate(expanded::SCRUBBER_HIT_SLOP);
-                self.fill_round_rect(
-                    hover.x,
-                    hover.y,
-                    hover.width,
-                    hover.height,
-                    7.0,
-                    color([255, 255, 255], 0.14 * alpha),
-                )?;
-            }
+            // Hovered (or dragged), the bar thickens a little and shows its
+            // knob: no box round it, which would cover the times below.
+            let bar = if media.scrub.is_some() || self.media_hover == Some(MediaHover::Seek) {
+                Rect::new(bar.x, bar.y - 1.0, bar.width, bar.height + 2.0)
+            } else {
+                bar
+            };
             let progress = media
                 .scrub
                 .unwrap_or_else(|| timeline.progress_at(now, media.playing))
@@ -2774,7 +2967,7 @@ impl Gfx {
                 self.fill_circle(
                     bar.x + bar.width * progress,
                     bar.y + bar.height * 0.5,
-                    5.5,
+                    4.5,
                     color([255, 255, 255], alpha),
                 )?;
             }
@@ -2801,11 +2994,13 @@ impl Gfx {
 
         let [previous, play, next] = expanded::controls(width);
         let hovered_control = match self.media_hover {
-            Some(MediaHover::Previous) => Some(previous),
+            Some(MediaHover::Previous) if media.skips.previous => Some(previous),
             Some(MediaHover::PlayPause) => Some(play),
-            Some(MediaHover::Next) => Some(next),
+            Some(MediaHover::Next) if media.skips.next => Some(next),
             _ => None,
         };
+        // A skip the player does not offer is dimmed.
+        let dim = |enabled: bool| if enabled { alpha } else { alpha * DISABLED };
         if let Some((x, y)) = hovered_control {
             self.fill_circle(
                 x,
@@ -2814,14 +3009,18 @@ impl Gfx {
                 color([255, 255, 255], 0.14 * alpha),
             )?;
         }
-        self.draw_transport(previous.0, previous.1, TransportIcon::Previous, alpha)?;
+        self.draw_transport(previous.0, previous.1, TransportIcon::Previous, dim(media.skips.previous))?;
         self.draw_transport(
             play.0,
             play.1,
             TransportIcon::PlayPause(media.playing),
             alpha,
         )?;
-        self.draw_transport(next.0, next.1, TransportIcon::Next, alpha)?;
+        self.draw_transport(next.0, next.1, TransportIcon::Next, dim(media.skips.next))?;
+        if media.lyrics {
+            let (x, y) = expanded::lyrics_button(width);
+            self.draw_lyrics_button(x, y, self.media_hover == Some(MediaHover::Lyrics), alpha)?;
+        }
 
         if let Some(volume) = media.volume {
             self.draw_volume(volume, width, alpha)?;
@@ -2829,87 +3028,42 @@ impl Gfx {
         Ok(())
     }
 
-    /// Source name in a soft pill with an "open" arrow: pressing it brings the
-    /// playing app to the front.
-    unsafe fn draw_source_chip(
-        &mut self,
-        source: &str,
-        pill_width: f32,
-        alpha: f32,
-    ) -> RenderResult<()> {
-        if source.is_empty() {
+    /// The upper row of round pills: the playing app's (its icon; it
+    /// opens the app), then the earbuds' battery while they are connected.
+    unsafe fn draw_source_chip(&mut self, media: &MediaCard, pill_width: f32, alpha: f32) -> RenderResult<()> {
+        if media.source.is_empty() {
             return Ok(());
         }
-        let chip = expanded::chip(pill_width, source);
-        let fill = color(
-            [255, 255, 255],
-            if self.media_hover == Some(MediaHover::Source) {
-                0.22
-            } else {
-                0.115
-            } * alpha,
-        );
-        let ink = color([240, 240, 242], alpha);
-        self.fill_round_rect(
-            chip.x,
-            chip.y,
-            chip.width,
-            chip.height,
-            chip.height * 0.5,
-            fill,
-        )?;
-        self.draw_text(
-            source,
-            FormatId::Chip,
-            chip.x + 16.0,
-            chip.y + 10.0,
-            (chip.width - 44.0).max(10.0),
-            16.0,
-            ink,
-        )?;
-        // A small north-east arrow, so the chip reads as "opens the app".
-        let ax = chip.right() - 18.0;
-        let ay = chip.center().1;
-        self.set_color(ink);
-        self.dc.DrawLine(
-            Vector2 {
-                X: ax - 3.0,
-                Y: ay + 3.0,
-            },
-            Vector2 {
-                X: ax + 3.0,
-                Y: ay - 3.0,
-            },
-            &self.brush,
-            1.3,
-            None,
-        );
-        self.dc.DrawLine(
-            Vector2 {
-                X: ax + 0.2,
-                Y: ay - 3.0,
-            },
-            Vector2 {
-                X: ax + 3.0,
-                Y: ay - 3.0,
-            },
-            &self.brush,
-            1.3,
-            None,
-        );
-        self.dc.DrawLine(
-            Vector2 {
-                X: ax + 3.0,
-                Y: ay - 3.0,
-            },
-            Vector2 {
-                X: ax + 3.0,
-                Y: ay + 0.2,
-            },
-            &self.brush,
-            1.3,
-            None,
-        );
+        let chip = expanded::chip(pill_width, &media.source);
+        let (cx, cy) = chip.center();
+        let radius = chip.height * 0.5;
+        let lit = self.media_hover == Some(MediaHover::Source);
+        self.fill_circle(cx, cy, radius, color([255, 255, 255], if lit { 0.22 } else { 0.115 } * alpha))?;
+        match &media.source_icon {
+            Some(icon) => {
+                let size = 22.0;
+                let rect = Rect::new(cx - size * 0.5, cy - size * 0.5, size, size);
+                self.draw_art(rect, 5.0, Some(icon), [255, 255, 255], alpha)?;
+            }
+            None => {
+                // No icon yet: the app's initial.
+                let initial = media.source.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_default();
+                self.draw_text(&initial, FormatId::Bubble, chip.x, chip.y, chip.width, chip.height, color([240, 240, 242], alpha))?;
+            }
+        }
+        // Then the Spotify pill, then the earbuds.
+        let mut next = 1;
+        if media.spotify != islet_core::spotify::SpotifyPill::Hidden {
+            let lit = self.media_hover == Some(MediaHover::Spotify);
+            self.draw_spotify_pill(expanded::spotify_pill(pill_width), media.spotify, lit, alpha)?;
+            next += 1;
+        }
+        if let Some(device) = media.device {
+            let pill = expanded::pill(pill_width, next);
+            let (px, py) = pill.center();
+            self.fill_circle(px, py, pill.height * 0.5, color([255, 255, 255], 0.115 * alpha))?;
+            self.draw_battery_ring(px, py, pill.height * 0.5 - 6.0, device, FormatId::RingLabel, alpha)?;
+        }
         Ok(())
     }
 
@@ -2998,7 +3152,10 @@ impl Gfx {
                 None,
             );
         }
+        self.draw_volume_track(track, volume, alpha)
+    }
 
+    unsafe fn draw_volume_track(&mut self, track: Rect, volume: f32, alpha: f32) -> RenderResult<()> {
         self.fill_round_rect(
             track.x,
             track.y,
@@ -3193,7 +3350,7 @@ impl Gfx {
         let button = notification
             .action_label()
             .map(|label| (label, islet_core::island::notice_button(width, height)));
-        let right = button.map_or(24.0, |(_, rect)| width - rect.x + 12.0);
+        let right = button.map_or(if notification.device.is_some() { 66.0 } else { 24.0 }, |(_, rect)| width - rect.x + 12.0);
         let text_w = (width - text_x - right).max(40.0);
         // Without a source line the title and body sit centred.
         let lift = if notification.source.is_empty() { 7.0 } else { 0.0 };
@@ -3231,6 +3388,9 @@ impl Gfx {
             self.fill_round_rect(rect.x, rect.y, rect.width, rect.height, rect.height * 0.5, color(accent, 0.92 * alpha))?;
             return self.draw_text(label, FormatId::Button, rect.x, rect.y, rect.width, rect.height, color([8, 10, 16], alpha));
         }
+        if let Some(device) = notification.device {
+            return self.draw_battery_ring(width - 38.0, height * 0.5, 16.0, device, FormatId::Button, alpha);
+        }
 
         self.draw_alert_dot(width - 19.0, 19.0, notification.level, accent, alpha)
     }
@@ -3265,6 +3425,11 @@ impl Gfx {
     ) -> RenderResult<()> {
         if let Some(icon) = &notification.icon {
             return self.draw_art(rect, radius * 0.6, Some(icon), accent, alpha);
+        }
+        if let Some(device) = notification.device {
+            self.fill_round_rect(rect.x, rect.y, rect.width, rect.height, radius, color([255, 255, 255], 0.09 * alpha))?;
+            let (x, y) = rect.center();
+            return self.draw_device_icon(x, y, rect.width * 0.9, device.kind, color([244, 245, 250], alpha));
         }
         if notification.source.is_empty() {
             // A tiny version of the app icon: a black pill with a silver
@@ -3326,6 +3491,9 @@ impl Gfx {
         )?;
         if let Some(progress) = notification.progress {
             self.draw_progress(text_x, height - 4.0, text_w, 2.0, progress, accent, alpha)?;
+        }
+        if let Some(device) = notification.device {
+            return self.draw_battery_ring(width - 16.0, height * 0.5, 9.0, device, FormatId::RingLabel, alpha);
         }
 
         self.draw_alert_dot(
@@ -3422,6 +3590,7 @@ impl Gfx {
                 icon: None,
                 action: None,
                 progress: None,
+                device: None,
             },
             accent,
             alpha,
@@ -3556,7 +3725,7 @@ impl Gfx {
             ContentCard::Dictation(_) => {
                 self.fill_circle(center_x, center_y, 5.0, color(accent, alpha))?;
             }
-            ContentCard::Converter(_) | ContentCard::Calculator(_) | ContentCard::Stats(_) | ContentCard::Glance(_) | ContentCard::Intro => {
+            ContentCard::Converter(_) | ContentCard::Calculator(_) | ContentCard::Stats(_) | ContentCard::Tasks(_) | ContentCard::Glance(_) | ContentCard::Lens(_) | ContentCard::Lyrics(_) | ContentCard::Search(_) | ContentCard::Intro => {
                 return Ok(())
             }
         }
@@ -3618,6 +3787,20 @@ impl Gfx {
         let layout =
             self.text_cache
                 .layout(&self.dwrite, format_ref, format, text, width, height)?;
+        let color = if self.glass.is_some() {
+            // A faint shadow a pixel down lifts the letters off a light
+            // backdrop; over a dark one it is lost in the tint.
+            self.set_color(D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.42 * color.a });
+            self.dc.DrawTextLayout(
+                Vector2 { X: x, Y: y + 1.0 },
+                &layout,
+                &self.brush,
+                D2D1_DRAW_TEXT_OPTIONS_CLIP,
+            );
+            glass_ink(color)
+        } else {
+            color
+        };
         self.set_color(color);
         self.dc.DrawTextLayout(
             Vector2 { X: x, Y: y },
@@ -3732,6 +3915,9 @@ impl Gfx {
     }
 
     unsafe fn present(&mut self) -> RenderResult<()> {
+        if let Some(acrylic) = &self.acrylic {
+            acrylic.present()?;
+        }
         self.swap_chain
             .Present(0, DXGI_PRESENT(0))
             .ok()
@@ -3806,10 +3992,17 @@ enum FormatId {
     MediaArtist,
     Tiny,
     TinyRight,
-    Chip,
     Tucked,
     Bubble,
     Button,
+    /// A task, or what is typed.
+    TaskText,
+    /// When a task's reminder is, right-aligned.
+    TaskWhen,
+    /// A line of lyrics: large, and wrapping.
+    Lyric,
+    /// The percent in a small battery ring.
+    RingLabel,
 }
 
 struct TextFormats {
@@ -3825,10 +4018,13 @@ struct TextFormats {
     media_artist: IDWriteTextFormat,
     tiny: IDWriteTextFormat,
     tiny_right: IDWriteTextFormat,
-    chip: IDWriteTextFormat,
     tucked: IDWriteTextFormat,
     bubble: IDWriteTextFormat,
     button: IDWriteTextFormat,
+    task_text: IDWriteTextFormat,
+    task_when: IDWriteTextFormat,
+    lyric: IDWriteTextFormat,
+    ring_label: IDWriteTextFormat,
 }
 
 impl TextFormats {
@@ -3918,13 +4114,6 @@ impl TextFormats {
                 DWRITE_TEXT_ALIGNMENT_TRAILING,
                 DWRITE_PARAGRAPH_ALIGNMENT_NEAR,
             )?,
-            chip: create_format(
-                factory,
-                11.0,
-                DWRITE_FONT_WEIGHT_MEDIUM,
-                DWRITE_TEXT_ALIGNMENT_LEADING,
-                DWRITE_PARAGRAPH_ALIGNMENT_NEAR,
-            )?,
             tucked: create_format(
                 factory,
                 12.0,
@@ -3946,6 +4135,46 @@ impl TextFormats {
                 DWRITE_TEXT_ALIGNMENT_CENTER,
                 DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
             )?,
+            task_text: create_format(
+                factory,
+                13.0,
+                DWRITE_FONT_WEIGHT_NORMAL,
+                DWRITE_TEXT_ALIGNMENT_LEADING,
+                DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
+            )?,
+            task_when: create_format(
+                factory,
+                11.0,
+                DWRITE_FONT_WEIGHT_NORMAL,
+                DWRITE_TEXT_ALIGNMENT_TRAILING,
+                DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
+            )?,
+            lyric: {
+                let format = create_format(
+                    factory,
+                    15.0,
+                    DWRITE_FONT_WEIGHT_DEMI_BOLD,
+                    DWRITE_TEXT_ALIGNMENT_LEADING,
+                    windows::Win32::Graphics::DirectWrite::DWRITE_PARAGRAPH_ALIGNMENT_NEAR,
+                )?;
+                stage("SetWordWrapping", format.SetWordWrapping(windows::Win32::Graphics::DirectWrite::DWRITE_WORD_WRAPPING_WRAP))?;
+                stage(
+                    "SetLineSpacing",
+                    format.SetLineSpacing(
+                        windows::Win32::Graphics::DirectWrite::DWRITE_LINE_SPACING_METHOD_UNIFORM,
+                        islet_core::lyrics::ROW,
+                        islet_core::lyrics::ROW * 0.8,
+                    ),
+                )?;
+                format
+            },
+            ring_label: create_format(
+                factory,
+                8.5,
+                DWRITE_FONT_WEIGHT_BOLD,
+                DWRITE_TEXT_ALIGNMENT_CENTER,
+                DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
+            )?,
         })
     }
 
@@ -3963,10 +4192,13 @@ impl TextFormats {
             FormatId::MediaArtist => &self.media_artist,
             FormatId::Tiny => &self.tiny,
             FormatId::TinyRight => &self.tiny_right,
-            FormatId::Chip => &self.chip,
             FormatId::Tucked => &self.tucked,
             FormatId::Bubble => &self.bubble,
             FormatId::Button => &self.button,
+            FormatId::TaskText => &self.task_text,
+            FormatId::TaskWhen => &self.task_when,
+            FormatId::Lyric => &self.lyric,
+            FormatId::RingLabel => &self.ring_label,
         }
     }
 }
@@ -4249,6 +4481,25 @@ unsafe fn create_squircle(
     Ok(geometry)
 }
 
+/// Grey ink on glass becomes see-through white. The glass is tinted, not
+/// opaque, so a white page behind it comes through mid-grey: the same grey
+/// as the secondary text, which vanishes. White over the tint is always
+/// lighter than whatever is behind, and its alpha keeps it the quieter ink.
+/// Coloured ink and white are kept.
+fn glass_ink(ink: D2D1_COLOR_F) -> D2D1_COLOR_F {
+    let max = ink.r.max(ink.g).max(ink.b);
+    let min = ink.r.min(ink.g).min(ink.b);
+    if max - min > 0.15 || max >= 0.9 {
+        return ink;
+    }
+    D2D1_COLOR_F {
+        r: 0.96,
+        g: 0.965,
+        b: 0.975,
+        a: ink.a * (0.3 + 0.7 * max),
+    }
+}
+
 fn color(rgb: [u8; 3], alpha: f32) -> D2D1_COLOR_F {
     D2D1_COLOR_F {
         r: f32::from(rgb[0]) / 255.0,
@@ -4257,6 +4508,13 @@ fn color(rgb: [u8; 3], alpha: f32) -> D2D1_COLOR_F {
         a: alpha.clamp(0.0, 1.0),
     }
 }
+
+/// How bright a button the player does not offer is (a skip on a radio
+/// stream).
+const DISABLED: f32 = 0.28;
+
+/// How far a page slides as the wheel changes it, in DIPs.
+const PAGE_SLIDE: f32 = 24.0;
 
 /// Pill opacity. Visible targets are opaque; while closing to hidden the
 /// droplet melts away as its short side drops below 28 dp.
@@ -4393,6 +4651,11 @@ mod tests {
             accent: None,
             scrub: None,
             volume: None,
+            device: None,
+            source_icon: None,
+            lyrics: false,
+            spotify: Default::default(),
+            skips: Default::default(),
         });
         // At either end the card is simply drawn in that look.
         assert!(morph_of(&card, COMPACT.height, COMPACT, 1.0).is_none());
@@ -4447,6 +4710,7 @@ mod tests {
             logical_width: 520.0,
             logical_height: 1040.0,
             anchor_top: true,
+            glass: None,
         };
         let mut renderer = Renderer::new(
             config,

@@ -22,7 +22,8 @@ use windows::Win32::UI::Accessibility::{
     CUIAutomation, IUIAutomation, IUIAutomationCondition, IUIAutomationElement,
     IUIAutomationInvokePattern, TreeScope_Descendants, UIA_ButtonControlTypeId,
     UIA_ControlTypePropertyId, UIA_DocumentControlTypeId, UIA_ImageControlTypeId,
-    UIA_InvokePatternId, UIA_NamePropertyId, UIA_TabItemControlTypeId,
+    UIA_InvokePatternId, UIA_LegacyIAccessibleValuePropertyId, UIA_NamePropertyId,
+    UIA_TabItemControlTypeId, UIA_ValueValuePropertyId,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetWindowThreadProcessId, IsWindowVisible,
@@ -332,6 +333,49 @@ impl TabReader {
                     }
                 }
                 return title.map(|title| (title, byline.unwrap_or_default()));
+            }
+            None
+        }
+    }
+
+    /// The address of the page in the tab titled `tab_title`, as the
+    /// browser exposes it on the page's document. `None` when the page is
+    /// not in the accessibility tree (some browsers only expose the tab in
+    /// front). Kept in memory only, never logged.
+    pub fn page_address(&mut self, tab_title: &str) -> Option<String> {
+        // SAFETY: plain UIA reads; failures skip the window.
+        unsafe {
+            let page = self
+                .uia
+                .CreateAndCondition(
+                    &self
+                        .uia
+                        .CreatePropertyCondition(UIA_ControlTypePropertyId, &VARIANT::from(UIA_DocumentControlTypeId.0))
+                        .ok()?,
+                    &self.uia.CreatePropertyCondition(UIA_NamePropertyId, &VARIANT::from(BSTR::from(tab_title))).ok()?,
+                )
+                .ok()?;
+            for hwnd in self.browser_windows() {
+                let Ok(window) = self.uia.ElementFromHandle(hwnd) else {
+                    continue;
+                };
+                let Ok(document) = window.FindFirst(TreeScope_Descendants, &page) else {
+                    continue;
+                };
+                for property in [UIA_ValueValuePropertyId, UIA_LegacyIAccessibleValuePropertyId] {
+                    let address = document
+                        .GetCurrentPropertyValue(property)
+                        .ok()
+                        .and_then(|value| {
+                            let inner = &value.Anonymous.Anonymous;
+                            (inner.vt == windows::Win32::System::Variant::VT_BSTR)
+                                .then(|| inner.Anonymous.bstrVal.to_string())
+                        })
+                        .filter(|value| value.starts_with("http"));
+                    if address.is_some() {
+                        return address;
+                    }
+                }
             }
             None
         }

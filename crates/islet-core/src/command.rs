@@ -27,6 +27,9 @@ pub enum Command {
     Search { query: String, site: Option<String> },
     Screenshot,
     Lock,
+    /// Add this to the to-do list (a time in it sets a reminder; see
+    /// [`crate::tasks::parse`]).
+    AddTask(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -133,6 +136,9 @@ pub fn parse(spoken: &str) -> Option<Command> {
     if let Some(text) = typed_text(spoken) {
         return Some(Command::Type(text));
     }
+    if let Some(task) = task_text(spoken) {
+        return Some(Command::AddTask(task));
+    }
     let said = strip_filler(&normalize(spoken));
     let s = said.as_str();
     if s.is_empty() {
@@ -170,6 +176,40 @@ pub fn parse(spoken: &str) -> Option<Command> {
             let name = clean_name(rest);
             if !name.is_empty() {
                 return Some(Command::Open(name));
+            }
+        }
+    }
+    None
+}
+
+/// "remind me to call Sam at 5", "add a task buy milk", "add buy milk to my
+/// to-do list": the task, as spoken. "Remind me" is kept, for the task
+/// parser to take out with its time.
+fn task_text(spoken: &str) -> Option<String> {
+    let words: Vec<&str> = spoken.split_whitespace().collect();
+    let bare: Vec<String> = words
+        .iter()
+        .map(|word| word.chars().filter(|c| c.is_alphanumeric() || *c == '-').collect::<String>().to_lowercase())
+        .collect();
+    let starts = |prefix: &[&str]| bare.len() > prefix.len() && bare.iter().zip(prefix).all(|(word, want)| word == want);
+    let tidy = |from: usize, to: usize| -> Option<String> {
+        let text = words[from..to].join(" ");
+        let text = text.trim_matches(|c: char| c.is_whitespace() || matches!(c, '.' | ',' | ':' | '!' | '?')).to_owned();
+        (!text.is_empty()).then_some(text)
+    };
+    if starts(&["remind", "me"]) || starts(&["remember", "to"]) {
+        return tidy(0, words.len());
+    }
+    for prefix in [&["add", "a", "task"][..], &["add", "task"][..], &["new", "task"][..], &["add", "a", "to-do"][..], &["add", "to-do"][..]] {
+        if starts(prefix) {
+            return tidy(prefix.len(), words.len());
+        }
+    }
+    // "add X to my to-do list" / "to my tasks" / "to my list".
+    if bare.first().is_some_and(|word| word == "add") {
+        for tail in [&["to", "my", "to-do", "list"][..], &["to", "my", "todo", "list"][..], &["to", "my", "to", "do", "list"][..], &["to", "my", "tasks"][..], &["to", "my", "to-do"][..], &["to", "my", "list"][..], &["to", "the", "list"][..]] {
+            if bare.len() > tail.len() + 1 && bare[bare.len() - tail.len()..].iter().zip(tail).all(|(word, want)| word == want) {
+                return tidy(1, words.len() - tail.len());
             }
         }
     }
@@ -642,5 +682,17 @@ mod tests {
         assert_eq!(parse(""), None);
         assert_eq!(parse("What's the weather like?"), None);
         assert_eq!(parse("Please."), None);
+    }
+
+    #[test]
+    fn tasks_are_added_by_voice() {
+        assert_eq!(parse("Remind me to call Sam at 5 p.m."), Some(Command::AddTask("Remind me to call Sam at 5 p.m".into())));
+        assert_eq!(parse("Add a task: buy milk."), Some(Command::AddTask("buy milk".into())));
+        assert_eq!(parse("add buy milk to my to-do list"), Some(Command::AddTask("buy milk".into())));
+        assert_eq!(parse("Add water the plants to my list."), Some(Command::AddTask("water the plants".into())));
+        assert_eq!(parse("new task pay rent tomorrow"), Some(Command::AddTask("pay rent tomorrow".into())));
+        // Not a task.
+        assert_ne!(parse("add task"), Some(Command::AddTask(String::new())));
+        assert!(!matches!(parse("open spotify"), Some(Command::AddTask(_))));
     }
 }

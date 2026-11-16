@@ -9,6 +9,7 @@ license.workspace = true
 islet-core = { path = "../islet-core" }
 crossbeam-channel.workspace = true
 tracing.workspace = true
+ureq = "2"
 windows = { version = "0.62", features = [
     "Foundation",
     "Foundation_Collections",

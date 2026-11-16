@@ -21,9 +21,19 @@ tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 serde_json = "1"
+ureq = { version = "2", features = ["json"] }
+sha2 = "0.10"
+base64 = "0.22"
+getrandom = "0.3"
 windows-core = "0.62"
+windows-collections = "0.3"
 notify = "8"
 windows = { version = "0.62", features = [
+    "Devices_Enumeration",
+    "Foundation",
+    "Foundation_Collections",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_Properties",
     "Win32_Foundation",
     "Win32_Graphics_DirectComposition",
     "Win32_Graphics_Dwm",
@@ -33,11 +43,17 @@ windows = { version = "0.62", features = [
     "Win32_NetworkManagement_Ndis",
     "Win32_Networking_WinSock",
     "Win32_System_Performance",
+    "Win32_System_Registry",
     "Win32_System_SystemInformation",
     "Win32_Security",
+    "Win32_Security_Cryptography",
     "Win32_System_LibraryLoader",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
+    "Win32_System_DataExchange",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Memory",
     "Win32_System_Ole",
     "Win32_System_SystemServices",
     "Win32_System_Threading",

@@ -38,6 +38,7 @@ impl Editor {
                 status: None,
                 dictation_ui: dictation_page::DictationUi::new(),
                 night_light_ui: crate::night_light_page::NightLightUi::default(),
+                tasks_ui: crate::tasks_page::TasksUi::at(std::env::temp_dir().join("onyx-settings-test-tasks.toml")),
                 initial_scroll: None,
             },
             time: 0.0,

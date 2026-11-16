@@ -6,7 +6,10 @@ Build the MSIX from the current optimized binaries:
 .\packaging\build.ps1 -SkipBuild -MsixOnly
 ```
 
-Omit `-SkipBuild` to rebuild the app, settings and speech worker first. Omit
+Omit `-SkipBuild` to rebuild the app, settings, speech worker and Onyx Lens
+first. Onyx Lens (`lens/`) needs Node.js; `tools/build-lens.ps1` builds it and
+copies `onyx-lens.exe` into `target/release`. It runs on WebView2, which
+Windows 11 includes. Omit
 `-MsixOnly` to also build the NSIS installer. Windows SDK, Visual C++
 redistributable files and Python with Pillow are required; NSIS is needed only
 for the setup executable.

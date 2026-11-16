@@ -103,6 +103,11 @@ pub fn load(dir: &Path) -> Option<Remembered> {
             accent: None,
             scrub: None,
             volume: None,
+            device: None,
+            source_icon: None,
+            lyrics: false,
+            spotify: Default::default(),
+            skips: Default::default(),
         },
     };
     let mut art_size = None;
@@ -168,6 +173,11 @@ mod tests {
             accent: Some([10, 20, 30]),
             scrub: None,
             volume: Some(0.5),
+            device: None,
+            source_icon: None,
+            lyrics: false,
+            spotify: Default::default(),
+            skips: Default::default(),
         };
         let remembered = Remembered::from_live("Spotify.exe", &card);
         assert!(!remembered.card.playing && remembered.card.volume.is_none());

@@ -12,6 +12,7 @@ fn calculator_renderer(hwnd: HWND, scale: f32) -> Renderer {
             logical_width: 720.0,
             logical_height: 248.0,
             anchor_top: true,
+            glass: None,
         },
         Arc::new(Mutex::new(HitRegion::default())),
         Arc::new(BarLevels::default()),
@@ -112,6 +113,11 @@ fn capture_widget_previews() {
             accent: None,
             scrub: None,
             volume: Some(0.65),
+            device: None,
+            source_icon: None,
+            lyrics: false,
+            spotify: Default::default(),
+            skips: Default::default(),
         });
         let target = state.layout();
         renderer.set_snapshot(target, state.content(), 0.0);
@@ -191,7 +197,7 @@ fn capture_converter_previews() {
                 let state=IslandState{converter:Some(card),expanded:true,..Default::default()};
                 let target=state.layout().customized(scale,0.0,320.0);
                 let content=state.content();
-                let mut renderer=Renderer::new(RendererConfig{hwnd,pixel_width:720,pixel_height:320,dpi:96.0,logical_width:720.0,logical_height:320.0,anchor_top:true},Arc::new(Mutex::new(HitRegion::default())),Arc::new(BarLevels::default()),0.0).unwrap();
+                let mut renderer=Renderer::new(RendererConfig{hwnd,pixel_width:720,pixel_height:320,dpi:96.0,logical_width:720.0,logical_height:320.0,anchor_top:true,glass:None},Arc::new(Mutex::new(HitRegion::default())),Arc::new(BarLevels::default()),0.0).unwrap();
                 renderer.set_snapshot(target,content.clone(),0.0);
                 renderer.render(5.0,true).unwrap();
                 renderer.animator.jump_to(target,8.0);
@@ -265,6 +271,11 @@ fn capture_pull_previews() {
         let state = IslandState { media: Some(MediaCard {
             title: "Sample track".into(), artist: "Sample artist".into(), source: "".into(),
             playing: false, timeline: None, art: None, accent: None, scrub: None, volume: None,
+            device: None,
+            source_icon: None,
+            lyrics: false,
+            spotify: Default::default(),
+            skips: Default::default(),
         }), ..Default::default() };
         let target = state.layout(); let content = state.content();
         renderer.set_snapshot(target, content.clone(), 0.0);
@@ -394,6 +405,7 @@ fn capture_notice_previews() {
         icon: None,
         action,
         progress,
+        device: None,
     };
     let offer = Some(NoticeAction::DownloadAiCleanup);
     let cards = [
@@ -519,6 +531,331 @@ fn capture_corner_eyes() {
             }
             save_buffer(renderer.gfx.as_ref().unwrap(), &directory.join(format!("back-{name}.tga"))).unwrap();
             drop(renderer);
+        }
+        DestroyWindow(hwnd).unwrap();
+    }
+}
+
+#[test]
+#[ignore = "requires Windows GPU; writes to-do render evidence"]
+fn capture_tasks_previews() {
+    use islet_core::tasks::{FocusPhase, FocusView, TaskItem, TaskLine, TasksCard};
+    use islet_core::widgets::WidgetHover;
+    use windows::Win32::UI::WindowsAndMessaging::{CreateWindowExW, DestroyWindow, WINDOW_EX_STYLE, WS_POPUP};
+    let directory = std::path::PathBuf::from(std::env::var_os("ISLET_WIDGET_CAPTURE_DIR").expect("set capture directory"));
+    std::fs::create_dir_all(&directory).unwrap();
+    let line = |id, text: &str, when: Option<&str>, overdue| TaskLine { id, text: text.into(), when: when.map(Into::into), overdue };
+    let full = TasksCard {
+        lines: vec![
+            line(1, "Call Sam about the venue", Some("5:00 PM"), false),
+            line(2, "Stretch", Some("in 12 min"), false),
+            line(3, "Send the invoice to Priya before Friday so it's paid this month", None, false),
+            line(4, "Water the plants", Some("Overdue"), true),
+        ],
+        open: 6,
+        done: 2,
+        draft: String::new(),
+        typing: false,
+        focus: None,
+        focus_minutes: 25,
+    };
+    let typing = TasksCard { draft: "Pay rent tomorrow 9am".into(), typing: true, ..full.clone() };
+    let focusing = TasksCard {
+        focus: Some(FocusView { phase: FocusPhase::Focus, left: 18 * 60 + 42, progress: 0.25 }),
+        ..full.clone()
+    };
+    let empty = TasksCard { lines: Vec::new(), open: 0, done: 0, ..full.clone() };
+    // The Glass look's tint, without the frost (composite over a backdrop).
+    let glass = std::env::var_os("ISLET_CAPTURE_GLASS").map(|_| crate::Glass { tint: 0.45, frost: false });
+    unsafe {
+        let hwnd = CreateWindowExW(WINDOW_EX_STYLE(0), w!("STATIC"), w!("Onyx tasks capture"), WS_POPUP, 0, 0, 720, 320, None, None, None, None).unwrap();
+        for (name, card, expanded, hover) in [
+            ("page", full.clone(), true, Some(WidgetHover::Task(TaskItem::Check(2)))),
+            ("typing", typing, true, None),
+            ("focusing", focusing.clone(), true, Some(WidgetHover::Task(TaskItem::Focus))),
+            ("empty", empty, true, None),
+            ("focus-pill", focusing, false, None),
+        ] {
+            let state = IslandState { tasks: Some(card), widget: Some(islet_core::island::WidgetKind::Tasks), expanded, ..Default::default() };
+            let target = state.layout().customized(1.0, 0.0, 320.0);
+            let content = state.content();
+            let mut renderer = Renderer::new(
+                RendererConfig { hwnd, pixel_width: 720, pixel_height: 320, dpi: 96.0, logical_width: 720.0, logical_height: 320.0, anchor_top: true, glass },
+                Arc::new(Mutex::new(HitRegion::default())),
+                Arc::new(BarLevels::default()),
+                0.0,
+            )
+            .unwrap();
+            renderer.set_snapshot(target, content.clone(), 0.0);
+            renderer.render(5.0, true).unwrap();
+            renderer.animator.jump_to(target, 8.0);
+            let sample = renderer.animator.sample(8.0);
+            let geometry = renderer.frame_geometry(&sample);
+            let gfx = renderer.gfx.as_mut().unwrap();
+            gfx.main_spring_height = sample.main_height;
+            gfx.content_scale = 1.0;
+            gfx.widget_hover = hover;
+            gfx.draw(8.0, &geometry, &geometry, target, &content, None, 1.0).unwrap();
+            save_buffer(gfx, &directory.join(format!("tasks-{name}.tga"))).unwrap();
+        }
+        DestroyWindow(hwnd).unwrap();
+    }
+}
+
+#[test]
+#[ignore = "requires Windows GPU; writes lyrics render evidence"]
+fn capture_lyrics_previews() {
+    use islet_core::lyrics::{parse_lrc, plain_lines, LyricsBody, LyricsCard};
+    use islet_core::media::Timeline;
+    use windows::Win32::UI::WindowsAndMessaging::{CreateWindowExW, DestroyWindow, WINDOW_EX_STYLE, WS_POPUP};
+    let directory = std::path::PathBuf::from(std::env::var_os("ISLET_WIDGET_CAPTURE_DIR").expect("set capture directory"));
+    std::fs::create_dir_all(&directory).unwrap();
+    let song = "[00:10.00]Oh simple thing, where have you gone?\n[00:14.00]I'm getting old and I need something to rely on\n[00:19.00]So tell me when you're gonna let me in\n[00:23.00]I'm getting tired and I need somewhere to begin\n[00:28.00]\n[00:33.00]I came across a fallen tree\n[00:37.00]I felt the branches of it looking at me\n[00:41.00]Is this the place we used to love?\n[00:45.00]Is this the place that I've been dreaming of?\n";
+    let synced = std::sync::Arc::new(parse_lrc(song));
+    let media = MediaCard {
+        title: "Somewhere Only We Know".into(),
+        artist: "Keane".into(),
+        source: "Spotify".into(),
+        playing: true,
+        timeline: Some(Timeline { position: 15.0, duration: 237.0, sampled_at: 8.0, rate: 1.0 }),
+        art: None,
+        accent: Some([96, 140, 220]),
+        scrub: None,
+        volume: Some(0.6),
+        device: None,
+        source_icon: None,
+        lyrics: false,
+        spotify: Default::default(),
+        skips: Default::default(),
+    };
+    let lyrics = |body: LyricsBody, position: f64| LyricsCard {
+        title: media.title.clone(),
+        artist: media.artist.clone(),
+        art: None,
+        accent: media.accent,
+        playing: true,
+        timeline: Some(Timeline { position, duration: 237.0, sampled_at: 8.0, rate: 1.0 }),
+        body,
+        scroll: None,
+        search: false,
+        skips: Default::default(),
+    };
+    unsafe {
+        let hwnd = CreateWindowExW(WINDOW_EX_STYLE(0), w!("STATIC"), w!("Onyx lyrics capture"), WS_POPUP, 0, 0, 720, 400, None, None, None, None).unwrap();
+        let cards: Vec<(&str, Option<LyricsCard>)> = vec![
+            ("media", None),
+            ("synced", Some(lyrics(LyricsBody::Synced(synced.clone()), 20.5))),
+            ("gliding", Some(lyrics(LyricsBody::Synced(synced.clone()), 22.95))),
+            ("plain", Some(lyrics(LyricsBody::Plain(std::sync::Arc::new(plain_lines(&song.lines().map(|l| &l[10..]).collect::<Vec<_>>().join("\n")))), 0.0))),
+            ("loading", Some(lyrics(LyricsBody::Loading, 3.0))),
+            ("missing", Some(lyrics(LyricsBody::NotFound, 3.0))),
+        ];
+        for (name, card) in cards {
+            let state = IslandState { media: Some(media.clone()), lyrics: card, expanded: true, ..Default::default() };
+            let target = state.layout();
+            let content = state.content();
+            let mut renderer = Renderer::new(
+                RendererConfig { hwnd, pixel_width: 720, pixel_height: 400, dpi: 96.0, logical_width: 720.0, logical_height: 400.0, anchor_top: true, glass: None },
+                Arc::new(Mutex::new(HitRegion::default())),
+                Arc::new(BarLevels::default()),
+                0.0,
+            )
+            .unwrap();
+            renderer.set_snapshot(target, content.clone(), 0.0);
+            renderer.render(5.0, true).unwrap();
+            renderer.animator.jump_to(target, 8.0);
+            let sample = renderer.animator.sample(8.0);
+            let geometry = renderer.frame_geometry(&sample);
+            let gfx = renderer.gfx.as_mut().unwrap();
+            gfx.main_spring_height = sample.main_height;
+            gfx.content_scale = 1.0;
+            gfx.draw(8.0, &geometry, &geometry, target, &content, None, 1.0).unwrap();
+            save_buffer(gfx, &directory.join(format!("lyrics-{name}.tga"))).unwrap();
+        }
+        DestroyWindow(hwnd).unwrap();
+    }
+}
+
+#[test]
+#[ignore = "requires Windows GPU; writes Bluetooth render evidence"]
+fn capture_device_previews() {
+    use islet_core::island::{AlertLevel, DeviceBadge, DeviceKind, NotificationCard};
+    use windows::Win32::UI::WindowsAndMessaging::{CreateWindowExW, DestroyWindow, WINDOW_EX_STYLE, WS_POPUP};
+    let directory = std::path::PathBuf::from(std::env::var_os("ISLET_WIDGET_CAPTURE_DIR").expect("set capture directory"));
+    std::fs::create_dir_all(&directory).unwrap();
+    let notice = |title: &str, body: &str, kind, battery| NotificationCard {
+        source: String::new(),
+        title: title.into(),
+        body: body.into(),
+        level: AlertLevel::Info,
+        icon: None,
+        action: None,
+        progress: None,
+        device: Some(DeviceBadge { kind, battery }),
+    };
+    let media = MediaCard {
+        title: "Somewhere Only We Know".into(),
+        artist: "Keane".into(),
+        source: "Spotify".into(),
+        playing: false,
+        timeline: None,
+        art: None,
+        accent: Some([96, 140, 220]),
+        scrub: None,
+        volume: Some(0.6),
+        device: None,
+        source_icon: None,
+        lyrics: false,
+        spotify: Default::default(),
+        skips: Default::default(),
+    };
+    let buds = Some(DeviceBadge { kind: DeviceKind::Earbuds, battery: Some(82) });
+    // A stand-in app icon: a green disc.
+    let size = 64usize;
+    let mut pixels = vec![0u8; size * size * 4];
+    for y in 0..size {
+        for x in 0..size {
+            let d = ((x as f32 - 31.5).powi(2) + (y as f32 - 31.5).powi(2)).sqrt();
+            let a = (31.5 - d).clamp(0.0, 1.0);
+            let i = (y * size + x) * 4;
+            pixels[i] = (84.0 * a) as u8;
+            pixels[i + 1] = (215.0 * a) as u8;
+            pixels[i + 2] = (30.0 * a) as u8;
+            pixels[i + 3] = (255.0 * a) as u8;
+        }
+    }
+    let icon = islet_core::media::ArtImage { id: 7, width: 64, height: 64, pixels: pixels.into() };
+    let icons = vec![("Spotify".to_owned(), icon)];
+    unsafe {
+        let hwnd = CreateWindowExW(WINDOW_EX_STYLE(0), w!("STATIC"), w!("Onyx device capture"), WS_POPUP, 0, 0, 720, 300, None, None, None, None).unwrap();
+        let states = vec![
+            ("a-connected", IslandState { done: Some(notice("OnePlus Nord Buds 3 Pro", "Connected", DeviceKind::Earbuds, Some(82))), expanded: true, ..Default::default() }),
+            ("b-compact", IslandState { done: Some(notice("OnePlus Nord Buds 3 Pro", "Connected", DeviceKind::Earbuds, Some(82))), ..Default::default() }),
+            ("c-low", IslandState { done: Some(notice("WH-1000XM5", "Battery low", DeviceKind::Headphones, Some(9))), expanded: true, ..Default::default() }),
+            ("d-unknown", IslandState { done: Some(notice("JBL Flip 6", "Connected", DeviceKind::Speaker, None)), expanded: true, ..Default::default() }),
+            ("e-media", IslandState { media: Some(media.clone()), audio_device: buds, source_icons: icons.clone(), expanded: true, ..Default::default() }),
+            ("f-media-alone", IslandState { media: Some(media.clone()), source_icons: icons.clone(), expanded: true, ..Default::default() }),
+        ];
+        for (name, state) in states {
+            let target = state.layout();
+            let content = state.content();
+            let mut renderer = Renderer::new(
+                RendererConfig { hwnd, pixel_width: 720, pixel_height: 300, dpi: 96.0, logical_width: 720.0, logical_height: 300.0, anchor_top: true, glass: None },
+                Arc::new(Mutex::new(HitRegion::default())),
+                Arc::new(BarLevels::default()),
+                0.0,
+            )
+            .unwrap();
+            renderer.set_snapshot(target, content.clone(), 0.0);
+            renderer.render(5.0, true).unwrap();
+            renderer.animator.jump_to(target, 8.0);
+            let sample = renderer.animator.sample(8.0);
+            let geometry = renderer.frame_geometry(&sample);
+            let gfx = renderer.gfx.as_mut().unwrap();
+            gfx.main_spring_height = sample.main_height;
+            gfx.content_scale = 1.0;
+            gfx.draw(8.0, &geometry, &geometry, target, &content, None, 1.0).unwrap();
+            save_buffer(gfx, &directory.join(format!("device-{name}.tga"))).unwrap();
+        }
+        DestroyWindow(hwnd).unwrap();
+    }
+}
+
+#[test]
+#[ignore = "requires Windows GPU; writes Spotify render evidence"]
+fn capture_spotify_previews() {
+    use islet_core::island::{DeviceBadge, DeviceKind};
+    use islet_core::spotify::{SearchCard, SearchResult, SearchStatus, SpotifyPill};
+    use windows::Win32::UI::WindowsAndMessaging::{CreateWindowExW, DestroyWindow, WINDOW_EX_STYLE, WS_POPUP};
+    let directory = std::path::PathBuf::from(std::env::var_os("ISLET_WIDGET_CAPTURE_DIR").expect("set capture directory"));
+    std::fs::create_dir_all(&directory).unwrap();
+    let disc = |id: u64, rgb: [u8; 3]| {
+        let size = 64usize;
+        let mut pixels = vec![0u8; size * size * 4];
+        for i in 0..size * size {
+            pixels[i * 4] = rgb[2];
+            pixels[i * 4 + 1] = rgb[1];
+            pixels[i * 4 + 2] = rgb[0];
+            pixels[i * 4 + 3] = 255;
+        }
+        islet_core::media::ArtImage { id, width: 64, height: 64, pixels: pixels.into() }
+    };
+    let result = |title: &str, artist: &str, ms: u32, explicit: bool, id: u64, rgb| SearchResult {
+        uri: format!("spotify:track:{id}"),
+        title: title.into(),
+        artist: artist.into(),
+        duration_ms: ms,
+        explicit,
+        art: Some(disc(id, rgb)),
+    };
+    let results = vec![
+        result("Somewhere Only We Know", "Keane", 237_000, false, 11, [80, 120, 200]),
+        result("Everybody's Changing", "Keane", 216_000, false, 12, [200, 120, 80]),
+        result("Bedshaped", "Keane", 278_000, false, 13, [90, 170, 120]),
+        result("Somewhere Only We Know - Live", "Keane", 251_000, false, 14, [160, 90, 170]),
+        result("Love Me Harder", "Ariana Grande, The Weeknd", 236_000, true, 15, [200, 60, 90]),
+    ];
+    let media = MediaCard {
+        title: "Somewhere Only We Know".into(),
+        artist: "Keane".into(),
+        source: "Spotify".into(),
+        playing: false,
+        timeline: None,
+        art: None,
+        accent: Some([96, 140, 220]),
+        scrub: None,
+        volume: Some(0.6),
+        device: None,
+        source_icon: None,
+        lyrics: false,
+        spotify: Default::default(),
+        skips: Default::default(),
+    };
+    let buds = Some(DeviceBadge { kind: DeviceKind::Earbuds, battery: Some(82) });
+    unsafe {
+        let hwnd = CreateWindowExW(WINDOW_EX_STYLE(0), w!("STATIC"), w!("Onyx Spotify capture"), WS_POPUP, 0, 0, 720, 400, None, None, None, None).unwrap();
+        let states = vec![
+            ("a-connect", IslandState { media: Some(media.clone()), spotify_pill: SpotifyPill::Connect, expanded: true, ..Default::default() }),
+            ("a-radio", IslandState {
+                media: Some(MediaCard { skips: islet_core::media::Skips { previous: false, next: false }, ..media.clone() }),
+                expanded: true,
+                ..Default::default()
+            }),
+            ("b-search-pill", IslandState { media: Some(media.clone()), spotify_pill: SpotifyPill::Search, audio_device: buds, expanded: true, ..Default::default() }),
+            ("c-empty", IslandState { media: Some(media.clone()), search: Some(SearchCard { typing: true, ..SearchCard::default() }), expanded: true, ..Default::default() }),
+            ("d-results", IslandState {
+                media: Some(media.clone()),
+                search: Some(SearchCard { query: "keane".into(), typing: true, status: SearchStatus::Results, results: results.clone(), starting: None }),
+                expanded: true,
+                ..Default::default()
+            }),
+            ("e-starting", IslandState {
+                media: Some(media.clone()),
+                search: Some(SearchCard { query: "keane".into(), typing: false, status: SearchStatus::Results, results: results.clone(), starting: Some(1) }),
+                expanded: true,
+                ..Default::default()
+            }),
+        ];
+        for (name, state) in states {
+            let target = state.layout();
+            let content = state.content();
+            let mut renderer = Renderer::new(
+                RendererConfig { hwnd, pixel_width: 720, pixel_height: 400, dpi: 96.0, logical_width: 720.0, logical_height: 400.0, anchor_top: true, glass: None },
+                Arc::new(Mutex::new(HitRegion::default())),
+                Arc::new(BarLevels::default()),
+                0.0,
+            )
+            .unwrap();
+            renderer.set_snapshot(target, content.clone(), 0.0);
+            renderer.render(5.0, true).unwrap();
+            renderer.animator.jump_to(target, 8.0);
+            let sample = renderer.animator.sample(8.0);
+            let geometry = renderer.frame_geometry(&sample);
+            let gfx = renderer.gfx.as_mut().unwrap();
+            gfx.main_spring_height = sample.main_height;
+            gfx.content_scale = 1.0;
+            gfx.draw(8.0, &geometry, &geometry, target, &content, None, 1.0).unwrap();
+            save_buffer(gfx, &directory.join(format!("spotify-{name}.tga"))).unwrap();
         }
         DestroyWindow(hwnd).unwrap();
     }

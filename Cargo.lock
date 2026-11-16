@@ -1254,8 +1254,10 @@ dependencies = [
 name = "islet-app"
 version = "1.0.1"
 dependencies = [
+ "base64 0.22.1",
  "crossbeam-channel",
  "embed-resource",
+ "getrandom 0.3.4",
  "islet-asr",
  "islet-audio",
  "islet-core",
@@ -1264,10 +1266,13 @@ dependencies = [
  "islet-render",
  "notify",
  "serde_json",
+ "sha2",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "ureq 2.12.1",
  "windows",
+ "windows-collections",
  "windows-core",
 ]
 
@@ -1330,6 +1335,7 @@ dependencies = [
  "crossbeam-channel",
  "islet-core",
  "tracing",
+ "ureq 2.12.1",
  "windows",
 ]
 
@@ -1338,7 +1344,9 @@ name = "islet-render"
 version = "1.0.1"
 dependencies = [
  "islet-core",
+ "tracing",
  "windows",
+ "windows-core",
  "windows-numerics",
 ]
 
@@ -3200,6 +3208,8 @@ dependencies = [
  "once_cell",
  "rustls",
  "rustls-pki-types",
+ "serde",
+ "serde_json",
  "url",
  "webpki-roots 0.26.11",
 ]
