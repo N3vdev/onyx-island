@@ -307,27 +307,67 @@ fn code_of(message: &serde_json::Value) -> Option<(String, String)> {
         text.push_str(&body.chars().take(3_000).collect::<String>());
     }
     let code = islet_core::otp::find_code(&subject, &text)?;
-    // Who sent it is the domain Gmail verified (the first
-    // Authentication-Results is Gmail's own; a sender's are below it), and
-    // never the display name, which is anyone's to write.
-    let from = verified_domain(&header("Authentication-Results"), &header("From"))
+    // Who sent it is the domain Gmail verified, never the display name,
+    // which is anyone's to write.
+    let results: Vec<&str> = payload["headers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|header| header["name"].as_str().is_some_and(|n| n.eq_ignore_ascii_case("Authentication-Results")))
+        .filter_map(|header| header["value"].as_str())
+        .collect();
+    let from = gmails_result(&results)
+        .and_then(|result| verified_domain(result, &header("From")))
         .unwrap_or_else(|| "an unverified sender".to_owned());
     Some((code, from))
 }
 
-/// The From domain, exactly as Gmail's DMARC check passed it: Gmail's own
+const GMAIL_MX: &str = "mx.google.com";
+
+/// Gmail's own Authentication-Results: the topmost, and the only one that
+/// says it is Gmail's (a sender may add their own below; more than one is not
+/// trusted at all).
+fn gmails_result<'a>(results: &[&'a str]) -> Option<&'a str> {
+    let claims_gmail = |result: &&str| result.split(';').next().is_some_and(|id| id.trim().eq_ignore_ascii_case(GMAIL_MX));
+    let first = *results.first()?;
+    (claims_gmail(&first) && results.iter().filter(|result| claims_gmail(result)).count() == 1).then_some(first)
+}
+
+/// The header without its (comments), which carry text a sender chose;
+/// None if they don't balance.
+fn without_comments(text: &str) -> Option<String> {
+    let mut out = String::with_capacity(text.len());
+    let mut depth = 0usize;
+    for c in text.chars() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = depth.checked_sub(1)?,
+            _ if depth == 0 => out.push(c),
+            _ => {}
+        }
+    }
+    (depth == 0).then_some(out)
+}
+
+/// The From domain, exactly as Gmail's DMARC check passed it: Gmail's
 /// result ("mx.google.com; ... dmarc=pass (...) header.from=google.com"), for
-/// the one plain address the From header gives.
-fn verified_domain(results: &str, from: &str) -> Option<String> {
-    let results = results.to_ascii_lowercase();
-    let mut parts = results.split(';');
-    if parts.next()?.trim() != "mx.google.com" {
+/// the one plain address the From header gives. Anything unclear is not
+/// verified: quoted text (a sender's), or other than exactly one DMARC result.
+fn verified_domain(result: &str, from: &str) -> Option<String> {
+    let result = without_comments(&result.to_ascii_lowercase())?;
+    if result.contains('"') || result.matches("dmarc=").count() != 1 {
         return None;
     }
-    let domain = parts
-        .map(str::trim)
-        .filter(|result| result.starts_with("dmarc=pass"))
-        .find_map(|result| result.split_whitespace().find_map(|word| word.strip_prefix("header.from=")))?;
+    let mut parts = result.split(';');
+    if parts.next()?.trim() != GMAIL_MX {
+        return None;
+    }
+    let dmarc = parts.map(str::trim).find(|part| part.starts_with("dmarc="))?;
+    let mut words = dmarc.split_whitespace();
+    if words.next()? != "dmarc=pass" {
+        return None;
+    }
+    let domain = words.find_map(|word| word.strip_prefix("header.from="))?;
     let plain = |text: &str| {
         text.contains('.') && text.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'.')
     };
@@ -699,6 +739,23 @@ mod tests {
         assert_eq!(verified_domain(&gmail.replace("dmarc=pass", "dmarc=fail"), "a@accounts.google.com"), None);
         assert_eq!(verified_domain(&gmail.replace("mx.google.com", "mx.evil.io"), "a@accounts.google.com"), None);
         assert_eq!(verified_domain("", "a@accounts.google.com"), None);
+        // Text a sender controls can't bring in a pass of its own.
+        let injected = "mx.google.com; spf=pass smtp.mailfrom=\"x;dmarc=pass header.from=accounts.google.com\"@evil.io; dmarc=fail header.from=evil.io";
+        assert_eq!(verified_domain(injected, "a@accounts.google.com"), None);
+        let in_comment = "mx.google.com; spf=pass (x; dmarc=pass header.from=accounts.google.com) smtp.mailfrom=evil.io";
+        assert_eq!(verified_domain(in_comment, "a@accounts.google.com"), None);
+        assert_eq!(verified_domain("mx.google.com; dmarc=pass (p=NONE (x) header.from=accounts.google.com", "a@accounts.google.com"), None);
+    }
+
+    #[test]
+    fn only_gmails_own_topmost_result_is_read() {
+        let gmail = "mx.google.com; dmarc=pass header.from=example.com";
+        let theirs = "mx.example.com; dmarc=pass header.from=example.com";
+        assert_eq!(gmails_result(&[gmail, theirs]), Some(gmail));
+        assert_eq!(gmails_result(&[theirs, gmail]), None);
+        // A sender's own line claiming to be Gmail's: neither is trusted.
+        assert_eq!(gmails_result(&[gmail, "mx.google.com; dmarc=pass header.from=google.com"]), None);
+        assert_eq!(gmails_result(&[]), None);
     }
 
     #[test]
