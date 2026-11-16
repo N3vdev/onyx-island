@@ -274,9 +274,8 @@ impl Practice {
             pill.left().max(stage.left())..=pill.right().min(stage.right()),
             pill.y_range(),
         );
-        // Sad eyes look down, a little low.
-        let look = vec2((offset.x / 40.0).clamp(-1.0, 1.0), ((offset.y / 30.0) + 0.5 * sad).clamp(-1.0, 1.0));
-        eyes(&painter, visible.center() - vec2(0.0, hop - sad), PILL_H / 32.0, look, sad, happy, blink(now));
+        let look = vec2((offset.x / 40.0).clamp(-1.0, 1.0), (offset.y / 30.0).clamp(-1.0, 1.0));
+        eyes(&painter, visible.center() - vec2(0.0, hop), PILL_H / 32.0, look, sad, happy, blink(now));
 
         // Which way to go next: chevrons drifting that way.
         if let (true, Some(m), None) = (self.started, self.current(), self.drag) {
@@ -375,7 +374,8 @@ fn eyes(painter: &Painter, center: Pos2, unit: f32, look: Vec2, sad: f32, happy:
     let radius = 6.0 * unit * (1.0 + 0.06 * sad);
     let ink = EYE;
     for side in [-1.0f32, 1.0] {
-        let at = center + vec2(side * 14.0 * unit + look.x * 5.0 * unit, look.y * 3.0 * unit);
+        // Raised by about half of what the sad lid takes off the top.
+        let at = center + vec2(side * 14.0 * unit + look.x * 5.0 * unit, look.y * 3.0 * unit - radius * 0.2 * sad);
         if happy {
             let half = 5.6 * unit;
             let sag = 4.0 * unit;

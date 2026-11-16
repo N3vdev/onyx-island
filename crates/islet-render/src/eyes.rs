@@ -248,12 +248,11 @@ impl EyePose {
     pub fn sulk(mut self, t: f64) -> Self {
         let t = t as f32;
         self.sad = self.sad.max(smoothstep(0.3, 0.7, t));
-        // Big, glossy puppy eyes, looking down.
+        // Big, glossy puppy eyes, still centred in the pill.
         self.surprise = self.surprise.max(0.45 * self.sad);
-        self.look_y = lerp(self.look_y, 0.5, self.sad);
-        // A sigh: a slow sink and back, settling a touch low.
+        // A sigh: a slow sink and back up.
         let sigh = (PI * ((t - 0.35) / 0.9).clamp(0.0, 1.0)).sin();
-        self.shift_y += 1.0 * self.sad + 1.3 * sigh;
+        self.shift_y += 1.3 * sigh;
         // Then one tear.
         if (TEAR_AT..TEAR_AT + TEAR_RUN).contains(&t) {
             self.tear = (t - TEAR_AT) / TEAR_RUN;
@@ -454,7 +453,9 @@ impl Gfx {
             // The eye on the side they look toward comes a touch closer.
             let near = 1.0 + 0.08 * pose.look_x * side;
             let at_x = cx + side * EYE_SPACING * unit + look_x;
-            let at_y = cy + look_y;
+            // The sad lid takes some of the top: raise the eye by about
+            // half of that, so what is left sits in the middle.
+            let at_y = cy + look_y - eye_h * 0.1 * pose.sad;
             if narrow < 1.0 {
                 let w = eye_w * near;
                 let full = eye_h * near;
