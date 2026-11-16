@@ -259,9 +259,9 @@ impl Practice {
         }
         pill = pill.translate(offset);
 
-        // Moods: cross while tucked into a side, a happy hop on coming back.
+        // Moods: sad while tucked into a side, a happy hop on coming back.
         let settled = !self.moving(now);
-        let angry = if self.side != 0 && settled { ((now - self.moved_at - TRAVEL) as f32 / 0.25).clamp(0.0, 1.0) } else { 0.0 };
+        let sad = if self.side != 0 && settled { ((now - self.moved_at - TRAVEL) as f32 / 0.25).clamp(0.0, 1.0) } else { 0.0 };
         let cheer = self.cheered_at.map_or(f32::MAX, |at| (now - at) as f32);
         let happy = (0.0..1.1).contains(&cheer);
         let hop = if happy { (std::f32::consts::PI * cheer / 0.3).sin().abs() * (-2.2 * cheer).exp() * 5.0 } else { 0.0 };
@@ -274,8 +274,9 @@ impl Practice {
             pill.left().max(stage.left())..=pill.right().min(stage.right()),
             pill.y_range(),
         );
-        let look = vec2((offset.x / 40.0).clamp(-1.0, 1.0), (offset.y / 30.0).clamp(-1.0, 1.0));
-        eyes(&painter, visible.center() - vec2(0.0, hop), PILL_H / 32.0, look, angry, happy, blink(now));
+        // Sad eyes look down, a little low.
+        let look = vec2((offset.x / 40.0).clamp(-1.0, 1.0), ((offset.y / 30.0) + 0.5 * sad).clamp(-1.0, 1.0));
+        eyes(&painter, visible.center() - vec2(0.0, hop - sad), PILL_H / 32.0, look, sad, happy, blink(now));
 
         // Which way to go next: chevrons drifting that way.
         if let (true, Some(m), None) = (self.started, self.current(), self.drag) {
@@ -367,10 +368,11 @@ pub fn swipe_of(drag: Vec2) -> Option<Move> {
     }
 }
 
-/// Two eyes around `center`. `angry` slants a lid down toward the middle of
-/// each; `happy` turns them into ^ ^; `open` is the blink.
-fn eyes(painter: &Painter, center: Pos2, unit: f32, look: Vec2, angry: f32, happy: bool, open: f32) {
-    let radius = 6.0 * unit;
+/// Two eyes around `center`. `sad` slants a lid down toward the outside of
+/// each (and makes them a little bigger); `happy` turns them into ^ ^;
+/// `open` is the blink.
+fn eyes(painter: &Painter, center: Pos2, unit: f32, look: Vec2, sad: f32, happy: bool, open: f32) {
+    let radius = 6.0 * unit * (1.0 + 0.06 * sad);
     let ink = EYE;
     for side in [-1.0f32, 1.0] {
         let at = center + vec2(side * 14.0 * unit + look.x * 5.0 * unit, look.y * 3.0 * unit);
@@ -393,11 +395,11 @@ fn eyes(painter: &Painter, center: Pos2, unit: f32, look: Vec2, angry: f32, happ
                 pos2(at.x + radius * a.cos(), at.y + ry * a.sin())
             })
             .collect();
-        let shape = if angry > 0.01 {
-            let top = at.y - radius;
-            let outer = pos2(at.x + side * radius, top - 0.5);
-            let inner = pos2(at.x - side * radius, top + radius * 2.0 * 0.52 * angry);
-            below_line(&outline, outer, inner)
+        let shape = if sad > 0.01 {
+            let top = at.y - ry;
+            let inner = pos2(at.x - side * radius, top - 0.5);
+            let outer = pos2(at.x + side * radius, top + ry * 2.0 * 0.42 * sad);
+            below_line(&outline, inner, outer)
         } else {
             outline
         };

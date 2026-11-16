@@ -371,6 +371,12 @@ fn capture_eye_morphs() {
             gfx.draw(8.0,&base,&base,target,&content,None,1.0).unwrap();
             save_buffer(gfx,&directory.join(format!("wink-{}.tga", (wink * 100.0) as i32))).unwrap();
         }
+        // Tucked at a side: turning sad, then the tear running down.
+        for t in [0.2f64, 0.5, 0.9, 1.4, 2.0, 2.4, 3.0] {
+            gfx.eyes = eyes::EyePose::REST.sulk(t);
+            gfx.draw(8.0,&base,&base,target,&content,None,1.0).unwrap();
+            save_buffer(gfx,&directory.join(format!("sad-{}.tga", (t * 10.0) as u32))).unwrap();
+        }
         // Eyes into dictation bars, partway, with a voice on the mic.
         gfx.eyes = eyes::EyePose::REST;
         let dictation = IslandState {

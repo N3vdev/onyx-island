@@ -676,7 +676,7 @@ impl Renderer {
             self.sulk_since = None;
         }
         let eye_pose = if eyes {
-            // A cross face does not wink.
+            // A sad face does not wink.
             let wink = if self.sulk_since.is_some() { 0.0 } else { self.blinker.wink(now) };
             let mut pose = eyes::EyePose::new(x, y, self.lift(y), self.blinker.open(now), now).wink(wink);
             if let Some(since) = self.sulk_since {
@@ -883,7 +883,8 @@ impl Renderer {
     fn eyes_reacting(&self, now: f64) -> bool {
         self.held_pull.is_some()
             || self.reaction.is_some_and(|(reaction, start)| now - start < reaction.length() + 0.05)
-            || self.sulk_since.is_some_and(|since| now - since < SULK_DELAY + 1.0)
+            // Turning sad, sighing, and the tear running down.
+            || self.sulk_since.is_some_and(|since| now - since < SULK_DELAY + eyes::SULK_LENGTH)
     }
 
     /// The night light is warming the screen.

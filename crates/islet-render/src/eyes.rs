@@ -20,6 +20,13 @@ const EYE_COLOR: [u8; 3] = [244, 245, 250];
 const NIGHT_EYE_COLOR: [u8; 3] = [255, 214, 92];
 /// Eye size and the distance from the middle to each eye, in eye units.
 const EYE: f32 = 12.0;
+/// The sad eyes' one tear: light blue, from this many seconds after they
+/// turn sad, running for this long.
+const TEAR_COLOR: [u8; 3] = [150, 205, 255];
+const TEAR_AT: f32 = 1.0;
+const TEAR_RUN: f32 = 1.6;
+/// How long the sad face keeps moving after it starts.
+pub(crate) const SULK_LENGTH: f64 = (TEAR_AT + TEAR_RUN) as f64 + 0.1;
 const EYE_SPACING: f32 = 14.0;
 /// One blink: the lids close quickly, rest a moment, and open more slowly.
 const CLOSE: f64 = 0.085;
@@ -103,9 +110,12 @@ pub(crate) struct EyePose {
     pub shift_y: f32,
     /// 0..1: tinted yellow, for the night light.
     pub warm: f32,
-    /// 0..1: angry, the top of each eye cut by a lid sloping down toward
-    /// the middle (\ /). Pushed off to the screen side, they sulk.
-    pub angry: f32,
+    /// 0..1: sad, the top of each eye cut by a lid sloping down toward the
+    /// outside (/ \), like worried brows. Pushed off to the screen side,
+    /// they sulk.
+    pub sad: f32,
+    /// 0..1: how far a single tear has run down (0: none).
+    pub tear: f32,
 }
 
 impl EyePose {
@@ -121,7 +131,8 @@ impl EyePose {
         shift_x: 0.0,
         shift_y: 0.0,
         warm: 0.0,
-        angry: 0.0,
+        sad: 0.0,
+        tear: 0.0,
     };
 
     /// The pose while pulled `x`, `y` logical pixels, `lift` of it away from
@@ -144,7 +155,8 @@ impl EyePose {
             shift_x: tremble * 0.7,
             shift_y: 0.0,
             warm: 0.0,
-            angry: 0.0,
+            sad: 0.0,
+            tear: 0.0,
         };
         pose.settle_lids();
         pose
@@ -230,16 +242,22 @@ impl EyePose {
     }
 
     /// Sulking at the screen side, `t` seconds after arriving there: a
-    /// moment of their usual face, then the brows come down with a huff (a
-    /// quick shake and a little drop), and they stay cross.
+    /// moment of their usual face, then the brows tilt up in the middle,
+    /// the eyes go big and droop with a little sigh, and one small tear
+    /// rolls down. Sad, but cute.
     pub fn sulk(mut self, t: f64) -> Self {
         let t = t as f32;
-        self.angry = self.angry.max(smoothstep(0.3, 0.55, t));
-        let huff = smoothstep(0.3, 0.4, t) * (1.0 - smoothstep(0.55, 0.95, t));
-        self.shift_x += 1.6 * (TAU * 11.0 * t).sin() * huff;
-        self.shift_y += 1.2 * huff;
-        // Narrowed a little, glaring.
-        self.open = self.open.min(1.0 - 0.12 * self.angry);
+        self.sad = self.sad.max(smoothstep(0.3, 0.7, t));
+        // Big, glossy puppy eyes, looking down.
+        self.surprise = self.surprise.max(0.45 * self.sad);
+        self.look_y = lerp(self.look_y, 0.5, self.sad);
+        // A sigh: a slow sink and back, settling a touch low.
+        let sigh = (PI * ((t - 0.35) / 0.9).clamp(0.0, 1.0)).sin();
+        self.shift_y += 1.0 * self.sad + 1.3 * sigh;
+        // Then one tear.
+        if (TEAR_AT..TEAR_AT + TEAR_RUN).contains(&t) {
+            self.tear = (t - TEAR_AT) / TEAR_RUN;
+        }
         self
     }
 
@@ -252,9 +270,10 @@ impl EyePose {
 
     /// Settled-frame key at about half-pixel steps, so a frame that would
     /// look the same as the last one is skipped.
-    pub fn key(self) -> [i16; 12] {
+    pub fn key(self) -> [i16; 13] {
         [
-            self.angry,
+            self.sad,
+            self.tear,
             self.warm,
             self.wink,
             self.look_x,
@@ -447,16 +466,16 @@ impl Gfx {
                 let w = lerp(w, half * 2.0 + stroke, narrow);
                 let h = lerp(lidded, stroke, narrow);
                 let mid = lerp(lid_y, at_y, narrow);
-                let angry = pose.angry * (1.0 - narrow);
-                if angry > 0.01 {
-                    // A lid sloping down toward the middle cuts the top of
-                    // the eye: untouched at the outer edge, half way down
-                    // at the inner.
-                    let top = at_y - full * 0.5;
-                    let outer = (at_x + side * eye_w * 0.5, top - 0.5 * unit);
-                    let inner = (at_x - side * eye_w * 0.5, top + full * 0.52 * angry);
+                let sad = pose.sad * (1.0 - narrow);
+                if sad > 0.01 {
+                    // A lid sloping down toward the outside cuts the top of
+                    // the eye: untouched at the inner edge, some way down
+                    // at the outer.
+                    let top = mid - h * 0.5;
+                    let inner = (at_x - side * eye_w * 0.5, top - 0.5 * unit);
+                    let outer = (at_x + side * eye_w * 0.5, top + h * 0.42 * sad);
                     let outline = round_rect_outline(at_x - w * 0.5, mid - h * 0.5, w, h, w.min(h) * 0.5);
-                    self.fill_polygon(&below_line(&outline, outer, inner), ink)?;
+                    self.fill_polygon(&below_line(&outline, inner, outer), ink)?;
                 } else {
                     self.fill_round_rect(at_x - w * 0.5, mid - h * 0.5, w, h, w.min(h) * 0.5, ink)?;
                 }
@@ -484,6 +503,28 @@ impl Gfx {
                     ink,
                 )?;
             }
+        }
+        if pose.tear > 0.0 && pose.tear < 1.0 {
+            // A small drop from the outer corner of the right eye, sliding
+            // down and fading.
+            let t = pose.tear;
+            let fade = smoothstep(0.0, 0.12, t) * (1.0 - smoothstep(0.7, 1.0, t));
+            let r = 1.6 * unit;
+            let x = cx + EYE_SPACING * unit + look_x + eye_w * 0.4;
+            // Starts at the corner of the eye and stays inside the pill.
+            let start = cy + look_y + eye_h * 0.42;
+            let end = (cy + height * 0.5 - r * 1.6).max(start);
+            let y = lerp(start, end, ease_in_out(t));
+            let drop = color(TEAR_COLOR, 0.9 * fade * alpha);
+            self.fill_circle(x, y, r, drop)?;
+            self.fill_polygon(
+                &[
+                    Vector2 { X: x - r * 0.92, Y: y - r * 0.4 },
+                    Vector2 { X: x, Y: y - r * 2.4 },
+                    Vector2 { X: x + r * 0.92, Y: y - r * 0.4 },
+                ],
+                drop,
+            )?;
         }
         Ok(())
     }
