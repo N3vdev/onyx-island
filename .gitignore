@@ -8,3 +8,5 @@
 /.impeccable/review
 /website/.firebase
 /training-data
+# Onyx's Google sign-in app (baked into builds, never committed)
+/secrets

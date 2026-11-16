@@ -22,6 +22,7 @@ mod restart;
 mod settings;
 mod source_icon;
 mod spotify;
+mod gmail;
 mod sysstats;
 mod tasks;
 mod tray;

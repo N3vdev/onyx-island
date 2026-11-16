@@ -57,6 +57,8 @@ pub const SPLIT_BUBBLE: PillSize = PillSize::new(36.0, 36.0, 18.0);
 /// it holds its own next to the big card and is easy to click.
 pub const SWITCH_BUBBLE: PillSize = PillSize::new(44.0, 44.0, 22.0);
 pub const NOTIFICATION: PillSize = PillSize::new(380.0, 76.0, 30.0);
+/// A one-time code from email: a little bigger than the resting pill.
+pub const CODE: PillSize = PillSize::new(crate::otp::WIDTH, crate::otp::HEIGHT, 29.0);
 pub const MEDIA: PillSize = PillSize::new(496.0, 120.0, 38.0);
 pub const CALCULATOR: PillSize = PillSize::new(
     crate::widgets::CALCULATOR_WIDTH,
@@ -559,6 +561,8 @@ pub enum ContentCard {
     Dictation(DictationCard),
     /// The lens's toolbar, while Onyx Lens is open.
     Lens(crate::lens::LensCard),
+    /// A one-time code from email.
+    Code(crate::otp::CodeCard),
     /// The startup greeting: the renderer animates it from when it appears.
     Intro,
 }
@@ -577,6 +581,7 @@ pub enum CardKind {
     Agent,
     Dictation,
     Lens,
+    Code,
     Intro,
 }
 
@@ -596,6 +601,7 @@ impl ContentCard {
             Self::Agent(_) => CardKind::Agent,
             Self::Dictation(_) => CardKind::Dictation,
             Self::Lens(_) => CardKind::Lens,
+            Self::Code(_) => CardKind::Code,
             Self::Intro => CardKind::Intro,
         }
     }
@@ -628,6 +634,7 @@ impl ContentCard {
             Self::Dictation(_) | Self::Intro => true,
             Self::Notification(_)
             | Self::Lens(_)
+            | Self::Code(_)
             | Self::Converter(_)
             | Self::Agent(_)
             | Self::Calculator(_)
@@ -751,6 +758,9 @@ pub struct IslandState {
     /// The lyrics view is open: the opened island shows it in place of the
     /// player until it is closed.
     pub lyrics: Option<crate::lyrics::LyricsCard>,
+    /// A one-time code that just arrived by email: the island grows a little
+    /// to show it until it is copied, closed, or its time is up.
+    pub code: Option<crate::otp::CodeCard>,
     /// A second player, playing at the same time. It waits in the round
     /// bubble beside the pill until it is clicked.
     pub other_media: Option<MediaCard>,
@@ -807,6 +817,7 @@ impl Default for IslandState {
             search: None,
             spotify_pill: crate::spotify::SpotifyPill::Hidden,
             lyrics: None,
+            code: None,
             other_media: None,
             media_dismissed: false,
             media_condensed: false,
@@ -953,7 +964,7 @@ impl IslandState {
 
     #[must_use]
     pub fn has_activity(&self) -> bool {
-        self.converter.is_some() || self.dictation.is_some() || self.lens.is_some()
+        self.converter.is_some() || self.dictation.is_some() || self.lens.is_some() || self.code.is_some()
             || self.needs_input.is_some()
             || self.done.is_some()
             || self.running.is_some()
@@ -1012,6 +1023,10 @@ impl IslandState {
         }
         if let Some(notification) = &self.needs_input {
             return Some(ContentCard::Notification(notification.clone()));
+        }
+        // Wanted now, whatever else is on: shown open or not.
+        if let Some(code) = &self.code {
+            return Some(ContentCard::Code(code.clone()));
         }
         if self.intro && !self.expanded {
             return Some(ContentCard::Intro);
@@ -1133,7 +1148,10 @@ impl IslandState {
     /// "Stopped" or "Claude finished"), so it takes over the pill for its few
     /// seconds instead.
     fn splits(&self) -> bool {
-        self.persistent_count() >= 2 && self.done.is_none() && (self.expanded || self.compact_widget.is_none())
+        self.persistent_count() >= 2
+            && self.done.is_none()
+            && self.code.is_none()
+            && (self.expanded || self.compact_widget.is_none())
     }
 
     #[must_use]
@@ -1143,6 +1161,9 @@ impl IslandState {
         }
         if self.dictation.is_some() {
             return LayoutTarget::single(DICTATION);
+        }
+        if self.code.is_some() && self.needs_input.is_none() {
+            return LayoutTarget::single(CODE);
         }
         // Shown whatever the idle style, even tucked: it is a greeting.
         if self.intro && !self.expanded && self.needs_input.is_none() {
@@ -1287,6 +1308,8 @@ pub enum IslandEvent {
     SetTasks(Option<crate::tasks::TasksCard>),
     /// Spotify search as shown, or `None` once closed.
     SetSearch(Option<crate::spotify::SearchCard>),
+    /// A one-time code to show, or `None` to take it away.
+    SetCode(Option<crate::otp::CodeCard>),
     /// What the music card's Spotify pill offers.
     SetSpotifyPill(crate::spotify::SpotifyPill),
     /// The song (title, artist) that has lyrics, or `None`.
@@ -1624,6 +1647,13 @@ pub fn reduce(state: &mut IslandState, event: IslandEvent, now: f64) -> Vec<Effe
                 Vec::new()
             }
         }
+        IslandEvent::SetCode(card) => {
+            if state.code == card {
+                return Vec::new();
+            }
+            state.code = card;
+            Effect::changed()
+        }
         IslandEvent::SetSearch(card) => {
             if state.search == card {
                 return Vec::new();
@@ -1901,6 +1931,8 @@ fn accent_for_card(card: &ContentCard) -> [u8; 3] {
         ContentCard::Lyrics(lyrics) => lyrics.accent.unwrap_or(DEFAULT_MEDIA_ACCENT),
         // Spotify's green.
         ContentCard::Search(_) => [30, 215, 96],
+        // A calm blue, like a notice of Onyx's own.
+        ContentCard::Code(_) => [110, 150, 255],
         ContentCard::Notification(notification) => match notification.level {
             AlertLevel::Info => [110, 150, 255],
             AlertLevel::Success => [64, 210, 122],
@@ -2725,6 +2757,24 @@ mod tests {
         let deadline = state.done_deadline.unwrap();
         reduce(&mut state, IslandEvent::Tick { now: deadline - 0.008 }, deadline - 0.008);
         assert!(state.done.is_none());
+    }
+
+    #[test]
+    fn a_code_takes_the_island_open_or_not_and_leaves_it_as_it_was() {
+        let card = crate::otp::CodeCard { code: "482913".into(), from: "Google".into(), copied: false };
+        let mut state = IslandState {
+            media: Some(media()),
+            ..IslandState::default()
+        };
+        let before = state.layout();
+        reduce(&mut state, IslandEvent::SetCode(Some(card.clone())), 0.0);
+        assert_eq!(state.layout(), LayoutTarget::single(CODE));
+        assert_eq!(state.primary_card(), Some(ContentCard::Code(card.clone())));
+        state.expanded = true;
+        assert_eq!(state.layout(), LayoutTarget::single(CODE), "open, it is still the code");
+        state.expanded = false;
+        reduce(&mut state, IslandEvent::SetCode(None), 1.0);
+        assert_eq!(state.layout(), before);
     }
 
     #[test]

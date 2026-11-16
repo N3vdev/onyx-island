@@ -16,6 +16,7 @@ pub mod island;
 pub mod media;
 pub mod music;
 pub mod night_light;
+pub mod otp;
 pub mod recordings;
 pub mod spotify;
 pub mod spring;

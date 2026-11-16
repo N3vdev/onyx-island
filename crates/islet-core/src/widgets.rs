@@ -29,6 +29,8 @@ pub enum WidgetHover {
     Task(crate::tasks::TaskItem),
     /// A button or a line on the lyrics view.
     Lyrics(crate::lyrics::LyricsItem),
+    /// The one-time code card.
+    Code(crate::otp::CodeItem),
     /// The field, a result or the close button on Spotify search.
     Search(crate::spotify::SearchItem),
 }

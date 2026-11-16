@@ -233,6 +233,7 @@ mod lens;
 mod tasks;
 mod lyrics;
 mod search;
+mod code;
 mod devices;
 
 /// How long the pill takes to grow in before the night light's eyes react.
@@ -808,6 +809,7 @@ impl Renderer {
                 ContentCard::Stats(stats) => format!("{stats:?}").hash(&mut hasher),
                 ContentCard::Tasks(tasks) => format!("{tasks:?}").hash(&mut hasher),
                 ContentCard::Search(card) => format!("{card:?}{:?}", self.widget_hover).hash(&mut hasher),
+                ContentCard::Code(card) => format!("{card:?}{:?}", self.widget_hover).hash(&mut hasher),
                 ContentCard::Lyrics(card) => {
                     crate::lyrics::lyrics_key(card, now).hash(&mut hasher);
                     (card.scroll.map(f32::to_bits), &card.title, &card.artist, card.art.as_ref().map(|art| art.id)).hash(&mut hasher);
@@ -1311,9 +1313,13 @@ fn morph_of(
         ContentCard::Notification(_) | ContentCard::Agent(_) => {
             (COMPACT, islet_core::island::NOTIFICATION)
         }
-        ContentCard::Dictation(_) | ContentCard::Glance(_) | ContentCard::Lens(_) | ContentCard::Lyrics(_) | ContentCard::Search(_) | ContentCard::Intro => {
-            return None
-        }
+        ContentCard::Dictation(_)
+        | ContentCard::Glance(_)
+        | ContentCard::Lens(_)
+        | ContentCard::Lyrics(_)
+        | ContentCard::Search(_)
+        | ContentCard::Code(_)
+        | ContentCard::Intro => return None,
     };
     if big.height <= small.height + 1.0 {
         return None;
@@ -2561,6 +2567,7 @@ impl Gfx {
             ContentCard::Tasks(tasks) => self.draw_tasks(width, height, tasks, alpha),
             ContentCard::Lyrics(card) => self.draw_lyrics(now, card, accent, alpha),
             ContentCard::Search(card) => self.draw_search(card, alpha),
+            ContentCard::Code(card) => self.draw_code(card, accent, alpha),
             ContentCard::Glance(glance) => self.draw_glance(width, height, glance, alpha),
             ContentCard::Media(media) => {
                 if height > 60.0 {
@@ -2698,6 +2705,7 @@ impl Gfx {
             (ContentCard::Lens(lens), _) => self.draw_lens(w, h, lens, accent, alpha),
             (ContentCard::Lyrics(card), _) => self.draw_lyrics(now, card, accent, alpha),
             (ContentCard::Search(card), _) => self.draw_search(card, alpha),
+            (ContentCard::Code(card), _) => self.draw_code(card, accent, alpha),
             (ContentCard::Dictation(_) | ContentCard::Intro, _) => Ok(()),
         };
         self.skip_art = false;
@@ -2825,7 +2833,12 @@ impl Gfx {
                 None => return Ok(()),
             },
             ContentCard::Converter(_) | ContentCard::Calculator(_) | ContentCard::Stats(_) => return Ok(()),
-            ContentCard::Dictation(_) | ContentCard::Lens(_) | ContentCard::Lyrics(_) | ContentCard::Search(_) | ContentCard::Intro => return Ok(()),
+            ContentCard::Dictation(_)
+            | ContentCard::Lens(_)
+            | ContentCard::Lyrics(_)
+            | ContentCard::Search(_)
+            | ContentCard::Code(_)
+            | ContentCard::Intro => return Ok(()),
         };
 
         let text_x = if trailing_bars.is_some() {
@@ -3726,7 +3739,7 @@ impl Gfx {
             ContentCard::Dictation(_) => {
                 self.fill_circle(center_x, center_y, 5.0, color(accent, alpha))?;
             }
-            ContentCard::Converter(_) | ContentCard::Calculator(_) | ContentCard::Stats(_) | ContentCard::Tasks(_) | ContentCard::Glance(_) | ContentCard::Lens(_) | ContentCard::Lyrics(_) | ContentCard::Search(_) | ContentCard::Intro => {
+            ContentCard::Converter(_) | ContentCard::Calculator(_) | ContentCard::Stats(_) | ContentCard::Tasks(_) | ContentCard::Glance(_) | ContentCard::Lens(_) | ContentCard::Lyrics(_) | ContentCard::Search(_) | ContentCard::Code(_) | ContentCard::Intro => {
                 return Ok(())
             }
         }
@@ -4004,6 +4017,8 @@ enum FormatId {
     Lyric,
     /// The percent in a small battery ring.
     RingLabel,
+    /// A one-time code: large and bold.
+    Code,
 }
 
 struct TextFormats {
@@ -4026,6 +4041,7 @@ struct TextFormats {
     task_when: IDWriteTextFormat,
     lyric: IDWriteTextFormat,
     ring_label: IDWriteTextFormat,
+    code: IDWriteTextFormat,
 }
 
 impl TextFormats {
@@ -4176,6 +4192,13 @@ impl TextFormats {
                 DWRITE_TEXT_ALIGNMENT_CENTER,
                 DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
             )?,
+            code: create_format(
+                factory,
+                21.0,
+                DWRITE_FONT_WEIGHT_BOLD,
+                DWRITE_TEXT_ALIGNMENT_LEADING,
+                DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
+            )?,
         })
     }
 
@@ -4200,6 +4223,7 @@ impl TextFormats {
             FormatId::TaskWhen => &self.task_when,
             FormatId::Lyric => &self.lyric,
             FormatId::RingLabel => &self.ring_label,
+            FormatId::Code => &self.code,
         }
     }
 }

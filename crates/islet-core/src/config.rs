@@ -27,6 +27,21 @@ pub struct Config {
     pub widgets: WidgetConfig,
     pub night_light: NightLightConfig,
     pub lens: LensConfig,
+    pub mail: MailConfig,
+}
+
+/// Email on the island.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MailConfig {
+    /// Show one-time codes that arrive in Gmail (once connected).
+    pub gmail_codes: bool,
+}
+
+impl Default for MailConfig {
+    fn default() -> Self {
+        Self { gmail_codes: true }
+    }
 }
 
 /// Onyx Lens: press a shortcut, then circle anything on screen to copy its
@@ -85,6 +100,7 @@ impl Default for Config {
             widgets: WidgetConfig::default(),
             night_light: NightLightConfig::default(),
             lens: LensConfig::default(),
+            mail: MailConfig::default(),
         }
     }
 }

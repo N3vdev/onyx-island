@@ -11,6 +11,7 @@ mod customize;
 mod dictation_page;
 mod folder_picker;
 mod lens_page;
+mod mail_page;
 mod tasks_page;
 mod night_light_page;
 mod onboarding;

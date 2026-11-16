@@ -592,8 +592,36 @@ fn sign_in_with(
         return Err("Couldn't open the browser");
     }
     waiting_on(Some(url.clone()));
-    let deadline = Instant::now() + SIGN_IN_WAIT;
-    let code = loop {
+    let code = wait_for_code(&listener, "/callback", &state, "Spotify", Instant::now() + SIGN_IN_WAIT, stopping)?;
+    drop(listener);
+    let response = session.agent().post(&format!("{ACCOUNTS}/api/token")).send_form(&[
+        ("grant_type", "authorization_code"),
+        ("code", &code),
+        ("redirect_uri", REDIRECT),
+        ("client_id", CLIENT_ID),
+        ("code_verifier", &verifier),
+    ]);
+    let body: serde_json::Value = match response {
+        Ok(response) => response.into_json().map_err(|_| "Spotify's answer was unreadable")?,
+        Err(ureq::Error::Status(_, _)) => return Err("Spotify refused the sign-in"),
+        Err(_) => return Err("Couldn't reach Spotify"),
+    };
+    session.take_tokens(&body).map(|_| ()).map_err(|_| "Spotify's answer was unreadable")
+}
+
+/// Waits on `listener` for the browser to come back from a sign-in page to
+/// `path` with this sign-in's `state`, and gives the code it brings. Other
+/// requests (a stale tab, a page poking the port) are turned away without
+/// ending the wait. Shared by every service Onyx signs in to.
+pub(crate) fn wait_for_code(
+    listener: &TcpListener,
+    path: &str,
+    state: &str,
+    service: &str,
+    deadline: Instant,
+    stopping: &dyn Fn() -> bool,
+) -> Result<String, &'static str> {
+    loop {
         if Instant::now() > deadline {
             return Err("Sign-in timed out");
         }
@@ -618,12 +646,12 @@ fn sign_in_with(
         }
         let request = String::from_utf8_lossy(&request);
         let target = request.lines().next().and_then(|line| line.split_whitespace().nth(1)).unwrap_or("");
-        let Some(query) = target.strip_prefix("/callback?") else {
+        let Some(query) = target.strip_prefix(path).and_then(|rest| rest.strip_prefix('?')) else {
             let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
             continue;
         };
         let params = parse_query(query);
-        if params.get("state") != Some(&state) {
+        if params.get("state").map(String::as_str) != Some(state) {
             // Not this sign-in's answer (a stale tab, or a page poking the
             // port): it does not end the wait.
             let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
@@ -631,9 +659,9 @@ fn sign_in_with(
         }
         let ok = params.contains_key("code");
         let page = if ok {
-            "Onyx is connected to Spotify. You can close this tab."
+            format!("Onyx is connected to {service}. You can close this tab.")
         } else {
-            "Onyx wasn't connected to Spotify. You can close this tab."
+            format!("Onyx wasn't connected to {service}. You can close this tab.")
         };
         let html = format!(
             "<!doctype html><meta charset=utf-8><title>Onyx</title><body style=\"font:16px system-ui;background:#0b0b0d;color:#f4f5fa;display:grid;place-items:center;height:90vh\"><p>{page}</p>"
@@ -643,27 +671,13 @@ fn sign_in_with(
                 .as_bytes(),
         );
         match params.get("code") {
-            Some(code) => break code.clone(),
+            Some(code) => return Ok(code.clone()),
             None => return Err("Sign-in was cancelled"),
         }
-    };
-    drop(listener);
-    let response = session.agent().post(&format!("{ACCOUNTS}/api/token")).send_form(&[
-        ("grant_type", "authorization_code"),
-        ("code", &code),
-        ("redirect_uri", REDIRECT),
-        ("client_id", CLIENT_ID),
-        ("code_verifier", &verifier),
-    ]);
-    let body: serde_json::Value = match response {
-        Ok(response) => response.into_json().map_err(|_| "Spotify's answer was unreadable")?,
-        Err(ureq::Error::Status(_, _)) => return Err("Spotify refused the sign-in"),
-        Err(_) => return Err("Couldn't reach Spotify"),
-    };
-    session.take_tokens(&body).map(|_| ()).map_err(|_| "Spotify's answer was unreadable")
+    }
 }
 
-fn shell_open(target: &str, show: i32) -> bool {
+pub(crate) fn shell_open(target: &str, show: i32) -> bool {
     let wide: Vec<u16> = target.encode_utf16().chain(std::iter::once(0)).collect();
     // SAFETY: plain ShellExecute of a URL or URI.
     let result = unsafe {
@@ -681,14 +695,14 @@ fn shell_open(target: &str, show: i32) -> bool {
 
 /// Unguessable text from the OS's random numbers; `None` if they are not
 /// available (there is no safe stand-in).
-fn random_text(bytes: usize) -> Option<String> {
+pub(crate) fn random_text(bytes: usize) -> Option<String> {
     let mut buffer = vec![0u8; bytes];
     getrandom::fill(&mut buffer).ok()?;
     Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buffer))
 }
 
 /// Percent-encoding for a URL's query.
-fn encode(text: &str) -> String {
+pub(crate) fn encode(text: &str) -> String {
     let mut out = String::with_capacity(text.len() * 3);
     for byte in text.bytes() {
         match byte {
@@ -699,7 +713,7 @@ fn encode(text: &str) -> String {
     out
 }
 
-fn parse_query(query: &str) -> HashMap<String, String> {
+pub(crate) fn parse_query(query: &str) -> HashMap<String, String> {
     query
         .split('&')
         .filter_map(|pair| {
@@ -750,7 +764,7 @@ fn load_key(dir: &std::path::Path) -> Option<String> {
 }
 
 /// DPAPI: seal (`true`) or open data for the signed-in Windows user.
-fn protect(data: &[u8], seal: bool) -> Option<Vec<u8>> {
+pub(crate) fn protect(data: &[u8], seal: bool) -> Option<Vec<u8>> {
     let input = CRYPT_INTEGER_BLOB { cbData: data.len() as u32, pbData: data.as_ptr().cast_mut() };
     let mut output = CRYPT_INTEGER_BLOB::default();
     // SAFETY: the output buffer is LocalAlloc'd by Windows and freed here.

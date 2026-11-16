@@ -97,6 +97,8 @@ const TIMER_LYRICS_FOLLOW: usize = 19;
 /// While the island is the lens's toolbar: checks the lens is still running
 /// (it can be switched off or crash with its overlay open).
 const TIMER_LENS_ALIVE: usize = 21;
+/// A one-time code's time on the island is up.
+const TIMER_CODE: usize = 22;
 /// How long scrolled lyrics stay put.
 const LYRICS_FOLLOW_MS: u32 = 4_000;
 /// Spotify search runs this long after typing pauses.
@@ -360,6 +362,9 @@ pub struct IslandHost {
     source_icons: Option<crate::source_icon::SourceIcons>,
     /// Spotify's Web API, started once Spotify is in use.
     spotify: Option<crate::spotify::Spotify>,
+    /// One-time codes from Gmail, while connected and switched on.
+    gmail: Option<crate::gmail::Gmail>,
+    gmail_enabled: bool,
     /// The Spotify setting.
     spotify_enabled: bool,
     /// Until when (island clock) the island does not close for the pointer
@@ -521,6 +526,8 @@ impl IslandHost {
             bluetooth: None,
             source_icons: None,
             spotify: None,
+            gmail: None,
+            gmail_enabled: false,
             spotify_enabled: config.media.spotify,
             collapse_grace_until: None,
             spotify_key_saved: None,
@@ -595,6 +602,7 @@ impl IslandHost {
                 }),
             ));
             host.set_bluetooth(config.media.bluetooth);
+            host.set_gmail(config.mail.gmail_codes);
             let mut lens = crate::lens::Lens::new(HWND(hwnd as *mut _));
             lens.configure(&config.lens);
             host.lens = Some(lens);
@@ -634,6 +642,7 @@ impl IslandHost {
         self.night_light = None;
         self.bluetooth = None;
         self.spotify = None;
+        self.gmail = None;
         self.lens = None;
         self.loopback = None;
         self.media = None;
@@ -668,6 +677,7 @@ impl IslandHost {
             // Live (not the demo): earbuds, as the setting says.
             self.set_bluetooth(config.media.bluetooth);
             self.spotify_enabled = config.media.spotify;
+            self.set_gmail(config.mail.gmail_codes);
         }
         if let Some(lens) = &mut self.lens {
             lens.configure(&config.lens);
@@ -754,6 +764,28 @@ impl IslandHost {
     ) -> Option<LRESULT> {
         if message == crate::lens::tools_message() {
             self.on_lens_report(wparam, lparam);
+            return Some(LRESULT(0));
+        }
+        if message == gmail_message() {
+            // From Settings: 1 connects, 0 disconnects; anything else is
+            // not Settings.
+            match wparam.0 {
+                1 => {
+                    self.gmail_enabled = true;
+                    let dir = crate::paths::Paths::discover().config_dir;
+                    let hwnd = self.hwnd;
+                    self.gmail.get_or_insert_with(|| crate::gmail::Gmail::start(hwnd, dir)).connect();
+                    self.notify("Connect Gmail", "Finish signing in in your browser");
+                }
+                0 => {
+                    // Started if need be, so the key is forgotten either way.
+                    let dir = crate::paths::Paths::discover().config_dir;
+                    let hwnd = self.hwnd;
+                    self.gmail.get_or_insert_with(|| crate::gmail::Gmail::start(hwnd, dir)).disconnect();
+                    self.clear_code();
+                }
+                _ => {}
+            }
             return Some(LRESULT(0));
         }
         if message == spotify_message() {
@@ -1003,6 +1035,8 @@ impl IslandHost {
                     self.finish_volume();
                 } else if !armed || !self.shape_settled() {
                     // Pressed or released mid-animation: not a click.
+                } else if self.handle_code_click(lparam) {
+                    // The one-time code: copied, or closed.
                 } else if self.handle_lens_click(lparam) {
                     // A tool on the lens toolbar, or the toolbar around it.
                 } else if self.handle_notice_click(lparam) {
@@ -1140,6 +1174,10 @@ impl IslandHost {
             }
             crate::spotify::WM_APP_SPOTIFY => {
                 self.on_spotify();
+                Some(LRESULT(0))
+            }
+            crate::gmail::WM_APP_GMAIL => {
+                self.on_gmail();
                 Some(LRESULT(0))
             }
             crate::bluetooth::WM_APP_BLUETOOTH => {
@@ -1994,6 +2032,103 @@ impl IslandHost {
         ))
     }
 
+    /// A point on the one-time code card (shown open or not), in its own
+    /// logical pixels.
+    fn code_point(&self, point: POINT) -> Option<(f32, f32)> {
+        if self.state.code.is_none() || self.traveling || self.fullscreen_hidden {
+            return None;
+        }
+        let top = self.effective_anchor_top();
+        let layout = self.customized_layout(self.state.layout(), top);
+        let main = self.target_frame(layout, top).main;
+        let dpi = self.dpi as f32 / 96.0;
+        let (x, y) = (point.x as f32 / dpi, point.y as f32 / dpi);
+        main.contains(x, y).then_some((
+            (x - main.x) / layout.content_scale,
+            (y - main.y) / layout.content_scale,
+        ))
+    }
+
+    /// A click on the code card copies the code, or closes the card.
+    fn handle_code_click(&mut self, lparam: LPARAM) -> bool {
+        use islet_core::otp::CodeItem;
+        let Some(card) = self.state.code.clone() else {
+            return false;
+        };
+        let Some((x, y)) = self.code_point(point_from_lparam(lparam)) else {
+            return false;
+        };
+        match card.item_at(x, y) {
+            Some(CodeItem::Copy) => {
+                if crate::gmail::copy_code(self.hwnd, &card.code) {
+                    self.dispatch(IslandEvent::SetCode(Some(islet_core::otp::CodeCard { copied: true, ..card })));
+                    // SAFETY: the island's own window and timer.
+                    unsafe {
+                        SetTimer(Some(self.hwnd), TIMER_CODE, islet_core::otp::COPIED_MS, None);
+                    }
+                }
+            }
+            Some(CodeItem::Close) => self.clear_code(),
+            None => return false,
+        }
+        self.update_widget_hover();
+        true
+    }
+
+    fn clear_code(&mut self) {
+        // SAFETY: the island's own window and timer.
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), TIMER_CODE);
+        }
+        self.dispatch(IslandEvent::SetCode(None));
+        self.update_widget_hover();
+    }
+
+    /// Gmail is switched on or off in Settings. Once on, it runs only for a
+    /// connected account (connecting starts it).
+    fn set_gmail(&mut self, on: bool) {
+        self.gmail_enabled = on;
+        if !on {
+            if self.gmail.take().is_some() || self.state.code.is_some() {
+                self.clear_code();
+            }
+            return;
+        }
+        if self.gmail.is_none() && self.demo.is_none() {
+            let dir = crate::paths::Paths::discover().config_dir;
+            if crate::gmail::Gmail::saved(&dir) {
+                self.gmail = Some(crate::gmail::Gmail::start(self.hwnd, dir));
+            }
+        }
+    }
+
+    fn on_gmail(&mut self) {
+        let Some(gmail) = &self.gmail else { return };
+        for news in gmail.take() {
+            match news {
+                crate::gmail::News::Code { code, from } => {
+                    if !self.gmail_enabled {
+                        continue;
+                    }
+                    self.dispatch(IslandEvent::SetCode(Some(islet_core::otp::CodeCard { code, from, copied: false })));
+                    // SAFETY: the island's own window and timer.
+                    unsafe {
+                        SetTimer(Some(self.hwnd), TIMER_CODE, islet_core::otp::VISIBLE_MS, None);
+                    }
+                    self.update_widget_hover();
+                }
+                crate::gmail::News::Connected => {
+                    self.notify("Gmail connected", "Codes that arrive will show here");
+                }
+                crate::gmail::News::ConnectFailed(why) => self.notify("Couldn't connect Gmail", why),
+                crate::gmail::News::SignedOut => {}
+                crate::gmail::News::Expired => {
+                    self.notify("Gmail signed out", "Connect again in Onyx Settings, Widgets");
+                }
+            }
+        }
+    }
+
     /// A point on the lens toolbar, in its own logical pixels.
     fn lens_point(&self, point: POINT) -> Option<(f32, f32)> {
         if self.state.lens.is_none() || self.traveling || self.fullscreen_hidden {
@@ -2079,6 +2214,10 @@ impl IslandHost {
     }
 
     fn widget_hover_at(&self, point: POINT) -> Option<WidgetHover> {
+        if let Some(card) = &self.state.code {
+            let (x, y) = self.code_point(point)?;
+            return card.item_at(x, y).map(WidgetHover::Code);
+        }
         if let Some(card) = self.state.lens {
             let (x, y) = self.lens_point(point)?;
             return card.item_at(x, y).map(WidgetHover::Lens);
@@ -2326,9 +2465,9 @@ impl IslandHost {
                 self.dispatch(IslandEvent::CalculatorKey(key));
                 true
             }
-            // Handled by `handle_lens_click` and `handle_lyrics_click`,
-            // which run first.
-            Some(WidgetHover::Lens(_) | WidgetHover::Lyrics(_)) => false,
+            // Handled by `handle_code_click`, `handle_lens_click` and
+            // `handle_lyrics_click`, which run first.
+            Some(WidgetHover::Code(_) | WidgetHover::Lens(_) | WidgetHover::Lyrics(_)) => false,
             Some(WidgetHover::Search(item)) => {
                 match item {
                     islet_core::spotify::SearchItem::Close => {
@@ -3344,6 +3483,9 @@ impl IslandHost {
                 if self.sync_lyrics() {
                     self.send_snapshot();
                 }
+            }
+            TIMER_CODE => {
+                self.clear_code();
             }
             TIMER_LENS_ALIVE => {
                 let gone = !self.lens.as_mut().is_some_and(|lens| lens.running());
@@ -4585,6 +4727,12 @@ fn demo_dictation_as(phase: DictationPhase, hands_free: bool) -> DictationCard {
 
 /// Settings asks the island to connect Spotify (`wparam` 1) or
 /// disconnect it (0).
+fn gmail_message() -> u32 {
+    static MESSAGE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    // SAFETY: registers a message name.
+    *MESSAGE.get_or_init(|| unsafe { windows::Win32::UI::WindowsAndMessaging::RegisterWindowMessageW(w!("Onyx.Gmail")) })
+}
+
 fn spotify_message() -> u32 {
     static MESSAGE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     // SAFETY: registers a message name.

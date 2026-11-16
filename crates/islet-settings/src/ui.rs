@@ -991,6 +991,7 @@ fn widgets(app: &mut SettingsApp, ui: &mut egui::Ui) {
             },
         );
     });
+    crate::mail_page::show(app, ui);
     ui.add_space(4.0);
     ui.label(RichText::new("Using widgets").font(bold_font(14.0)));
     ui.label(RichText::new("Expand the island, then scroll to switch between your current activity and each widget. The to-do list has its own page in the sidebar.").color(MUTED));

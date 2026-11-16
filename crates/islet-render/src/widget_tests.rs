@@ -866,3 +866,47 @@ fn capture_spotify_previews() {
         DestroyWindow(hwnd).unwrap();
     }
 }
+
+/// Opt-in native evidence: a one-time code from email on the island.
+#[test]
+#[ignore = "requires Windows GPU; writes code card render evidence"]
+fn capture_code_previews() {
+    use islet_core::otp::{CodeCard, CodeItem};
+    use windows::Win32::UI::WindowsAndMessaging::{CreateWindowExW, DestroyWindow, WINDOW_EX_STYLE, WS_POPUP};
+    let directory = std::path::PathBuf::from(std::env::var_os("ISLET_WIDGET_CAPTURE_DIR").expect("set capture directory"));
+    std::fs::create_dir_all(&directory).unwrap();
+    let card = CodeCard { code: "482913".into(), from: "Google".into(), copied: false };
+    unsafe {
+        let hwnd = CreateWindowExW(WINDOW_EX_STYLE(0), w!("STATIC"), w!("Onyx code capture"), WS_POPUP, 0, 0, 720, 248, None, None, None, None).unwrap();
+        let states = [
+            ("a-code", card.clone(), None),
+            ("b-hover", card.clone(), Some(CodeItem::Copy)),
+            ("c-copied", CodeCard { copied: true, ..card.clone() }, None),
+            ("d-letters", CodeCard { code: "K7Q2ZP".into(), from: "GitHub".into(), copied: false }, Some(CodeItem::Close)),
+        ];
+        for (name, card, hover) in states {
+            let state = IslandState { code: Some(card), ..Default::default() };
+            let target = state.layout();
+            let content = state.content();
+            let mut renderer = Renderer::new(
+                RendererConfig { hwnd, pixel_width: 720, pixel_height: 248, dpi: 96.0, logical_width: 720.0, logical_height: 248.0, anchor_top: true, glass: None },
+                Arc::new(Mutex::new(HitRegion::default())),
+                Arc::new(BarLevels::default()),
+                0.0,
+            )
+            .unwrap();
+            renderer.set_snapshot(target, content.clone(), 0.0);
+            renderer.render(5.0, true).unwrap();
+            renderer.animator.jump_to(target, 8.0);
+            let sample = renderer.animator.sample(8.0);
+            let geometry = renderer.frame_geometry(&sample);
+            let gfx = renderer.gfx.as_mut().unwrap();
+            gfx.main_spring_height = sample.main_height;
+            gfx.content_scale = 1.0;
+            gfx.widget_hover = hover.map(islet_core::widgets::WidgetHover::Code);
+            gfx.draw(8.0, &geometry, &geometry, target, &content, None, 1.0).unwrap();
+            save_buffer(gfx, &directory.join(format!("code-{name}.tga"))).unwrap();
+        }
+        DestroyWindow(hwnd).unwrap();
+    }
+}
