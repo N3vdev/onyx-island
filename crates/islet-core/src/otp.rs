@@ -19,7 +19,7 @@ pub const COPIED_MS: u32 = 1_400;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CodeCard {
     pub code: String,
-    /// Who sent it ("Google", "GitHub"): the sender's name, or its domain.
+    /// Who sent it: the domain Gmail verified ("accounts.google.com"), or "an unverified sender".
     pub from: String,
     /// Copied to the clipboard: the card says so, then goes.
     pub copied: bool,

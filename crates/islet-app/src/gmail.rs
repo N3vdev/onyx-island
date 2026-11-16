@@ -307,20 +307,45 @@ fn code_of(message: &serde_json::Value) -> Option<(String, String)> {
         text.push_str(&body.chars().take(3_000).collect::<String>());
     }
     let code = islet_core::otp::find_code(&subject, &text)?;
-    // The name shown comes from the sending domain, never the free-form
-    // display name, and only when Gmail found the mail really is from that
-    // domain (DMARC passed); otherwise the card says so.
-    let from = if dmarc_passed(&header("Authentication-Results")) {
-        sender_name(&header("From"))
-    } else {
-        "an unverified sender".to_owned()
-    };
+    // Who sent it is the domain Gmail verified (the first
+    // Authentication-Results is Gmail's own; a sender's are below it), and
+    // never the display name, which is anyone's to write.
+    let from = verified_domain(&header("Authentication-Results"), &header("From"))
+        .unwrap_or_else(|| "an unverified sender".to_owned());
     Some((code, from))
 }
 
-/// Gmail's verdict that the From domain is genuine.
-fn dmarc_passed(results: &str) -> bool {
-    results.to_ascii_lowercase().split(';').any(|result| result.trim().starts_with("dmarc=pass"))
+/// The From domain, exactly as Gmail's DMARC check passed it: Gmail's own
+/// result ("mx.google.com; ... dmarc=pass (...) header.from=google.com"), for
+/// the one plain address the From header gives.
+fn verified_domain(results: &str, from: &str) -> Option<String> {
+    let results = results.to_ascii_lowercase();
+    let mut parts = results.split(';');
+    if parts.next()?.trim() != "mx.google.com" {
+        return None;
+    }
+    let domain = parts
+        .map(str::trim)
+        .filter(|result| result.starts_with("dmarc=pass"))
+        .find_map(|result| result.split_whitespace().find_map(|word| word.strip_prefix("header.from=")))?;
+    let plain = |text: &str| {
+        text.contains('.') && text.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'.')
+    };
+    if !plain(domain) {
+        return None;
+    }
+    // One address: "Name <a@b>" or "a@b", nothing more.
+    let from = from.trim();
+    let address = match from.find('<') {
+        Some(open) if from.rfind('<') == Some(open) => from[open + 1..].strip_suffix('>')?,
+        Some(_) => return None,
+        None => from,
+    };
+    let (local, from_domain) = address.trim().split_once('@')?;
+    if local.is_empty() || from_domain.contains(['@', ',', ' ']) {
+        return None;
+    }
+    from_domain.eq_ignore_ascii_case(domain).then(|| domain.to_owned())
 }
 
 /// The plain text of a message, or its HTML with the tags taken out.
@@ -401,25 +426,6 @@ fn decode_entities(text: &str) -> String {
         .replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&amp;", "&")
-}
-
-/// The sender's domain's name: "Google <no-reply@accounts.google.com>" is
-/// "Google", "x@amazon.co.uk" is "Amazon". The display name before the
-/// address is anyone's to write, so it is never used.
-fn sender_name(from: &str) -> String {
-    let address = from.rsplit('<').next().unwrap_or(from).trim().trim_end_matches('>').trim();
-    let domain = address.rsplit('@').next().unwrap_or("");
-    let parts: Vec<&str> = domain.split('.').filter(|part| !part.is_empty()).collect();
-    // "co.uk", "com.au": the name is the label before the two-part ending.
-    let index = match parts.len() {
-        0 => return String::new(),
-        1 => 0,
-        n if n >= 3 && parts[n - 2].len() <= 3 && parts[n - 1].len() == 2 => n - 3,
-        n => n - 2,
-    };
-    let main: String = parts[index].chars().take(28).collect();
-    let mut chars = main.chars();
-    chars.next().map_or_else(String::new, |first| first.to_uppercase().chain(chars).collect())
 }
 
 fn read_json(response: ureq::Response) -> Option<serde_json::Value> {
@@ -680,22 +686,19 @@ mod tests {
     }
 
     #[test]
-    fn senders_are_named_by_their_domain_never_their_display_name() {
-        assert_eq!(sender_name("Google <no-reply@accounts.google.com>"), "Google");
-        assert_eq!(sender_name("\"GitHub\" <noreply@github.com>"), "Github");
-        assert_eq!(sender_name("Amazon <account-update@amazon.co.uk>"), "Amazon");
-        assert_eq!(sender_name("Google <security@evil.example>"), "Evil");
-        assert_eq!(sender_name("noreply@github.com"), "Github");
-        assert_eq!(sender_name("<alerts@mail.hdfcbank.net>"), "Hdfcbank");
-    }
-
-    #[test]
-    fn only_mail_gmail_verified_is_named() {
-        assert!(dmarc_passed(
-            "mx.google.com; dkim=pass header.i=@accounts.google.com; spf=pass; dmarc=pass (p=REJECT) header.from=google.com"
-        ));
-        assert!(!dmarc_passed("mx.google.com; spf=softfail; dmarc=fail (p=NONE) header.from=google.com"));
-        assert!(!dmarc_passed(""));
+    fn only_the_domain_gmail_verified_names_the_sender() {
+        let gmail = "mx.google.com; dkim=pass header.i=@accounts.google.com; spf=pass; dmarc=pass (p=REJECT sp=REJECT dis=NONE) header.from=accounts.google.com";
+        let verified = |from: &str| verified_domain(gmail, from);
+        assert_eq!(verified("Google <no-reply@accounts.google.com>").as_deref(), Some("accounts.google.com"));
+        assert_eq!(verified("no-reply@Accounts.Google.com").as_deref(), Some("accounts.google.com"));
+        // The display name, a second address, or another domain is not it.
+        assert_eq!(verified("Google <x@google.xyz.io>"), None);
+        assert_eq!(verified("<a@accounts.google.com> <b@evil.io>"), None);
+        assert_eq!(verified("a@accounts.google.com, b@evil.io"), None);
+        // Failed, or a result Gmail didn't write.
+        assert_eq!(verified_domain(&gmail.replace("dmarc=pass", "dmarc=fail"), "a@accounts.google.com"), None);
+        assert_eq!(verified_domain(&gmail.replace("mx.google.com", "mx.evil.io"), "a@accounts.google.com"), None);
+        assert_eq!(verified_domain("", "a@accounts.google.com"), None);
     }
 
     #[test]
@@ -731,7 +734,7 @@ mod tests {
                 },
             })
         };
-        assert_eq!(code_of(&message(now_ms - 5_000, "pass")), Some(("731904".into(), "Example".into())));
+        assert_eq!(code_of(&message(now_ms - 5_000, "pass")), Some(("731904".into(), "example.com".into())));
         assert_eq!(code_of(&message(now_ms - 5_000, "fail")), Some(("731904".into(), "an unverified sender".into())));
         assert_eq!(code_of(&message(now_ms - 3_600_000, "pass")), None);
     }
