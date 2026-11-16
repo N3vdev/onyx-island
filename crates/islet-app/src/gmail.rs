@@ -37,6 +37,7 @@ pub const WM_APP_GMAIL: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 
 
 const AUTH: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN: &str = "https://oauth2.googleapis.com/token";
+const REVOKE: &str = "https://oauth2.googleapis.com/revoke";
 const API: &str = "https://gmail.googleapis.com/gmail/v1/users/me";
 /// Reading mail; no sending, changing or deleting.
 const SCOPE: &str = "https://www.googleapis.com/auth/gmail.readonly";
@@ -526,7 +527,11 @@ fn run(rx: &Receiver<Job>, shared: &Arc<Mutex<Shared>>, island: isize, dir: &Pat
         match job {
             Some(Job::Shutdown) => break,
             Some(Job::Disconnect) => {
-                session.refresh = None;
+                // Google forgets the access too, not only this PC (best
+                // effort: offline, the key is still deleted here).
+                if let Some(refresh) = session.refresh.take() {
+                    let _ = session.agent().post(REVOKE).send_form(&[("token", &refresh)]);
+                }
                 session.access = None;
                 session.history = None;
                 let _ = std::fs::remove_file(dir.join(KEY_FILE));

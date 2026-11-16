@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Privacy — Onyx</title>
-  <meta name="description" content="What Onyx does with your data: it runs on your PC, has no account and sends nothing about you anywhere.">
+  <meta name="description" content="What Onyx does with your data: it runs on your PC, has no servers, and keeps what it reads on your PC.">
   <meta name="theme-color" content="#09090a">
   <link rel="icon" href="/favicon.ico" sizes="any">
   <link rel="apple-touch-icon" href="/assets/apple-touch-icon.png">
@@ -32,11 +32,11 @@
   <div class="legal__head">
     <p class="label">Privacy</p>
     <h1>Yours stays <span class="muted">yours.</span></h1>
-    <p>Last updated 28 October 2026</p>
+    <p>Last updated 17 November 2026</p>
   </div>
 
   <div>
-    <p class="legal__summary">Onyx runs entirely on your PC. There’s no account, no analytics and no telemetry. Nothing you say, play or type is sent to us or anyone else.</p>
+    <p class="legal__summary">Onyx runs on your PC. There’s no Onyx account, no analytics and no telemetry, and Onyx has no servers: nothing you say, play, type or receive is sent to us.</p>
 
     <section>
       <h2>What Onyx collects</h2>
@@ -63,6 +63,17 @@
       </div>
     </section>
 
+    <section id="gmail">
+      <h2>Gmail codes</h2>
+      <div>
+        <p>Gmail codes is optional and off until you connect a Google account in Onyx Settings. When you connect, Google asks you to give Onyx read-only access to your Gmail (the <code>gmail.readonly</code> permission). Onyx can’t send, delete or change your mail.</p>
+        <p><strong>What Onyx reads, and why.</strong> Onyx asks Gmail for new messages in your inbox, every 15 seconds while you’re using your PC, every 3 minutes when you’re away, and not at all on Battery Saver. It reads only messages that arrived in the last 10 minutes, and reads them only to find a one-time sign-in code. When it finds one, the island shows the code and the domain Gmail verified as the sender for a minute, so you can copy it.</p>
+        <p><strong>Where your mail goes.</strong> Straight from Google to your PC, and nowhere else. Onyx has no servers, so your mail and codes are never sent to us or anyone else. Messages and codes are handled in memory only: they’re never saved to disk or written to logs. No person reads your mail. It isn’t used for advertising, isn’t sold, and isn’t used to train AI models.</p>
+        <p><strong>What’s kept.</strong> Only the sign-in key Google gives Onyx, stored on your PC encrypted with Windows so only your Windows account can use it. When you copy a code, Onyx keeps it out of Windows clipboard history and the cloud clipboard.</p>
+        <p><strong>Turning it off.</strong> Press Disconnect in Onyx Settings: Onyx deletes the key and asks Google to cancel its access. You can also remove Onyx’s access at any time from your Google Account, under <a href="https://myaccount.google.com/connections">Third-party apps &amp; services</a>.</p>
+        <p>Onyx’s use and transfer of information received from Google APIs to any other app will adhere to the <a href="https://developers.google.com/terms/api-services-user-data-policy">Google API Services User Data Policy</a>, including the Limited Use requirements.</p>
+      </div>
+    </section>
     <section>
       <h2>Your screen</h2>
       <div>
@@ -91,13 +102,17 @@
     <section>
       <h2>When Onyx goes online</h2>
       <div>
-        <p>Onyx connects to the internet only when you ask it to:</p>
+        <p>Onyx goes online only for these:</p>
         <ul>
           <li>Downloading a speech model, from Hugging Face and GitHub</li>
           <li>Downloading AI cleanup, from GitHub and Hugging Face</li>
+          <li>Lyrics: the title, artist and length of the song playing are sent to LRCLIB (lrclib.net) to find its lyrics</li>
+          <li>Covers for YouTube videos, from YouTube’s image server</li>
+          <li>Spotify, if you connect it: Onyx reads and controls what’s playing through Spotify’s Web API</li>
+          <li>Gmail codes, if you connect it, as described above</li>
           <li>Pressing play on a song you last played in a browser that’s now closed, which opens a YouTube Music search for it in your browser</li>
         </ul>
-        <p>These services see an ordinary download or page request from your computer, including your IP address, under their own privacy policies. Onyx sends them nothing else.</p>
+        <p>These services see an ordinary request from your computer, including your IP address, under their own privacy policies. Onyx sends them nothing beyond what’s listed here.</p>
       </div>
     </section>
 
