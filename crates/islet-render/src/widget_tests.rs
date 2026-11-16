@@ -882,7 +882,7 @@ fn capture_code_previews() {
             ("a-code", card.clone(), None),
             ("b-hover", card.clone(), Some(CodeItem::Copy)),
             ("c-copied", CodeCard { copied: true, ..card.clone() }, None),
-            ("d-letters", CodeCard { code: "K7Q2ZP".into(), from: "GitHub".into(), copied: false }, Some(CodeItem::Close)),
+            ("d-letters", CodeCard { code: "K7Q2ZP".into(), from: "an unverified sender".into(), copied: false }, Some(CodeItem::Close)),
         ];
         for (name, card, hover) in states {
             let state = IslandState { code: Some(card), ..Default::default() };

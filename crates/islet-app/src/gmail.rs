@@ -307,7 +307,20 @@ fn code_of(message: &serde_json::Value) -> Option<(String, String)> {
         text.push_str(&body.chars().take(3_000).collect::<String>());
     }
     let code = islet_core::otp::find_code(&subject, &text)?;
-    Some((code, sender_name(&header("From"))))
+    // The name shown comes from the sending domain, never the free-form
+    // display name, and only when Gmail found the mail really is from that
+    // domain (DMARC passed); otherwise the card says so.
+    let from = if dmarc_passed(&header("Authentication-Results")) {
+        sender_name(&header("From"))
+    } else {
+        "an unverified sender".to_owned()
+    };
+    Some((code, from))
+}
+
+/// Gmail's verdict that the From domain is genuine.
+fn dmarc_passed(results: &str) -> bool {
+    results.to_ascii_lowercase().split(';').any(|result| result.trim().starts_with("dmarc=pass"))
 }
 
 /// The plain text of a message, or its HTML with the tags taken out.
@@ -321,7 +334,7 @@ fn body_text(payload: &serde_json::Value) -> Option<String> {
             if kind == "text/plain" && plain.is_none() {
                 plain = decode_part(data);
             } else if kind == "text/html" && html.is_none() {
-                html = decode_part(data).map(|html| strip_html(&html));
+                html = decode_part(data).map(|html| strip_html(cut(&html, HTML_LIMIT)));
             }
         }
         if let Some(parts) = part["parts"].as_array() {
@@ -331,29 +344,54 @@ fn body_text(payload: &serde_json::Value) -> Option<String> {
     plain.or(html)
 }
 
+/// A code is near the top of a mail; HTML past this is not read.
+const HTML_LIMIT: usize = 64 * 1024;
+
+/// `text` up to `limit` bytes, at a character boundary.
+fn cut(text: &str, limit: usize) -> &str {
+    let mut end = limit.min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
 fn decode_part(data: &str) -> Option<String> {
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(data.trim_end_matches('=')).ok()?;
     Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Text of an HTML mail: tags, styles and scripts out, entities decoded.
+///
+/// One forward pass: each byte is looked at a bounded number of times.
 fn strip_html(html: &str) -> String {
+    let bytes = html.as_bytes();
     let mut out = String::with_capacity(html.len() / 2);
-    let mut rest = html;
-    while let Some(open) = rest.find('<') {
-        out.push_str(&rest[..open]);
-        let tag = rest[open..].to_ascii_lowercase();
-        let skip_to = ["<style", "<script", "<head"]
-            .iter()
-            .find(|start| tag.starts_with(*start))
-            .and_then(|start| tag.find(&format!("</{}", &start[1..])))
-            .unwrap_or(0);
-        let after = rest[open + skip_to..].find('>').map_or(rest.len(), |close| open + skip_to + close + 1);
+    let mut at = 0;
+    while let Some(open) = html[at..].find('<').map(|offset| at + offset) {
+        out.push_str(&html[at..open]);
         out.push(' ');
-        rest = &rest[after.min(rest.len())..];
+        // A style, script or head block goes whole, up to its closing tag.
+        let block = ["style", "script", "head"].into_iter().find(|name| starts_with_ignore_case(&bytes[open + 1..], name));
+        let mut from = open;
+        if let Some(name) = block {
+            from = find_close(bytes, open + 1 + name.len(), name).unwrap_or(bytes.len());
+        }
+        at = html.get(from..).and_then(|rest| rest.find('>')).map_or(html.len(), |close| from + close + 1);
     }
-    out.push_str(rest);
+    out.push_str(&html[at..]);
     decode_entities(&out)
+}
+
+fn starts_with_ignore_case(bytes: &[u8], word: &str) -> bool {
+    bytes.len() >= word.len() && bytes[..word.len()].eq_ignore_ascii_case(word.as_bytes())
+}
+
+/// Where `</name` starts at or after `from`.
+fn find_close(bytes: &[u8], from: usize, name: &str) -> Option<usize> {
+    (from..bytes.len()).find(|&at| {
+        bytes[at] == b'<' && bytes.get(at + 1) == Some(&b'/') && starts_with_ignore_case(&bytes[at + 2..], name)
+    })
 }
 
 fn decode_entities(text: &str) -> String {
@@ -365,17 +403,21 @@ fn decode_entities(text: &str) -> String {
         .replace("&amp;", "&")
 }
 
-/// "Google <no-reply@accounts.google.com>" is "Google"; a bare address is
-/// its domain's name ("github").
+/// The sender's domain's name: "Google <no-reply@accounts.google.com>" is
+/// "Google", "x@amazon.co.uk" is "Amazon". The display name before the
+/// address is anyone's to write, so it is never used.
 fn sender_name(from: &str) -> String {
-    let name = from.split('<').next().unwrap_or("").trim().trim_matches('"').trim();
-    if !name.is_empty() && !name.contains('@') {
-        return name.chars().take(28).collect();
-    }
-    let address = from.trim().trim_start_matches('<').trim_end_matches('>');
+    let address = from.rsplit('<').next().unwrap_or(from).trim().trim_end_matches('>').trim();
     let domain = address.rsplit('@').next().unwrap_or("");
     let parts: Vec<&str> = domain.split('.').filter(|part| !part.is_empty()).collect();
-    let main = if parts.len() >= 2 { parts[parts.len() - 2] } else { parts.first().copied().unwrap_or("") };
+    // "co.uk", "com.au": the name is the label before the two-part ending.
+    let index = match parts.len() {
+        0 => return String::new(),
+        1 => 0,
+        n if n >= 3 && parts[n - 2].len() <= 3 && parts[n - 1].len() == 2 => n - 3,
+        n => n - 2,
+    };
+    let main: String = parts[index].chars().take(28).collect();
     let mut chars = main.chars();
     chars.next().map_or_else(String::new, |first| first.to_uppercase().chain(chars).collect())
 }
@@ -638,30 +680,60 @@ mod tests {
     }
 
     #[test]
-    fn senders_are_named_by_their_name_or_their_domain() {
+    fn senders_are_named_by_their_domain_never_their_display_name() {
         assert_eq!(sender_name("Google <no-reply@accounts.google.com>"), "Google");
-        assert_eq!(sender_name("\"GitHub\" <noreply@github.com>"), "GitHub");
+        assert_eq!(sender_name("\"GitHub\" <noreply@github.com>"), "Github");
+        assert_eq!(sender_name("Amazon <account-update@amazon.co.uk>"), "Amazon");
+        assert_eq!(sender_name("Google <security@evil.example>"), "Evil");
         assert_eq!(sender_name("noreply@github.com"), "Github");
         assert_eq!(sender_name("<alerts@mail.hdfcbank.net>"), "Hdfcbank");
+    }
+
+    #[test]
+    fn only_mail_gmail_verified_is_named() {
+        assert!(dmarc_passed(
+            "mx.google.com; dkim=pass header.i=@accounts.google.com; spf=pass; dmarc=pass (p=REJECT) header.from=google.com"
+        ));
+        assert!(!dmarc_passed("mx.google.com; spf=softfail; dmarc=fail (p=NONE) header.from=google.com"));
+        assert!(!dmarc_passed(""));
+    }
+
+    #[test]
+    fn html_is_stripped_in_one_pass() {
+        let words = |html: &str| strip_html(html).split_whitespace().map(str::to_owned).collect::<Vec<_>>();
+        assert_eq!(words("<HEAD><Style>p{}</STYLE></head><p>Code&nbsp;<b>4821</b></p>"), ["Code", "4821"]);
+        assert_eq!(words("a <script>x<y</script> b"), ["a", "b"]);
+        assert_eq!(words("a <b"), ["a"]);
+        // Many tags, or a style never closed, stay fast.
+        let big = "<b>".repeat(200_000);
+        let started = std::time::Instant::now();
+        let _ = strip_html(cut(&big, HTML_LIMIT));
+        let _ = strip_html(&format!("<style>{big}"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 
     #[test]
     fn a_fresh_message_gives_its_code_and_an_old_one_does_not() {
         let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
         let body = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("<html><style>p{}</style><p>Your code is <b>731904</b></p></html>");
-        let message = |sent_ms: u64| {
+        let message = |sent_ms: u64, dmarc: &str| {
             serde_json::json!({
                 "internalDate": sent_ms.to_string(),
                 "snippet": "Use this to sign in",
                 "payload": {
                     "mimeType": "multipart/alternative",
-                    "headers": [{"name": "Subject", "value": "Sign in to Example"}, {"name": "From", "value": "Example <hi@example.com>"}],
+                    "headers": [
+                        {"name": "Subject", "value": "Sign in to Example"},
+                        {"name": "From", "value": "Google <hi@example.com>"},
+                        {"name": "Authentication-Results", "value": format!("mx.google.com; spf=pass; dmarc={dmarc} header.from=example.com")},
+                    ],
                     "parts": [{"mimeType": "text/html", "body": {"data": body}}],
                 },
             })
         };
-        assert_eq!(code_of(&message(now_ms - 5_000)), Some(("731904".into(), "Example".into())));
-        assert_eq!(code_of(&message(now_ms - 3_600_000)), None);
+        assert_eq!(code_of(&message(now_ms - 5_000, "pass")), Some(("731904".into(), "Example".into())));
+        assert_eq!(code_of(&message(now_ms - 5_000, "fail")), Some(("731904".into(), "an unverified sender".into())));
+        assert_eq!(code_of(&message(now_ms - 3_600_000, "pass")), None);
     }
 
     #[test]
