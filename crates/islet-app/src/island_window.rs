@@ -364,7 +364,9 @@ pub struct IslandHost {
     spotify: Option<crate::spotify::Spotify>,
     /// One-time codes from Gmail, while connected and switched on.
     gmail: Option<crate::gmail::Gmail>,
-    gmail_enabled: bool,
+    /// What Gmail shows on the island (codes only, every email, or the
+    /// custom choices), and whether it is on at all.
+    mail: islet_core::config::MailConfig,
     /// The Spotify setting.
     spotify_enabled: bool,
     /// Until when (island clock) the island does not close for the pointer
@@ -527,7 +529,7 @@ impl IslandHost {
             source_icons: None,
             spotify: None,
             gmail: None,
-            gmail_enabled: false,
+            mail: islet_core::config::MailConfig { gmail_codes: false, ..Default::default() },
             spotify_enabled: config.media.spotify,
             collapse_grace_until: None,
             spotify_key_saved: None,
@@ -602,7 +604,7 @@ impl IslandHost {
                 }),
             ));
             host.set_bluetooth(config.media.bluetooth);
-            host.set_gmail(config.mail.gmail_codes);
+            host.set_gmail(&config.mail);
             let mut lens = crate::lens::Lens::new(HWND(hwnd as *mut _));
             lens.configure(&config.lens);
             host.lens = Some(lens);
@@ -677,7 +679,7 @@ impl IslandHost {
             // Live (not the demo): earbuds, as the setting says.
             self.set_bluetooth(config.media.bluetooth);
             self.spotify_enabled = config.media.spotify;
-            self.set_gmail(config.mail.gmail_codes);
+            self.set_gmail(&config.mail);
         }
         if let Some(lens) = &mut self.lens {
             lens.configure(&config.lens);
@@ -767,24 +769,25 @@ impl IslandHost {
             return Some(LRESULT(0));
         }
         if message == gmail_message() {
-            // From Settings: 1 connects, 0 disconnects; anything else is
-            // not Settings.
-            match wparam.0 {
-                1 => {
-                    self.gmail_enabled = true;
-                    let dir = crate::paths::Paths::discover().config_dir;
-                    let hwnd = self.hwnd;
-                    self.gmail.get_or_insert_with(|| crate::gmail::Gmail::start(hwnd, dir)).connect();
-                    self.notify("Connect Gmail", "Finish signing in in your browser");
-                }
-                0 => {
-                    // Started if need be, so the key is forgotten either way.
-                    let dir = crate::paths::Paths::discover().config_dir;
-                    let hwnd = self.hwnd;
-                    self.gmail.get_or_insert_with(|| crate::gmail::Gmail::start(hwnd, dir)).disconnect();
+            // From Settings: 1 adds an account, 0 disconnects them all,
+            // REMOVE_ACCOUNT + n removes the n-th; anything else is not
+            // Settings.
+            const REMOVE_ACCOUNT: usize = 0x100;
+            let which = match wparam.0 {
+                0 => Some(None),
+                n if (REMOVE_ACCOUNT..REMOVE_ACCOUNT + crate::gmail::MOST_ACCOUNTS).contains(&n) => Some(Some(n - REMOVE_ACCOUNT)),
+                _ => None,
+            };
+            if wparam.0 == 1 {
+                self.mail.gmail_codes = true;
+                self.gmail_worker().connect();
+                self.notify("Connect Gmail", "Finish signing in in your browser");
+            } else if let Some(which) = which {
+                // Started if need be, so the key is forgotten either way.
+                self.gmail_worker().disconnect(which);
+                if which.is_none() {
                     self.clear_code();
                 }
-                _ => {}
             }
             return Some(LRESULT(0));
         }
@@ -2035,7 +2038,7 @@ impl IslandHost {
     /// A point on the one-time code card (shown open or not), in its own
     /// logical pixels.
     fn code_point(&self, point: POINT) -> Option<(f32, f32)> {
-        if self.state.code.is_none() || self.traveling || self.fullscreen_hidden {
+        if self.state.mail.is_none() || self.traveling || self.fullscreen_hidden {
             return None;
         }
         let top = self.effective_anchor_top();
@@ -2051,25 +2054,34 @@ impl IslandHost {
 
     /// A click on the code card copies the code, or closes the card.
     fn handle_code_click(&mut self, lparam: LPARAM) -> bool {
-        use islet_core::otp::CodeItem;
-        let Some(card) = self.state.code.clone() else {
+        use islet_core::otp::{MailBody, MailCard, MailItem};
+        let Some(card) = self.state.mail.clone() else {
             return false;
         };
         let Some((x, y)) = self.code_point(point_from_lparam(lparam)) else {
             return false;
         };
-        match card.item_at(x, y) {
-            Some(CodeItem::Copy) => {
-                if crate::gmail::copy_code(self.hwnd, &card.code) {
-                    self.dispatch(IslandEvent::SetCode(Some(islet_core::otp::CodeCard { copied: true, ..card })));
+        match (card.item_at(x, y), &card.body) {
+            (Some(MailItem::Copy), MailBody::Code { code, .. }) => {
+                if crate::gmail::copy_code(self.hwnd, code) {
+                    let body = MailBody::Code { code: code.clone(), copied: true };
+                    self.dispatch(IslandEvent::SetMail(Some(MailCard { body, ..card })));
                     // SAFETY: the island's own window and timer.
                     unsafe {
                         SetTimer(Some(self.hwnd), TIMER_CODE, islet_core::otp::COPIED_MS, None);
                     }
                 }
             }
-            Some(CodeItem::Close) => self.clear_code(),
-            None => return false,
+            (Some(MailItem::Open), MailBody::Message { link, .. }) => {
+                // Only ever Gmail's own pages (the link is built by Onyx).
+                if link.starts_with(crate::gmail::GMAIL_WEB) {
+                    crate::spotify::shell_open(link, SW_SHOWNORMAL.0);
+                }
+                self.clear_code();
+            }
+            (Some(MailItem::Close), _) => self.clear_code(),
+            (Some(_), _) => {}
+            (None, _) => return false,
         }
         self.update_widget_hover();
         true
@@ -2080,50 +2092,74 @@ impl IslandHost {
         unsafe {
             let _ = KillTimer(Some(self.hwnd), TIMER_CODE);
         }
-        self.dispatch(IslandEvent::SetCode(None));
+        self.dispatch(IslandEvent::SetMail(None));
         self.update_widget_hover();
     }
 
-    /// Gmail is switched on or off in Settings. Once on, it runs only for a
-    /// connected account (connecting starts it).
-    fn set_gmail(&mut self, on: bool) {
-        self.gmail_enabled = on;
-        if !on {
-            if self.gmail.take().is_some() || self.state.code.is_some() {
+    /// Gmail is switched on or off in Settings, or what it shows changed.
+    /// Once on, it runs only for a connected account (connecting starts it).
+    fn set_gmail(&mut self, mail: &islet_core::config::MailConfig) {
+        self.mail = mail.clone();
+        if !mail.gmail_codes {
+            if self.gmail.take().is_some() || self.state.mail.is_some() {
                 self.clear_code();
             }
             return;
         }
-        if self.gmail.is_none() && self.demo.is_none() {
+        if let Some(gmail) = &self.gmail {
+            gmail.set_filter(mail);
+        } else if self.demo.is_none() {
             let dir = crate::paths::Paths::discover().config_dir;
             if crate::gmail::Gmail::saved(&dir) {
-                self.gmail = Some(crate::gmail::Gmail::start(self.hwnd, dir));
+                self.gmail = Some(crate::gmail::Gmail::start(self.hwnd, dir, mail.clone()));
             }
         }
+    }
+
+    /// The Gmail worker, started if need be.
+    fn gmail_worker(&mut self) -> &crate::gmail::Gmail {
+        let dir = crate::paths::Paths::discover().config_dir;
+        let (hwnd, mail) = (self.hwnd, self.mail.clone());
+        self.gmail.get_or_insert_with(|| crate::gmail::Gmail::start(hwnd, dir, mail))
+    }
+
+    fn show_mail(&mut self, card: islet_core::otp::MailCard, visible_ms: u32) {
+        self.dispatch(IslandEvent::SetMail(Some(card)));
+        // SAFETY: the island's own window and timer.
+        unsafe {
+            SetTimer(Some(self.hwnd), TIMER_CODE, visible_ms, None);
+        }
+        self.update_widget_hover();
     }
 
     fn on_gmail(&mut self) {
         let Some(gmail) = &self.gmail else { return };
         for news in gmail.take() {
+            use islet_core::otp::{MailBody, MailCard};
             match news {
-                crate::gmail::News::Code { code, from } => {
-                    if !self.gmail_enabled {
-                        continue;
+                crate::gmail::News::Code { code, from, account } => {
+                    if self.mail.gmail_codes {
+                        let card = MailCard { from, account, body: MailBody::Code { code, copied: false } };
+                        self.show_mail(card, islet_core::otp::VISIBLE_MS);
                     }
-                    self.dispatch(IslandEvent::SetCode(Some(islet_core::otp::CodeCard { code, from, copied: false })));
-                    // SAFETY: the island's own window and timer.
-                    unsafe {
-                        SetTimer(Some(self.hwnd), TIMER_CODE, islet_core::otp::VISIBLE_MS, None);
-                    }
-                    self.update_widget_hover();
                 }
-                crate::gmail::News::Connected => {
-                    self.notify("Gmail connected", "Codes that arrive will show here");
+                crate::gmail::News::Email { from, subject, link, account } => {
+                    // A code still to copy keeps its place.
+                    let waiting = self.state.mail.as_ref().is_some_and(MailCard::is_waiting_code);
+                    if self.mail.gmail_codes && !waiting {
+                        let card = MailCard { from, account, body: MailBody::Message { subject, link } };
+                        self.show_mail(card, islet_core::otp::MESSAGE_MS);
+                    }
+                }
+                crate::gmail::News::Connected(email) => {
+                    let what = if self.mail.show == islet_core::config::MailShow::Codes { "Codes" } else { "Mail" };
+                    self.notify("Gmail connected", &format!("{what} to {email} will show here"));
                 }
                 crate::gmail::News::ConnectFailed(why) => self.notify("Couldn't connect Gmail", why),
                 crate::gmail::News::SignedOut => {}
-                crate::gmail::News::Expired => {
-                    self.notify("Gmail signed out", "Connect again in Onyx Settings, Widgets");
+                crate::gmail::News::Expired(email) => {
+                    let who = if email.is_empty() { "Gmail".to_owned() } else { email };
+                    self.notify(&format!("{who} signed out"), "Connect it again in Onyx Settings, Widgets");
                 }
             }
         }
@@ -2214,9 +2250,9 @@ impl IslandHost {
     }
 
     fn widget_hover_at(&self, point: POINT) -> Option<WidgetHover> {
-        if let Some(card) = &self.state.code {
+        if let Some(card) = &self.state.mail {
             let (x, y) = self.code_point(point)?;
-            return card.item_at(x, y).map(WidgetHover::Code);
+            return card.item_at(x, y).map(WidgetHover::Mail);
         }
         if let Some(card) = self.state.lens {
             let (x, y) = self.lens_point(point)?;
@@ -2467,7 +2503,7 @@ impl IslandHost {
             }
             // Handled by `handle_code_click`, `handle_lens_click` and
             // `handle_lyrics_click`, which run first.
-            Some(WidgetHover::Code(_) | WidgetHover::Lens(_) | WidgetHover::Lyrics(_)) => false,
+            Some(WidgetHover::Mail(_) | WidgetHover::Lens(_) | WidgetHover::Lyrics(_)) => false,
             Some(WidgetHover::Search(item)) => {
                 match item {
                     islet_core::spotify::SearchItem::Close => {

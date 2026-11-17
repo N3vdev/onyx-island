@@ -871,21 +871,33 @@ fn capture_spotify_previews() {
 #[test]
 #[ignore = "requires Windows GPU; writes code card render evidence"]
 fn capture_code_previews() {
-    use islet_core::otp::{CodeCard, CodeItem};
+    use islet_core::otp::{MailBody, MailCard, MailItem};
     use windows::Win32::UI::WindowsAndMessaging::{CreateWindowExW, DestroyWindow, WINDOW_EX_STYLE, WS_POPUP};
     let directory = std::path::PathBuf::from(std::env::var_os("ISLET_WIDGET_CAPTURE_DIR").expect("set capture directory"));
     std::fs::create_dir_all(&directory).unwrap();
-    let card = CodeCard { code: "482913".into(), from: "Google".into(), copied: false };
+    let code = |code: &str, from: &str, copied: bool| MailCard {
+        from: from.into(),
+        account: String::new(),
+        body: MailBody::Code { code: code.into(), copied },
+    };
+    let card = code("482913", "accounts.google.com", false);
+    let email = MailCard {
+        from: "Priya Raman".into(),
+        account: "work@gmail.com".into(),
+        body: MailBody::Message { subject: "Lunch on Friday? I found a new place near the office".into(), link: String::new() },
+    };
     unsafe {
         let hwnd = CreateWindowExW(WINDOW_EX_STYLE(0), w!("STATIC"), w!("Onyx code capture"), WS_POPUP, 0, 0, 720, 248, None, None, None, None).unwrap();
         let states = [
             ("a-code", card.clone(), None),
-            ("b-hover", card.clone(), Some(CodeItem::Copy)),
-            ("c-copied", CodeCard { copied: true, ..card.clone() }, None),
-            ("d-letters", CodeCard { code: "K7Q2ZP".into(), from: "an unverified sender".into(), copied: false }, Some(CodeItem::Close)),
+            ("b-hover", card.clone(), Some(MailItem::Copy)),
+            ("c-copied", code("482913", "accounts.google.com", true), None),
+            ("d-letters", code("K7Q2ZP", "an unverified sender", false), Some(MailItem::Close)),
+            ("e-email", email.clone(), None),
+            ("f-email-hover", email, Some(MailItem::Open)),
         ];
         for (name, card, hover) in states {
-            let state = IslandState { code: Some(card), ..Default::default() };
+            let state = IslandState { mail: Some(card), ..Default::default() };
             let target = state.layout();
             let content = state.content();
             let mut renderer = Renderer::new(
@@ -903,7 +915,7 @@ fn capture_code_previews() {
             let gfx = renderer.gfx.as_mut().unwrap();
             gfx.main_spring_height = sample.main_height;
             gfx.content_scale = 1.0;
-            gfx.widget_hover = hover.map(islet_core::widgets::WidgetHover::Code);
+            gfx.widget_hover = hover.map(islet_core::widgets::WidgetHover::Mail);
             gfx.draw(8.0, &geometry, &geometry, target, &content, None, 1.0).unwrap();
             save_buffer(gfx, &directory.join(format!("code-{name}.tga"))).unwrap();
         }

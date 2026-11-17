@@ -34,14 +34,88 @@ pub struct Config {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MailConfig {
-    /// Show one-time codes that arrive in Gmail (once connected).
+    /// Gmail on the island at all (once an account is connected). The name
+    /// is from when it showed only codes, kept so settings carry over.
     pub gmail_codes: bool,
+    /// What shows: codes only, every new email, or a chosen mix.
+    pub show: MailShow,
+    /// With [`MailShow::Custom`]: one-time codes,
+    pub custom_codes: bool,
+    /// mail Gmail marks important,
+    pub custom_important: bool,
+    /// mail in the Primary inbox tab (not Promotions, Social, Updates or
+    /// Forums),
+    pub custom_primary: bool,
+    /// and mail from these senders: addresses ("ana@example.com") or domains
+    /// ("github.com", which takes its subdomains too).
+    pub custom_senders: Vec<String>,
 }
 
 impl Default for MailConfig {
     fn default() -> Self {
-        Self { gmail_codes: true }
+        Self {
+            gmail_codes: true,
+            show: MailShow::Codes,
+            custom_codes: true,
+            custom_important: true,
+            custom_primary: false,
+            custom_senders: Vec::new(),
+        }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MailShow {
+    /// One-time codes only.
+    #[default]
+    Codes,
+    /// Codes, and every new email in the inbox.
+    All,
+    /// The custom choices.
+    Custom,
+}
+
+impl MailConfig {
+    /// Codes found in new mail show.
+    #[must_use]
+    pub fn shows_codes(&self) -> bool {
+        match self.show {
+            MailShow::Codes | MailShow::All => true,
+            MailShow::Custom => self.custom_codes,
+        }
+    }
+
+    /// A new email (without a code to show) shows: Gmail's `important` and
+    /// `primary` marks for it, and the sender's address.
+    #[must_use]
+    pub fn shows_email(&self, important: bool, primary: bool, address: &str) -> bool {
+        match self.show {
+            MailShow::Codes => false,
+            MailShow::All => true,
+            MailShow::Custom => {
+                (self.custom_important && important)
+                    || (self.custom_primary && primary)
+                    || self.custom_senders.iter().any(|sender| sender_matches(sender, address))
+            }
+        }
+    }
+}
+
+/// "ana@example.com" is that address; "example.com" or "@example.com" is the
+/// domain and its subdomains.
+fn sender_matches(sender: &str, address: &str) -> bool {
+    let sender = sender.trim().to_ascii_lowercase();
+    let address = address.trim().to_ascii_lowercase();
+    if sender.is_empty() || address.is_empty() {
+        return false;
+    }
+    if !sender.starts_with('@') && sender.contains('@') {
+        return sender == address;
+    }
+    let domain = sender.trim_start_matches('@');
+    let Some((_, from)) = address.rsplit_once('@') else { return false };
+    from == domain || from.ends_with(&format!(".{domain}"))
 }
 
 /// Onyx Lens: press a shortcut, then circle anything on screen to copy its
@@ -854,5 +928,29 @@ mod tests {
         )
         .expect("parse");
         assert_eq!(config.schema_version, 9);
+    }
+
+    #[test]
+    fn mail_shows_codes_only_unless_chosen() {
+        let mut mail = MailConfig::default();
+        assert!(mail.shows_codes());
+        assert!(!mail.shows_email(true, true, "ana@example.com"));
+        mail.show = MailShow::All;
+        assert!(mail.shows_email(false, false, "news@shop.example"));
+        mail.show = MailShow::Custom;
+        mail.custom_codes = false;
+        mail.custom_senders = vec!["github.com".into(), "ana@example.com".into()];
+        assert!(!mail.shows_codes());
+        assert!(mail.shows_email(true, false, "x@y.z"), "important");
+        assert!(!mail.shows_email(false, true, "x@y.z"), "primary is off by default");
+        assert!(mail.shows_email(false, false, "noreply@github.com"));
+        assert!(mail.shows_email(false, false, "a@mail.github.com"));
+        assert!(!mail.shows_email(false, false, "a@notgithub.com"));
+        assert!(mail.shows_email(false, false, "Ana@Example.com"));
+        assert!(!mail.shows_email(false, false, "bo@example.com"));
+        let saved: Config = toml::from_str("[mail]
+gmail_codes = true
+").expect("parse");
+        assert_eq!(saved.mail.show, MailShow::Codes);
     }
 }

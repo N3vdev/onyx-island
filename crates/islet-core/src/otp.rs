@@ -1,5 +1,6 @@
-//! One-time codes from email ("Your verification code is 482913"): finding
-//! the code in a message, and the island's card that shows it.
+//! Mail on the island: one-time codes from email ("Your verification code is
+//! 482913") and, if chosen, new emails. Finding the code in a message, and the
+//! island's card that shows a code or an email.
 //!
 //! Only messages that say they carry a code are read for one, and only the
 //! number that the message presents as the code is taken: a nearby word such
@@ -8,34 +9,57 @@
 
 use crate::geometry::Rect;
 
-/// The card: the island grows to this to show a code.
-pub const WIDTH: f32 = 300.0;
+/// The card: the island grows to this to show a code, and a little wider for
+/// an email's subject.
+pub const CODE_WIDTH: f32 = 300.0;
+pub const MESSAGE_WIDTH: f32 = 380.0;
 pub const HEIGHT: f32 = 58.0;
 /// How long a code stays on the island, and after it is copied.
 pub const VISIBLE_MS: u32 = 60_000;
 pub const COPIED_MS: u32 = 1_400;
+/// How long a new email stays.
+pub const MESSAGE_MS: u32 = 12_000;
 
-/// A code on the island.
+/// A code or a new email on the island.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CodeCard {
-    pub code: String,
-    /// Who sent it: the domain Gmail verified ("accounts.google.com"), or "an unverified sender".
+pub struct MailCard {
+    /// Who sent it. For a code, the domain Gmail verified
+    /// ("accounts.google.com") or "an unverified sender"; for an email, the
+    /// sender's name as their mail gives it.
     pub from: String,
-    /// Copied to the clipboard: the card says so, then goes.
-    pub copied: bool,
+    /// Which Gmail account it came to, when more than one is connected
+    /// (empty with one).
+    pub account: String,
+    pub body: MailBody,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MailBody {
+    Code {
+        code: String,
+        /// Copied to the clipboard: the card says so, then goes.
+        copied: bool,
+    },
+    Message {
+        subject: String,
+        /// Where it opens in Gmail.
+        link: String,
+    },
 }
 
 /// What is under the pointer on the card.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CodeItem {
-    /// The code or its copy button: both copy.
+pub enum MailItem {
+    /// A code's card, or its copy button: both copy.
     Copy,
+    /// An email's card, or its open button: both open it in Gmail.
+    Open,
     /// The close mark.
     Close,
 }
 
 pub mod layout {
-    use super::{HEIGHT, WIDTH};
+    use super::HEIGHT;
     use crate::geometry::Rect;
 
     pub const INSET: f32 = 16.0;
@@ -44,37 +68,88 @@ pub mod layout {
     pub const CLOSE: f32 = 20.0;
     /// The mail icon, left.
     pub const MAIL: Rect = Rect::new(INSET, (HEIGHT - ICON) * 0.5, ICON, ICON);
-    /// The sender over the code.
+    /// The sender over the code or subject.
     pub const TEXT_X: f32 = INSET + ICON + 12.0;
-    /// The copy button, right, with the close mark beyond it.
-    pub const CLOSE_MARK: Rect = Rect::new(WIDTH - INSET - CLOSE, (HEIGHT - CLOSE) * 0.5, CLOSE, CLOSE);
-    pub const COPY: Rect = Rect::new(WIDTH - INSET - CLOSE - 8.0 - BUTTON, (HEIGHT - BUTTON) * 0.5, BUTTON, BUTTON);
+
+    /// The close mark, right.
+    #[must_use]
+    pub const fn close_mark(width: f32) -> Rect {
+        Rect::new(width - INSET - CLOSE, (HEIGHT - CLOSE) * 0.5, CLOSE, CLOSE)
+    }
+
+    /// Copy or open, just left of the close mark.
+    #[must_use]
+    pub const fn button(width: f32) -> Rect {
+        Rect::new(width - INSET - CLOSE - 8.0 - BUTTON, (HEIGHT - BUTTON) * 0.5, BUTTON, BUTTON)
+    }
 }
 
-impl CodeCard {
+impl MailCard {
+    #[must_use]
+    pub fn width(&self) -> f32 {
+        match self.body {
+            MailBody::Code { .. } => CODE_WIDTH,
+            MailBody::Message { .. } => MESSAGE_WIDTH,
+        }
+    }
+
+    /// A code not yet copied: a new email doesn't take its place.
+    #[must_use]
+    pub fn is_waiting_code(&self) -> bool {
+        matches!(self.body, MailBody::Code { copied: false, .. })
+    }
+
+    /// The small line over the code or subject.
+    #[must_use]
+    pub fn label(&self) -> String {
+        let main = match &self.body {
+            MailBody::Code { copied: true, .. } => return "Copied".to_owned(),
+            MailBody::Code { .. } if self.from.is_empty() => "Code from Gmail".to_owned(),
+            MailBody::Code { .. } => format!("Code from {}", self.from),
+            MailBody::Message { .. } if self.from.is_empty() => "New email".to_owned(),
+            MailBody::Message { .. } => self.from.clone(),
+        };
+        if self.account.is_empty() {
+            main
+        } else {
+            format!("{main} \u{00b7} {}", self.account)
+        }
+    }
+
     /// What a click at (`x`, `y`) on the card does.
     #[must_use]
-    pub fn item_at(&self, x: f32, y: f32) -> Option<CodeItem> {
+    pub fn item_at(&self, x: f32, y: f32) -> Option<MailItem> {
+        let width = self.width();
         let slop = 4.0;
         let hit = |rect: Rect| {
             x >= rect.x - slop && x <= rect.right() + slop && y >= rect.y - slop && y <= rect.bottom() + slop
         };
-        if hit(layout::CLOSE_MARK) {
-            return Some(CodeItem::Close);
+        if hit(layout::close_mark(width)) {
+            return Some(MailItem::Close);
         }
-        // Anywhere else on the card copies: the code is the point of it.
-        ((0.0..=WIDTH).contains(&x) && (0.0..=HEIGHT).contains(&y)).then_some(CodeItem::Copy)
+        // Anywhere else on the card copies the code or opens the email.
+        let on_card = (0.0..=width).contains(&x) && (0.0..=HEIGHT).contains(&y);
+        on_card.then_some(match self.body {
+            MailBody::Code { .. } => MailItem::Copy,
+            MailBody::Message { .. } => MailItem::Open,
+        })
     }
 
-    /// The code as shown: long numbers split in two ("482 913").
+    /// The code or subject as shown: long numbers split in two ("482 913").
     #[must_use]
     pub fn shown(&self) -> String {
-        let chars: Vec<char> = self.code.chars().collect();
-        if chars.len() >= 6 && chars.iter().all(char::is_ascii_digit) {
-            let half = chars.len() / 2;
-            format!("{} {}", chars[..half].iter().collect::<String>(), chars[half..].iter().collect::<String>())
-        } else {
-            self.code.clone()
+        match &self.body {
+            MailBody::Message { subject, .. } if subject.trim().is_empty() => "(no subject)".to_owned(),
+            MailBody::Message { subject, .. } => subject.clone(),
+            MailBody::Code { code, .. } => {
+                let chars: Vec<char> = code.chars().collect();
+                if chars.len() >= 6 && chars.iter().all(char::is_ascii_digit) {
+                    let half = chars.len() / 2;
+                    format!("{} {}", chars[..half].iter().collect::<String>(), chars[half..].iter().collect::<String>())
+                } else {
+                    code.clone()
+                }
+            }
         }
     }
 }
@@ -258,12 +333,37 @@ mod tests {
 
     #[test]
     fn long_codes_show_in_two_halves_and_clicks_copy_or_close() {
-        let card = CodeCard { code: "482913".into(), from: "Google".into(), copied: false };
+        let code = |code: &str| MailCard {
+            from: "accounts.google.com".into(),
+            account: String::new(),
+            body: MailBody::Code { code: code.into(), copied: false },
+        };
+        let card = code("482913");
         assert_eq!(card.shown(), "482 913");
-        assert_eq!(CodeCard { code: "4829".into(), ..card.clone() }.shown(), "4829");
-        let close = layout::CLOSE_MARK;
-        assert_eq!(card.item_at(close.x + 4.0, close.y + 4.0), Some(CodeItem::Close));
-        assert_eq!(card.item_at(layout::TEXT_X + 10.0, HEIGHT * 0.5), Some(CodeItem::Copy));
-        assert_eq!(card.item_at(WIDTH + 20.0, 10.0), None);
+        assert_eq!(code("4829").shown(), "4829");
+        assert_eq!(card.label(), "Code from accounts.google.com");
+        let close = layout::close_mark(CODE_WIDTH);
+        assert_eq!(card.item_at(close.x + 4.0, close.y + 4.0), Some(MailItem::Close));
+        assert_eq!(card.item_at(layout::TEXT_X + 10.0, HEIGHT * 0.5), Some(MailItem::Copy));
+        assert_eq!(card.item_at(CODE_WIDTH + 20.0, 10.0), None);
+        let copied = MailCard { body: MailBody::Code { code: "482913".into(), copied: true }, ..card.clone() };
+        assert_eq!(copied.label(), "Copied");
+        assert!(card.is_waiting_code() && !copied.is_waiting_code());
+    }
+
+    #[test]
+    fn an_email_shows_its_sender_and_subject_and_opens() {
+        let card = MailCard {
+            from: "Priya".into(),
+            account: "work@gmail.com".into(),
+            body: MailBody::Message { subject: "Lunch on Friday?".into(), link: "https://mail.google.com/".into() },
+        };
+        assert_eq!(card.width(), MESSAGE_WIDTH);
+        assert_eq!(card.label(), "Priya \u{00b7} work@gmail.com");
+        assert_eq!(card.shown(), "Lunch on Friday?");
+        assert_eq!(card.item_at(layout::TEXT_X, HEIGHT * 0.5), Some(MailItem::Open));
+        let close = layout::close_mark(MESSAGE_WIDTH);
+        assert_eq!(card.item_at(close.x + 4.0, close.y + 4.0), Some(MailItem::Close));
+        assert!(!card.is_waiting_code());
     }
 }
