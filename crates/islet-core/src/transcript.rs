@@ -1569,11 +1569,13 @@ fn stray_capitals(line: &str) -> String {
             !previous.ends_with(['.', '!', '?', ':', ';', '"', '\u{201d}'])
                 && previous.chars().next().is_some_and(|c| c.is_lowercase() || c.is_ascii_digit())
         };
-        // "play The Weeknd": the start of a capitalised run, a name.
-        let starts_name = words
-            .get(index + 1)
-            .and_then(|next| next.chars().next())
-            .is_some_and(char::is_uppercase);
+        // "play The Weeknd": the start of a capitalised run, a name. "I" is
+        // always a capital, so "centric, And I want" is not one.
+        let starts_name = words.get(index + 1).is_some_and(|next| {
+            let bare = next.trim_end_matches([',', ';', ':', '.', '!', '?']).replace('\u{2019}', "'");
+            next.chars().next().is_some_and(char::is_uppercase)
+                && !matches!(bare.as_str(), "I" | "I'm" | "I'll" | "I've" | "I'd")
+        });
         let mut letters = core.chars();
         let capitalised = !starts_name
             && letters.next().is_some_and(char::is_uppercase)
@@ -4995,6 +4997,11 @@ mod dictated_list_tests {
             "Can you increase the hover on hover time?"
         );
         assert_eq!(finish_layout("I paused here, And then went on."), "I paused here, and then went on.");
+        // "I" is always a capital, so it doesn't make "And I" a name.
+        assert_eq!(
+            finish_layout("It's performance centric, And I want better graphics, But I'm not sure."),
+            "It's performance centric, and I want better graphics, but I'm not sure."
+        );
         // Sentence starts, names, titles and "I" keep their capitals.
         for kept in [
             "It works. On Monday we ship.",
