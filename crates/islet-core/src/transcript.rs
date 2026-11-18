@@ -1432,8 +1432,32 @@ fn restarted_articles(text: &str) -> String {
 fn continue_sentences(text: &str) -> String {
     const ABBREVIATIONS: &[&str] = &["mr.", "mrs.", "ms.", "dr.", "vs.", "etc.", "e.g.", "i.e.", "st.", "no."];
     let mut words: Vec<String> = text.split_whitespace().map(str::to_owned).collect();
+    // Words that join "I …" into the sentence before it ("…that I want").
+    const CLAUSE_LINKS: &[&str] = &[
+        "and", "but", "so", "or", "because", "if", "when", "that", "what", "how", "why", "where", "which", "who",
+        "as", "than", "since", "until", "while", "before", "after", "think", "know", "mean", "say", "said", "hope",
+        "guess", "whether", "unless", "once",
+    ];
     let mut question_pending = false;
+    // Where the question's stop was taken off.
+    let mut merged_at = 0;
     for index in 0..words.len() {
+        // "…the AI model? like the Gemma model to fix the dictation I want to
+        // explain it…": the question went on after the pause, but "I want"
+        // with no stop before it starts the next sentence, so the question
+        // ends before it, not at the next stop.
+        if question_pending && index >= merged_at + 4 && index + 1 < words.len() && words[index] == "I" {
+            let previous = &words[index - 1];
+            let opens = matches!(
+                bare_word(&words[index + 1]).as_str(),
+                "want" | "wanted" | "need" | "needed" | "would" | "also" | "just" | "really"
+            );
+            let plain = previous.chars().last().is_some_and(char::is_alphanumeric);
+            if opens && plain && !CLAUSE_LINKS.contains(&bare_word(previous).as_str()) {
+                words[index - 1].push('?');
+                question_pending = false;
+            }
+        }
         let command_follows = matches!(
             (words.get(index + 1).map(|w| bare_word(w)).as_deref(), words.get(index + 2).map(|w| bare_word(w)).as_deref()),
             (Some("new"), Some("paragraph" | "line" | "bullet")) | (Some("bullet"), Some("point")) | (Some("next"), Some("bullet"))
@@ -1450,7 +1474,10 @@ fn continue_sentences(text: &str) -> String {
             || word.trim_end_matches('.').contains('.')
             || word.chars().rev().nth(1).is_some_and(|c| c.is_ascii_digit());
         if stop && next_lower && !abbreviation {
-            question_pending |= mark == Some('?');
+            if mark == Some('?') && !question_pending {
+                question_pending = true;
+                merged_at = index;
+            }
             words[index].pop();
             continue;
         }
@@ -5095,6 +5122,17 @@ mod dictated_list_tests {
         assert_eq!(
             cleaned("Can you send the contract to Daniel? before 5pm. The new contract the contract should include the new pricing. and the delivery dates."),
             "Can you send the contract to Daniel before 5pm? The contract should include the new pricing and the delivery dates."
+        );
+        // A question that went on, then ran into a new "I want…" sentence
+        // with no stop: the question ends before it.
+        assert_eq!(
+            cleaned("Can you create a PDF on how we train the AI model? like the Gemma model for dictation I want to explain it to a developer."),
+            "Can you create a PDF on how we train the AI model like the Gemma model for dictation? I want to explain it to a developer."
+        );
+        // But not inside the question's own clause ("…that I want…").
+        assert_eq!(
+            cleaned("Can you find the report? the one from last week that I want to send."),
+            "Can you find the report the one from last week that I want to send?"
         );
         // Real sentence ends and abbreviations stay.
         for text in ["It works. Then we ship.", "Talk to Dr. smith today.", "Use e.g. the logs."] {
