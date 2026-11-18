@@ -1,6 +1,7 @@
 //! The welcome tour, shown once on first run (and from About any time):
 //! what Onyx is, what the island does with your hands, downloading the
-//! speech and cleanup models, and a box to try dictation in.
+//! speech and cleanup models, a box to try dictation in, and connecting
+//! Gmail for sign-in codes.
 //!
 //! It runs in the settings process (`islet-settings --onboarding`) in its own
 //! window. The island refuses dictation into settings windows, except this
@@ -13,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{
     self, pos2, vec2, Align, Align2, Color32, CornerRadius, FontId, Layout, Margin, Rect, RichText,
-    Sense, Stroke, StrokeKind,
+    Sense, Stroke, StrokeKind, Vec2,
 };
 use islet_asr::{ModelSpec, ModelStatus, AI_CLEANUP};
 use islet_core::config::ExpandTrigger;
@@ -78,15 +79,18 @@ enum Step {
     Gestures,
     Models,
     Try,
+    /// Connecting Gmail for sign-in codes. Optional.
+    Gmail,
     Done,
 }
 
-const STEPS: [Step; 6] = [
+const STEPS: [Step; 7] = [
     Step::Welcome,
     Step::Island,
     Step::Gestures,
     Step::Models,
     Step::Try,
+    Step::Gmail,
     Step::Done,
 ];
 
@@ -129,6 +133,9 @@ struct Tour {
     island_checked: Option<Instant>,
     status: Option<String>,
     practice: Practice,
+    /// When Connect was last clicked: the island takes a moment to say it is
+    /// signing in, and a second click meanwhile would start another.
+    gmail_asked: Option<Instant>,
 }
 
 impl Tour {
@@ -147,6 +154,7 @@ impl Tour {
             Some("gestures") => Step::Gestures,
             Some("models") => Step::Models,
             Some("try") => Step::Try,
+            Some("gmail") => Step::Gmail,
             Some("done") => Step::Done,
             _ => Step::Welcome,
         };
@@ -165,6 +173,7 @@ impl Tour {
             island_checked: None,
             status: None,
             practice: Practice::default(),
+            gmail_asked: None,
         };
         // The tour counts as done once the gestures have been practised
         // (see `update`); until then the island opens it at every start. It
@@ -340,6 +349,7 @@ impl eframe::App for Tour {
                                     next_step = Some(step);
                                 }
                             }
+                            Step::Gmail => gmail_page(self, ui),
                             Step::Done => done_page(self, ui),
                         });
                 });
@@ -1227,6 +1237,145 @@ fn try_page(tour: &mut Tour, ui: &mut egui::Ui) -> Option<Step> {
     go
 }
 
+/// The island's code card, as it looks when a code arrives.
+fn code_preview(ui: &mut egui::Ui) {
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 92.0), Sense::hover());
+    let painter = ui.painter();
+    let pill = Rect::from_center_size(rect.center(), vec2(300.0, 58.0));
+    painter.rect_filled(pill, cr(29.0), Color32::BLACK);
+    // Envelope.
+    let mail = Rect::from_center_size(pos2(pill.left() + 29.0, pill.center().y), vec2(20.0, 14.0));
+    let stroke = Stroke::new(1.6, LAVENDER);
+    painter.rect_stroke(mail, cr(2.5), stroke, StrokeKind::Middle);
+    painter.add(egui::Shape::line(
+        vec![mail.left_top() + vec2(1.5, 1.5), pos2(mail.center().x, mail.center().y + 1.0), mail.right_top() + vec2(-1.5, 1.5)],
+        stroke,
+    ));
+    let text_x = pill.left() + 52.0;
+    painter.text(pos2(text_x, pill.top() + 15.0), Align2::LEFT_CENTER, "Code from github.com", FontId::proportional(11.0), MUTED);
+    painter.text(pos2(text_x, pill.top() + 36.0), Align2::LEFT_CENTER, "482 913", bold_font(20.0), TEXT);
+    // Copy mark: two overlapping sheets.
+    let copy = pos2(pill.right() - 34.0, pill.center().y);
+    let sheet = |offset: Vec2| Rect::from_center_size(copy + offset, vec2(10.0, 12.0));
+    let mark = Stroke::new(1.4, MUTED);
+    painter.rect_stroke(sheet(vec2(-2.0, 2.0)), cr(2.0), mark, StrokeKind::Middle);
+    painter.rect_filled(sheet(vec2(2.0, -2.0)), cr(2.0), Color32::BLACK);
+    painter.rect_stroke(sheet(vec2(2.0, -2.0)), cr(2.0), mark, StrokeKind::Middle);
+}
+
+fn gmail_page(tour: &mut Tour, ui: &mut egui::Ui) {
+    heading(
+        ui,
+        "Sign-in codes from Gmail",
+        "Connect Gmail, and the codes sites send you show on the island the moment they arrive. Click one to copy it. This step is optional.",
+    );
+    card(ui, code_preview);
+    ui.add_space(12.0);
+
+    let status = crate::mail_page::status();
+    tour.check_island();
+    let asked = tour.gmail_asked.is_some_and(|at| at.elapsed() < Duration::from_secs(4));
+    let connecting = status.connecting || asked;
+    let mut connect = false;
+    let mut start_island = false;
+    let mut on = tour.config.mail.gmail_codes;
+    card(ui, |ui| {
+        if !status.available {
+            ui.label(RichText::new("Gmail sign-in isn't set up in this build of Onyx.").color(MUTED));
+            return;
+        }
+        for email in &status.accounts {
+            ui.horizontal(|ui| {
+                check(ui, OK);
+                ui.add_space(4.0);
+                let shown = if email.is_empty() { "Gmail account" } else { email.as_str() };
+                ui.label(RichText::new(shown).size(15.0).color(TEXT));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(RichText::new("Connected").small().color(OK));
+                });
+            });
+            ui.add_space(8.0);
+        }
+        ui.horizontal(|ui| {
+            if connecting {
+                button(ui, "Waiting for your browser\u{2026}", Kind::Secondary, false);
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new("Finish signing in in the browser window that opened.")
+                        .size(13.0)
+                        .color(MUTED),
+                );
+            } else if status.accounts.len() >= crate::mail_page::MOST_ACCOUNTS {
+                ui.label(RichText::new("Onyx checks up to 5 accounts.").size(13.0).color(MUTED));
+            } else {
+                let first = status.accounts.is_empty();
+                let (label, kind, about) = if first {
+                    ("Connect Google account", Kind::Primary, "Opens Google in your browser, where you allow read-only access.")
+                } else {
+                    ("Connect another account", Kind::Secondary, "Codes from every connected account show on the island.")
+                };
+                connect = button(ui, label, kind, tour.island_running).clicked();
+                ui.add_space(6.0);
+                ui.label(RichText::new(about).size(13.0).color(MUTED));
+            }
+        });
+        if !tour.island_running {
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Onyx isn't running, so it can't sign in.").color(TEXT));
+                start_island = button(ui, "Start Onyx", Kind::Secondary, true).clicked();
+            });
+        }
+        // Connected before, then switched off in Settings.
+        if !status.accounts.is_empty() && !on {
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Gmail on the island is turned off.").color(TEXT));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    toggle(ui, &mut on, "Gmail on the island");
+                });
+            });
+        }
+    });
+    if start_island {
+        if let Ok(exe) = std::env::current_exe() {
+            let _ = std::process::Command::new(exe.with_file_name("islet.exe")).spawn();
+        }
+        tour.island_checked = None;
+    }
+    if connect {
+        // On in the settings first, so the island keeps checking after it
+        // next reads them.
+        on = true;
+        tour.gmail_asked = Some(Instant::now());
+    }
+    if on != tour.config.mail.gmail_codes {
+        tour.change(|config| config.mail.gmail_codes = on);
+    }
+    if connect {
+        crate::mail_page::tell_island(crate::mail_page::ADD);
+    }
+
+    ui.add_space(16.0);
+    ui.label(
+        RichText::new(
+            "Read-only: Onyx never sends, changes or deletes mail, and your mail goes only between this PC and Google.",
+        )
+        .small()
+        .color(MUTED),
+    );
+    ui.add_space(4.0);
+    ui.label(
+        RichText::new(
+            "You can add or remove accounts later, and choose whether the island shows only codes, all new mail or your own mix, in Settings, under Widgets.",
+        )
+        .small()
+        .color(MUTED),
+    );
+    // The island writes how sign-in is going.
+    ui.ctx().request_repaint_after(Duration::from_millis(500));
+}
+
 fn done_page(tour: &mut Tour, ui: &mut egui::Ui) {
     let t = if tour.animations {
         tour.step_changed.elapsed().as_secs_f32()
@@ -1355,7 +1504,8 @@ mod tests {
         assert_eq!(Step::Welcome.previous(), None);
         assert_eq!(Step::Welcome.next(), Some(Step::Island));
         assert_eq!(Step::Island.next(), Some(Step::Gestures));
-        assert_eq!(Step::Try.next(), Some(Step::Done));
+        assert_eq!(Step::Try.next(), Some(Step::Gmail));
+        assert_eq!(Step::Gmail.next(), Some(Step::Done));
         assert_eq!(Step::Done.next(), None);
         assert_eq!(Step::Models.previous(), Some(Step::Gestures));
     }

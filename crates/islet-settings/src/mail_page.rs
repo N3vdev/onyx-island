@@ -15,18 +15,18 @@ use crate::SettingsApp;
 
 const MUTED: egui::Color32 = egui::Color32::from_rgb(150, 156, 172);
 /// The island's own limit.
-const MOST_ACCOUNTS: usize = 5;
+pub(crate) const MOST_ACCOUNTS: usize = 5;
 /// Messages to the island: add an account, or remove the n-th.
-const ADD: usize = 1;
+pub(crate) const ADD: usize = 1;
 const REMOVE_ACCOUNT: usize = 0x100;
 
 /// What the island last wrote.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct Status {
+pub(crate) struct Status {
     /// This build of Onyx can sign in to Google.
-    available: bool,
-    connecting: bool,
-    accounts: Vec<String>,
+    pub(crate) available: bool,
+    pub(crate) connecting: bool,
+    pub(crate) accounts: Vec<String>,
 }
 
 /// The senders box as typed (the list itself is in the settings).
@@ -136,7 +136,7 @@ fn parse_senders(text: &str) -> Vec<String> {
 }
 
 /// What the island last wrote (Settings never sees the keys).
-fn status() -> Status {
+pub(crate) fn status() -> Status {
     let path = std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_default().join("Islet").join("gmail-status.txt");
     let Some(json) = std::fs::read_to_string(path).ok().and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok()) else {
         // Not written yet: the island hasn't started Gmail. Connecting will.
@@ -157,7 +157,7 @@ fn status() -> Status {
 
 /// Asks the island to add an account (it opens Google's sign-in page) or to
 /// forget one or all.
-fn tell_island(what: usize) {
+pub(crate) fn tell_island(what: usize) {
     use windows::Win32::Foundation::{LPARAM, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, PostMessageW, RegisterWindowMessageW};
     // SAFETY: registers a message name and posts it to the island window.
