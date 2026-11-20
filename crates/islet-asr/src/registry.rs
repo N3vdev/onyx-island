@@ -189,8 +189,8 @@ impl AddOn {
 /// The local model and CPU runtime are checksum-pinned.
 pub const AI_CLEANUP: AddOn = AddOn {
     id: "ai-cleanup",
-    name: "Onyx Cleanup - Gemma 3 270M (Round 5)",
-    summary: "Local dictation cleanup with bounded chunks and checked fallbacks. Experimental.",
+    name: "Onyx Cleanup - Gemma 3 270M (Round 10)",
+    summary: "Local dictation cleanup and professional rewrite, with bounded chunks and checked fallbacks.",
     maker: "Onyx / Google Gemma",
     license: "Gemma terms / MIT runtime",
     dir: "ai-cleanup",
@@ -202,14 +202,14 @@ pub const AI_CLEANUP: AddOn = AddOn {
             sha256: "f70b7fe800e683f58fed3199fcf9c961932307f30916498a7758dce5f1d76ce9",
         },
         ModelFile {
-            name: "onyx-cleanup-270m-r5-selected-q8_0.gguf",
-            url: "https://github.com/N3vdev/onyx-cleanup/releases/download/cleanup-r5/onyx-cleanup-270m-r5-selected-q8_0.gguf",
+            name: "onyx-cleanup-270m-r10-q8_0.gguf",
+            url: "https://github.com/N3vdev/onyx-cleanup/releases/download/cleanup-r10/onyx-cleanup-270m-r10-q8_0.gguf",
             size: 291_545_536,
-            sha256: "760e148a14c0057a086f47efbec76f738ce817901141e45a58d9566dee67cf8f",
+            sha256: "04b52943e16cd245b75f84d09756bd77b3a35f90063aa635e98b84b0043b4148",
         },
     ],
     archive: Some("llama-b11927-bin-win-cpu-x64.zip"),
-    model: "onyx-cleanup-270m-r5-selected-q8_0.gguf",
+    model: "onyx-cleanup-270m-r10-q8_0.gguf",
     program: "llama-server.exe",
 };
 

@@ -3191,9 +3191,11 @@ pub fn professional_rejection(original: &str, rewrite: &str) -> Option<RewriteRe
     if !before.is_empty() && kept * 4 < before.len() * 3 {
         return Some(RewriteRejection::DroppedContent);
     }
-    // "Basically, a to-do list" -> "maybe, a to-do list": a hedge that was
-    // not said changes how sure the speaker is.
-    const HEDGES: &[&str] = &["maybe", "perhaps", "probably", "possibly", "might"];
+    // "Basically, a to-do list" -> "maybe, a to-do list", "I have tokens
+    // left" -> "I have a few tokens left": a hedge or an amount that was not
+    // said changes the meaning.
+    const HEDGES: &[&str] =
+        &["maybe", "perhaps", "probably", "possibly", "might", "few", "several", "many", "lots"];
     let said = content_words(original);
     content_words(rewrite)
         .iter()
@@ -3882,6 +3884,10 @@ mod tests {
                 "Now I want a widget of to-do list with reminders and Basically, a to-do list.",
                 "Now I want a to-do list widget with reminders and maybe, a to-do list."
             ),
+            Some(RewriteRejection::NovelContent)
+        );
+        assert_eq!(
+            professional_rejection("I have codex tokens left.", "I have a few codex tokens left."),
             Some(RewriteRejection::NovelContent)
         );
         assert!(professional_rejection(
