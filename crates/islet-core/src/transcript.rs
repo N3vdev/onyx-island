@@ -1638,6 +1638,67 @@ const FUNCTION_WORDS: &[&str] = &[
 /// sentence, so the next one must repeat at least three of its words and
 /// most of them. A real apology ("I'm late, I'm sorry. I missed the bus.")
 /// shares little and stays.
+/// "the six CT six fifty hours are from, sorry, the 650 hours are from one
+/// video" -> "the 650 hours are from one video": a phrase begun, "sorry" in
+/// the middle of the sentence, and the phrase said again. The second try
+/// takes the place of the first.
+///
+/// Only when the redo opens with a word from the first try and repeats two
+/// words in a row from it ("hours are"). An apology ("I'm so sorry", "sorry
+/// for the delay") repeats nothing and stays.
+fn restated_after_sorry(tokens: &[Token], out: &mut Vec<Token>, index: usize, cue_end: usize) -> Option<usize> {
+    const APOLOGY: &[&str] = &[
+        "i'm", "am", "i", "so", "very", "really", "truly", "terribly", "awfully", "feel", "felt", "be", "was",
+        "were", "is", "are", "not", "too", "say", "said", "you're", "we're", "they're", "he's", "she's", "how",
+    ];
+    if cue_end != index + 1 || norm(&tokens[index]) != "sorry" {
+        return None;
+    }
+    let last = out.last()?;
+    if last.ends_sentence() || clause_boundary(last) || APOLOGY.contains(&norm(last).as_str()) {
+        return None;
+    }
+    let mut end = cue_end;
+    while end < tokens.len() {
+        end += 1;
+        if tokens[end - 1].ends_sentence() {
+            break;
+        }
+    }
+    let redo = &tokens[cue_end..end];
+    if redo.len() < 3 || redo.iter().any(|t| t.verbatim) {
+        return None;
+    }
+    let pairs = |words: &[Token]| -> Vec<(String, String)> {
+        words.windows(2).map(|w| (norm(&w[0]), norm(&w[1]))).collect()
+    };
+    let redo_pairs = pairs(&redo[1..]);
+    let sentence = out.iter().rposition(Token::ends_sentence).map_or(0, |at| at + 1);
+    let from = sentence.max(out.len().saturating_sub(12));
+    // The first try runs up to "sorry": it ends on a word the redo says again,
+    // or is no longer than the redo. "cheap to remake them or it will be
+    // cheap, sorry, to remake them" only repeats its middle and stays.
+    let last_word = norm(last);
+    let ends_in_redo = redo.iter().any(|t| norm(t) == last_word);
+    let at = (from..out.len()).rev().find(|&at| {
+        norm(&out[at]) == norm(&redo[0])
+            && out[at..].iter().all(|t| !t.verbatim)
+            && (ends_in_redo || out.len() - at <= redo.len())
+            && pairs(&out[at + 1..]).iter().any(|pair| redo_pairs.contains(pair))
+    })?;
+    out.truncate(at);
+    let mut redo = redo.to_vec();
+    let mut letters = redo[0].word.chars();
+    let title_case = letters.next().is_some_and(char::is_uppercase) && letters.all(|c| !c.is_uppercase());
+    if out.last().is_none_or(clause_boundary) {
+        capitalize(&mut redo[0]);
+    } else if title_case && redo[0].word != "I" {
+        redo[0].word = redo[0].word.to_lowercase();
+    }
+    out.extend(redo);
+    Some(end)
+}
+
 fn abandoned_start(tokens: &[Token], out: &mut Vec<Token>, cue_end: usize) -> Option<usize> {
     let last_cue = &tokens[cue_end - 1];
     if norm(last_cue) != "sorry" || !(closes_phrase(last_cue) || cue_end == tokens.len()) {
@@ -2075,7 +2136,8 @@ fn apply_cue(
     match cue {
         Cue::Contrast => corrections::contrast(tokens, out, cue_end),
         Cue::VerifiedRestate => corrections::verified_restate(tokens, out, cue_end),
-        Cue::Scoped => abandoned_start(tokens, out, cue_end),
+        Cue::Scoped => restated_after_sorry(tokens, out, index, cue_end)
+            .or_else(|| abandoned_start(tokens, out, cue_end)),
         Cue::GiveUp => given_up(tokens, out, cue_end),
         Cue::Scratch => {
             // Only when it ends its clause ("scratch that." / "scratch that, ...").
@@ -3719,6 +3781,31 @@ mod tests {
         assert_eq!(clean("It's a car that has that sound I like.", &o), "It's a car that has that sound I like.");
         assert_eq!(clean("I know what is what.", &o), "I know what is what.");
         assert_eq!(clean("He said that is that and left.", &o), "He said that is that and left.");    }
+
+    #[test]
+    fn a_phrase_said_again_after_a_mid_sentence_sorry_replaces_the_first_try() {
+        let o = options();
+        assert_eq!(
+            clean("And the six CT six fifty hours are from sorry, the 650 hours are from one video itself.", &o),
+            "And the 650 hours are from one video itself."
+        );
+        assert_eq!(
+            clean("Send the blue file to sorry the red file to Maya.", &o),
+            "Send the red file to Maya."
+        );
+        // Only the middle said again: the first try is not replaced.
+        assert_eq!(
+            clean("It won't be cheap to remake them or it will be cheap sorry to remake them.", &o),
+            "It won't be cheap to remake them or it will be cheap sorry to remake them."
+        );
+        // Apologies stay.
+        assert_eq!(clean("I'm so sorry, the train was late.", &o), "I'm so sorry, the train was late.");
+        assert_eq!(clean("Sorry, the meeting is at noon.", &o), "Sorry, the meeting is at noon.");
+        assert_eq!(
+            clean("I missed the call sorry, the battery died.", &o),
+            "I missed the call sorry, the battery died."
+        );
+    }
 
     #[test]
     fn deliberate_repeats_and_real_words_are_kept() {
