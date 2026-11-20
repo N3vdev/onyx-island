@@ -398,6 +398,7 @@ fn is_break(token: &Token) -> bool {
 fn remove_fillers(tokens: Vec<Token>) -> Vec<Token> {
     let mut out: Vec<Token> = Vec::with_capacity(tokens.len());
     let mut index = 0;
+    let mut capital_due = false;
     while index < tokens.len() {
         let token = &tokens[index];
         let at_clause_start = out
@@ -473,18 +474,16 @@ fn remove_fillers(tokens: Vec<Token>) -> Vec<Token> {
             }
             index += if is_you_know { 2 } else { 1 };
             // The word after a dropped sentence-initial filler starts the
-            // sentence, so it gets its capital back.
-            if at_clause_start {
-                if let Some(next) = tokens.get(index) {
-                    let mut next = next.clone();
-                    capitalize(&mut next);
-                    out.push(next);
-                    index += 1;
-                }
-            }
+            // sentence, so it gets its capital back. It is checked like any
+            // other word first: "Uh uh can you" drops both sounds.
+            capital_due |= at_clause_start;
             continue;
         }
-        out.push(token.clone());
+        let mut token = token.clone();
+        if std::mem::take(&mut capital_due) {
+            capitalize(&mut token);
+        }
+        out.push(token);
         index += 1;
     }
     out
@@ -1965,6 +1964,145 @@ fn drop_relative_restarts(tokens: Vec<Token>) -> Vec<Token> {
     out
 }
 
+/// "we need to the thing that needs to be fixed" -> "the thing that needs
+/// to be fixed": "need to" or "want to" goes on with a verb, so one followed
+/// by "the" or "a" is a start given up. The subject and "need to" go.
+///
+/// Then "the thing is, the thing that…" -> "the thing that…": an opener
+/// said in full before the noun phrase it introduced.
+fn drop_stranded_to(tokens: Vec<Token>) -> Vec<Token> {
+    const SUBJECTS: &[&str] = &["i", "we", "you", "they", "he", "she"];
+    const WANTS: &[&str] = &["need", "needs", "needed", "want", "wants", "wanted"];
+    const ADVERBS: &[&str] = &["just", "really", "also", "still", "definitely"];
+    const NOUN_STARTS: &[&str] = &["the", "a", "an", "this", "our", "my", "your", "their"];
+    let plain = |token: &Token| !token.verbatim && token.lead.is_empty() && token.trail.is_empty();
+    let mut out: Vec<Token> = Vec::with_capacity(tokens.len());
+    let mut index = 0;
+    while index < tokens.len() {
+        let adverb = usize::from(tokens.get(index + 1).is_some_and(|t| ADVERBS.contains(&norm(t).as_str())));
+        let stranded = tokens.get(index..index + 4 + adverb).is_some_and(|w| {
+            w[..3 + adverb].iter().all(plain)
+                && SUBJECTS.contains(&norm(&w[0]).as_str())
+                && WANTS.contains(&norm(&w[1 + adverb]).as_str())
+                && norm(&w[2 + adverb]) == "to"
+                && NOUN_STARTS.contains(&norm(&w[3 + adverb]).as_str())
+        });
+        if !stranded {
+            out.push(tokens[index].clone());
+            index += 1;
+            continue;
+        }
+        let capital = tokens[index].word.starts_with(char::is_uppercase) && tokens[index].word != "I";
+        index += 3 + adverb;
+        // "the thing is, " just before, naming the same noun: drop it too.
+        let noun = tokens.get(index + 1).map(norm);
+        let n = out.len();
+        if n >= 3
+            && noun.is_some()
+            && norm(&out[n - 3]) == "the"
+            && Some(norm(&out[n - 2])) == noun
+            && norm(&out[n - 1]) == "is"
+            && out[n - 1].trail == ","
+            && out[n - 3..n - 1].iter().all(plain)
+        {
+            let opened = out[n - 3].word.starts_with(char::is_uppercase);
+            out.truncate(n - 3);
+            let mut next = tokens[index].clone();
+            if opened || out.last().is_none_or(clause_boundary) {
+                capitalize(&mut next);
+            }
+            out.push(next);
+            index += 1;
+        } else if capital || out.last().is_none_or(clause_boundary) {
+            let mut next = tokens[index].clone();
+            capitalize(&mut next);
+            out.push(next);
+            index += 1;
+        }
+    }
+    out
+}
+
+/// "I think I'm pretty sure it will take an hour" -> "I'm pretty sure it
+/// will take an hour": two openers for one opinion, back to back. The second
+/// stays. "I think I know" and "I think I'm late" are meant and stay.
+fn drop_opinion_restarts(tokens: Vec<Token>) -> Vec<Token> {
+    const OPINIONS: &[&str] = &["think", "guess", "believe", "feel"];
+    const SURE_WORDS: &[&str] = &["pretty", "fairly", "quite", "really", "very", "so", "absolutely"];
+    let plain = |token: &Token| !token.verbatim && token.lead.is_empty() && token.trail.is_empty();
+    let sure_at = |at: usize| -> bool {
+        let Some(first) = tokens.get(at) else {
+            return false;
+        };
+        let (word, mut next) = match norm(first).as_str() {
+            "i'm" => (true, at + 1),
+            "i" => (tokens.get(at + 1).is_some_and(|t| norm(t) == "am"), at + 2),
+            _ => (false, at),
+        };
+        if word && tokens.get(next).is_some_and(|t| plain(t) && SURE_WORDS.contains(&norm(t).as_str())) {
+            next += 1;
+        }
+        word && tokens.get(next).is_some_and(|t| matches!(norm(t).as_str(), "sure" | "certain" | "positive"))
+    };
+    let opinion_at = |at: usize| -> bool {
+        tokens.get(at..at + 2).is_some_and(|w| {
+            norm(&w[0]) == "i" && matches!(norm(&w[1]).as_str(), "think" | "guess" | "believe")
+        })
+    };
+    let mut out: Vec<Token> = Vec::with_capacity(tokens.len());
+    let mut index = 0;
+    while index < tokens.len() {
+        let doubled = tokens.get(index..index + 2).is_some_and(|w| {
+            w.iter().all(plain) && norm(&w[0]) == "i" && OPINIONS.contains(&norm(&w[1]).as_str())
+        }) && (sure_at(index + 2) || opinion_at(index + 2) && norm(&tokens[index + 1]) != norm(&tokens[index + 3]));
+        if doubled {
+            index += 2;
+            continue;
+        }
+        out.push(tokens[index].clone());
+        index += 1;
+    }
+    out
+}
+
+/// "more cleaner than" -> "cleaner than", "more better." -> "better.": a
+/// comparative already says "more". Only before "than" or the end of a
+/// phrase, so "more older users" (a larger number of them) stays.
+fn drop_double_comparatives(tokens: Vec<Token>) -> Vec<Token> {
+    const COMPARATIVES: &[&str] = &[
+        "better", "worse", "cleaner", "faster", "easier", "simpler", "cheaper", "quicker", "slower", "smaller",
+        "bigger", "larger", "harder", "smoother", "nicer", "safer", "clearer", "stronger", "longer", "shorter",
+        "higher", "lower", "richer", "happier", "busier", "lighter", "heavier", "smarter", "cooler", "warmer",
+    ];
+    let mut out: Vec<Token> = Vec::with_capacity(tokens.len());
+    let mut index = 0;
+    while index < tokens.len() {
+        let token = &tokens[index];
+        let doubled = !token.verbatim
+            && token.trail.is_empty()
+            && norm(token) == "more"
+            && tokens.get(index + 1).is_some_and(|next| {
+                !next.verbatim
+                    && next.lead.is_empty()
+                    && COMPARATIVES.contains(&norm(next).as_str())
+                    && (closes_phrase(next) || tokens.get(index + 2).is_none_or(|after| norm(after) == "than"))
+            });
+        if doubled {
+            let mut next = tokens[index + 1].clone();
+            next.lead = token.lead.clone();
+            if token.word.starts_with(char::is_uppercase) {
+                capitalize(&mut next);
+            }
+            out.push(next);
+            index += 2;
+            continue;
+        }
+        out.push(token.clone());
+        index += 1;
+    }
+    out
+}
+
 /// A bare number word or numeral, as a value.
 fn small_number(token: &Token) -> Option<i64> {
     if token.verbatim && !token.word.chars().all(|c| c.is_ascii_digit()) {
@@ -2122,6 +2260,11 @@ fn apply_cue(
             return None;
         }
         return corrections::scoped_after_sentence(tokens, out, cue_end)
+            .or_else(|| {
+                (norm(&tokens[index]) == "sorry" && cue_end == index + 1)
+                    .then(|| corrections::scoped_noun_phrase(tokens, out, cue_end))
+                    .flatten()
+            })
             .or_else(|| abandoned_start(tokens, out, cue_end));
     }
     if !matches!(
@@ -3111,6 +3254,9 @@ pub fn rewrite_rejection(original: &str, rewrite: &str) -> Option<RewriteRejecti
     if let Some(reason) = safety::rejection(original, rewrite) {
         return Some(reason);
     }
+    if dropped_clause(original, rewrite) {
+        return Some(RewriteRejection::DroppedContent);
+    }
     // Line breaks were asked for ("new paragraph", "new line", bullets):
     // the rewrite keeps every one (it may add a list's, never remove one).
     if original.matches('\n').count() > rewrite.matches('\n').count() {
@@ -3178,6 +3324,34 @@ fn rewrite_stem(word: &str) -> &str {
 /// still be there ("make a revision plan for physics" must not become "a
 /// literature review").
 #[must_use]
+/// "and I sent an email, but nobody has replied." -> "and I sent an
+/// email.": a whole clause gone. Each clause of what was said with two or
+/// more content words must keep at least one of them (or a spelling of it)
+/// in the rewrite; rewording inside a clause is fine.
+fn dropped_clause(original: &str, rewrite: &str) -> bool {
+    let stems = |text: &str| -> Vec<String> {
+        content_words(&text.replace('\u{2019}', "'"))
+            .into_iter()
+            .filter(|word| word.chars().count() >= 3 && !REWRITE_FREE.contains(&word.as_str()))
+            .map(|word| rewrite_stem(&word).to_owned())
+            .collect()
+    };
+    let kept = stems(rewrite);
+    let survives = |word: &String| {
+        kept.iter().any(|k| {
+            k == word
+                || within_edits(k, word, 1)
+                || (word.len() >= 4 && k.starts_with(word.as_str()))
+                || (k.len() >= 4 && word.starts_with(k.as_str()))
+        })
+    };
+    original
+        .split([',', '.', ';', ':', '?', '!', '\n'])
+        .flat_map(|part| part.split(" but ").flat_map(|part| part.split(" because ")))
+        .map(stems)
+        .any(|clause| clause.len() >= 2 && !clause.iter().any(survives))
+}
+
 pub fn professional_rejection(original: &str, rewrite: &str) -> Option<RewriteRejection> {
     let words = |text: &str| -> std::collections::BTreeSet<String> {
         content_words(&text.replace('\u{2019}', "'"))
@@ -3437,8 +3611,8 @@ pub fn clean(text: &str, options: &TextOptions) -> String {
     }
     if options.filler_removal {
         tokens = remove_stutters(resolve_quick_swaps(resolve_corrections(drop_restarts(
-            drop_number_restarts(drop_relative_restarts(drop_subject_restarts(collapse_linking_runs(
-                remove_fillers(tokens),
+            drop_number_restarts(drop_relative_restarts(drop_opinion_restarts(drop_stranded_to(
+                drop_subject_restarts(collapse_linking_runs(drop_double_comparatives(remove_fillers(tokens)))),
             )))),
         ))));
     }
@@ -3920,6 +4094,93 @@ mod tests {
             clean("I missed the call sorry, the battery died.", &o),
             "I missed the call sorry, the battery died."
         );
+    }
+
+    #[test]
+    fn a_rewrite_may_not_drop_a_whole_clause() {
+        let said = "This version is cleaner than the last one, and I sent an email to the team since 2 weeks, but nobody has replied.";
+        assert!(rewrite_rejection(
+            said,
+            "This version is cleaner than the last one, and I sent an email to the team since 2 weeks."
+        )
+        .is_some());
+        assert_eq!(
+            rewrite_rejection(
+                "The app is slow since the update, but the database queries look fine.",
+                "The app is slow since the update."
+            ),
+            Some(RewriteRejection::DroppedContent)
+        );
+        assert_eq!(
+            rewrite_rejection(said, "This version is cleaner than the last one. I emailed the team 2 weeks ago, but nobody has replied."),
+            None
+        );
+    }
+
+    #[test]
+    fn a_noun_phrase_after_sorry_replaces_the_one_ending_the_sentence_before() {
+        let o = options();
+        assert_eq!(
+            clean("The thing that needs to be fixed is the login page. Sorry, the sign up page, not the dashboard.", &o),
+            "The thing that needs to be fixed is the sign up page, not the dashboard."
+        );
+        assert_eq!(clean("Send it to my old address. Sorry, my new address.", &o), "Send it to my new address.");
+        // A new sentence after an apology stays.
+        assert_eq!(
+            clean("I missed the meeting. Sorry, the traffic was bad.", &o),
+            "I missed the meeting. Sorry, the traffic was bad."
+        );
+        assert_eq!(
+            clean("We fixed the page. Sorry, the page is still slow.", &o),
+            "We fixed the page. Sorry, the page is still slow."
+        );
+    }
+
+    #[test]
+    fn a_need_to_broken_off_before_a_noun_is_dropped() {
+        let o = options();
+        assert_eq!(
+            clean("So the thing is, we need to the thing that has that needs to be fixed is the login page.", &o),
+            "So the thing that needs to be fixed is the login page."
+        );
+        assert_eq!(clean("I want to the report should go out today.", &o), "The report should go out today.");
+        assert_eq!(clean("We need to the, the budget is late.", &o), "The budget is late.");
+        // Meant: "need to" goes on with a verb.
+        assert_eq!(clean("We need to fix the login page.", &o), "We need to fix the login page.");
+        assert_eq!(clean("I'm going to the store.", &o), "I'm going to the store.");
+    }
+
+    #[test]
+    fn two_opinion_openers_keep_the_second() {
+        let o = options();
+        assert_eq!(
+            clean("And I think I'm pretty sure it will take an hour.", &o),
+            "And I'm pretty sure it will take an hour."
+        );
+        assert_eq!(clean("I guess I think it works.", &o), "I think it works.");
+        assert_eq!(clean("I think I know the answer.", &o), "I think I know the answer.");
+        assert_eq!(clean("I think I'm late.", &o), "I think I'm late.");
+    }
+
+    #[test]
+    fn more_before_a_comparative_is_dropped() {
+        let o = options();
+        assert_eq!(
+            clean("This version is more cleaner than the last one.", &o),
+            "This version is cleaner than the last one."
+        );
+        assert_eq!(clean("It feels more better.", &o), "It feels better.");
+        assert_eq!(clean("We need more older users.", &o), "We need more older users.");
+    }
+
+    #[test]
+    fn a_doubled_opening_filler_is_dropped() {
+        let o = options();
+        assert_eq!(
+            clean("Uh uh can you check the build?", &o),
+            "Can you check the build?"
+        );
+        assert_eq!(clean("Um, uh, so we ship today.", &o), "So we ship today.");
     }
 
     #[test]

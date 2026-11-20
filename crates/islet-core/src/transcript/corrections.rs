@@ -1,6 +1,6 @@
 //! Bounded phrase replacement. Only consume an old span that ends at a cue;
 //! unrelated clauses and the following instruction remain untouched.
-use super::{closes_phrase, facts, norm, Token};
+use super::{closes_phrase, facts, norm, Token, DETERMINERS, FUNCTION_WORDS};
 
 fn capitalized(token: &Token) -> bool {
     token.word.chars().next().is_some_and(char::is_uppercase)
@@ -196,6 +196,49 @@ pub(super) fn scoped_after_sentence(
     carry_end(&out[begin..], &mut replacement);
     out.splice(begin.., replacement);
     Some(scoped_resume(tokens, out, new.end + 1))
+}
+
+/// "…is the login page. Sorry, the sign up page, not the dashboard." -> "…is
+/// the sign up page, not the dashboard.": after a full stop, "sorry" and a
+/// short noun phrase that ends on the same noun as the sentence before. The
+/// new phrase replaces the old one at the end of that sentence.
+///
+/// Only a phrase of two to five plain words that opens with a determiner,
+/// where the old phrase opens with the same determiner within the last six
+/// words. "Sorry, the traffic was bad." ends on another word and stays.
+pub(super) fn scoped_noun_phrase(tokens: &[Token], out: &mut Vec<Token>, start: usize) -> Option<usize> {
+    let first = tokens.get(start)?;
+    let opener = norm(first);
+    if !DETERMINERS.contains(&opener.as_str()) || !out.last().is_some_and(|t| t.trail == "." || t.trail == "!") {
+        return None;
+    }
+    let end = (start..tokens.len().min(start + 5)).find(|&at| closes_phrase(&tokens[at]))? + 1;
+    let redo = &tokens[start..end];
+    let plain = |t: &Token| !t.verbatim && t.lead.is_empty() && t.word.chars().all(char::is_alphabetic);
+    if redo.len() < 2 || !redo.iter().all(plain) {
+        return None;
+    }
+    let noun = norm(&redo[redo.len() - 1]);
+    let old_end = out.len() - 1;
+    if noun.len() < 3 || FUNCTION_WORDS.contains(&noun.as_str()) || norm(&out[old_end]) != noun {
+        return None;
+    }
+    let at = (old_end.saturating_sub(5)..old_end).rev().find(|&at| {
+        norm(&out[at]) == opener && out[at..].iter().all(plain) && !out[at..old_end].iter().any(closes_phrase)
+    })?;
+    let old: Vec<String> = out[at..].iter().map(norm).collect();
+    let new: Vec<String> = redo.iter().map(norm).collect();
+    if old == new {
+        return None;
+    }
+    let mut replacement = redo.to_vec();
+    if at == 0 || super::clause_boundary(&out[at - 1]) {
+        super::capitalize(&mut replacement[0]);
+    } else {
+        replacement[0].word = out[at].word.clone();
+    }
+    out.splice(at.., replacement);
+    Some(end)
 }
 
 fn boundary(word: &str) -> bool {
