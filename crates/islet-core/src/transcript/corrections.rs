@@ -188,14 +188,33 @@ pub(super) fn scoped_after_sentence(
         || !old_noun.word.chars().all(char::is_alphabetic)
         || boundary(&norm(old_noun))
         || norm(old_noun) != norm(new_noun)
-        || !complete_scoped_span(tokens, new.end + 1)
     {
         return None;
     }
-    let mut replacement = tokens[start..=new.end].to_vec();
+    let end = if complete_scoped_span(tokens, new.end + 1) {
+        new.end + 1
+    } else {
+        finishing_phrase(tokens, new.end + 1)?
+    };
+    let mut replacement = tokens[start..end].to_vec();
     carry_end(&out[begin..], &mut replacement);
     out.splice(begin.., replacement);
-    Some(scoped_resume(tokens, out, new.end + 1))
+    Some(scoped_resume(tokens, out, end))
+}
+
+/// "Sorry, 2700 users on the beta.": a short phrase opening with a
+/// preposition that ends the sentence finishes the corrected one. Where it
+/// ends, or None ("Sorry, 2 cars were returned" is a new statement).
+fn finishing_phrase(tokens: &[Token], at: usize) -> Option<usize> {
+    const OPENERS: &[&str] = &[
+        "on", "in", "at", "for", "from", "with", "by", "per", "each", "every", "across", "this", "last", "next",
+    ];
+    let first = tokens.get(at)?;
+    if !OPENERS.contains(&norm(first).as_str()) {
+        return None;
+    }
+    let end = (at..tokens.len().min(at + 6)).find(|&i| tokens[i].ends_sentence())? + 1;
+    tokens[at..end].iter().all(|t| !t.verbatim).then_some(end)
 }
 
 /// "…is the login page. Sorry, the sign up page, not the dashboard." -> "…is
@@ -610,7 +629,9 @@ pub(super) fn apply(
         // An explicit correction may repeat a counted noun not in the unit
         // vocabulary. Require the same noun (or a small spelling repair),
         // rather than swallowing the beginning of an unrelated clause.
-        if names && new.unit.is_none() {
+        // After "sorry" only the very same noun: "2000 users sorry 2700
+        // users on the beta".
+        if new.unit.is_none() {
             if let (Some(old_noun), Some(new_noun)) = (out.last(), tokens.get(new.end)) {
                 let old_key = norm(old_noun);
                 let new_key = norm(new_noun);
@@ -622,7 +643,7 @@ pub(super) fn apply(
                 };
                 if noun(old_noun)
                     && noun(new_noun)
-                    && (old_key == new_key || super::within_edits(&old_key, &new_key, 1))
+                    && (old_key == new_key || names && super::within_edits(&old_key, &new_key, 1))
                 {
                     let old_at = (out.len().saturating_sub(16)..out.len() - 1).find(|&at| {
                         facts::quantity(out, at)

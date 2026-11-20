@@ -1201,7 +1201,14 @@ fn drop_resaid_sentences(text: &str) -> String {
         let resaid = sentences.get(index + 1).is_some_and(|next| {
             let (a, b) = (bare(sentence), bare(next));
             let shorter = a.len().min(b.len());
-            shorter >= 5 && a.len().abs_diff(b.len()) <= 3 && a[..shorter] == b[..shorter]
+            // "Here are the points. Here are a few points.": the same short
+            // announcement said again.
+            let announced_again = (3..=6).contains(&a.len())
+                && (3..=7).contains(&b.len())
+                && a[..2] == b[..2]
+                && a.last() == b.last()
+                && LIST_NOUNS.contains(&a[a.len() - 1].as_str());
+            announced_again || shorter >= 5 && a.len().abs_diff(b.len()) <= 3 && a[..shorter] == b[..shorter]
         });
         if !resaid {
             kept.push(sentence);
@@ -1727,11 +1734,20 @@ fn abandoned_start(tokens: &[Token], out: &mut Vec<Token>, cue_end: usize) -> Op
         .iter()
         .filter(|a| after.iter().any(|b| a == &b || b.starts_with(a.as_str()) || a.starts_with(b.as_str())))
         .count();
-    let enough = if finished {
-        shared >= 3 && shared * 5 >= before.len() * 3
-    } else {
-        shared >= 2
-    };
+    // "Hay paragraph, sorry, hey Priya": a start of three words or fewer,
+    // begun again with (a spelling of) its first word.
+    let restarted = !finished
+        && fragment.len() <= 3
+        && tokens.get(cue_end).is_some_and(|next| {
+            let (a, b) = (norm(&fragment[0]), norm(next));
+            a.len() >= 2 && (a == b || within_edits(&a, &b, 1))
+        });
+    let enough = restarted
+        || if finished {
+            shared >= 3 && shared * 5 >= before.len() * 3
+        } else {
+            shared >= 2
+        };
     if !enough {
         return None;
     }
@@ -2061,6 +2077,46 @@ fn drop_opinion_restarts(tokens: Vec<Token>) -> Vec<Token> {
         }
         out.push(tokens[index].clone());
         index += 1;
+    }
+    out
+}
+
+/// "a call for like 3:30" -> "a call for about 3:30", "take like an hour"
+/// -> "take about an hour": "like" before an amount means about. Only after
+/// a word an amount follows ("for", "take", "was"), so "I like 3 things"
+/// stays.
+fn approximate_like(tokens: Vec<Token>) -> Vec<Token> {
+    const BEFORE: &[&str] = &[
+        "for", "at", "in", "after", "within", "under", "over", "take", "takes", "took", "taking", "cost", "costs",
+        "paid", "spent", "have", "has", "had", "got", "is", "was", "are", "were", "be", "been", "wait", "waited",
+        "only", "just",
+    ];
+    const UNITS: &[&str] = &[
+        "hour", "minute", "second", "day", "week", "month", "year", "hundred", "thousand", "million", "dollar",
+        "mile", "couple", "few",
+    ];
+    const NUMBERS: &[&str] = &[
+        "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven", "twelve",
+        "fifteen", "twenty", "thirty", "forty", "fifty", "sixty", "hundred",
+    ];
+    let mut out = tokens;
+    for at in 1..out.len().saturating_sub(1) {
+        let amount = {
+            let next = norm(&out[at + 1]);
+            next.starts_with(|c: char| c.is_ascii_digit())
+                || NUMBERS.contains(&next.as_str())
+                || (matches!(next.as_str(), "a" | "an")
+                    && out.get(at + 2).is_some_and(|unit| UNITS.contains(&norm(unit).as_str())))
+        };
+        if amount
+            && !out[at].verbatim
+            && out[at].trail.is_empty()
+            && out[at - 1].trail.is_empty()
+            && norm(&out[at]) == "like"
+            && BEFORE.contains(&norm(&out[at - 1]).as_str())
+        {
+            out[at].word = "about".into();
+        }
     }
     out
 }
@@ -2930,16 +2986,33 @@ fn unpunctuated_list(text: &str) -> Option<String> {
 /// sentences after the announcement on bullet lines, and "First, A. Second,
 /// B." puts each marked item on its own line. An announcement needs two or
 /// more sentences after it, so one stray sentence is never a list.
+/// "Here are a few points. The app crashes twice." just above spoken
+/// bullets: the sentences after the announcement are the first items.
+fn lead_into_bullets(line: &str) -> Option<String> {
+    let parts = sentences(line);
+    let intro = parts.iter().position(|part| introduces_list(part))?;
+    let mut out = heading(&parts[..=intro]);
+    for part in &parts[intro + 1..] {
+        out.push_str("\n- ");
+        out.push_str(&capitalized(part));
+    }
+    Some(out)
+}
+
 fn bulletize(text: String) -> String {
     if text.contains('\n') {
         // Each paragraph or line on its own; bullets already made stay.
-        return text
-            .split('\n')
-            .map(|line| {
+        let lines: Vec<&str> = text.split('\n').collect();
+        return lines
+            .iter()
+            .enumerate()
+            .map(|(at, line)| {
                 if line.trim().is_empty() || line.starts_with("- ") {
-                    line.to_owned()
+                    (*line).to_owned()
+                } else if lines.get(at + 1).is_some_and(|next| next.starts_with("- ")) {
+                    lead_into_bullets(line).unwrap_or_else(|| bulletize((*line).to_owned()))
                 } else {
-                    bulletize(line.to_owned())
+                    bulletize((*line).to_owned())
                 }
             })
             .collect::<Vec<_>>()
@@ -2974,10 +3047,31 @@ fn bulletize(text: String) -> String {
     for part in &parts[intro + 1..] {
         items.extend(parallel_clauses(part).into_iter().map(capitalized));
     }
+    // "Can you tell me which one to fix first?" after the items asks about
+    // them; it is not one of them.
+    let mut asked = Vec::new();
+    while items.len() > 2 && items.last().is_some_and(|item| item.ends_with('?')) {
+        asked.insert(0, items.pop().unwrap_or_default());
+    }
+    let count = announced_count(parts[intro]);
+    // "three things: A. B, and the fact that C.": one item short, and one
+    // item joins two with ", and the": split it.
+    if count == Some(items.len() + 1) {
+        let joined: Vec<usize> = (0..items.len()).filter(|&i| items[i].contains(", and the ")).collect();
+        if let [at] = joined[..] {
+            let item = items.remove(at);
+            let (first, second) = item.split_once(", and the ").unwrap_or_default();
+            items.insert(at, capitalized(&format!("the {second}")));
+            items.insert(at, format!("{first}."));
+        }
+    }
     // "I want three things": three items; anything after is ordinary text.
-    let rest = announced_count(parts[intro])
+    let mut rest = count
         .filter(|&count| count >= 2 && count < items.len())
         .map(|count| items.split_off(count));
+    if !asked.is_empty() {
+        rest.get_or_insert_with(Vec::new).extend(asked);
+    }
     let mut out = heading(&parts[..=intro]);
     for item in &items {
         out.push_str("\n- ");
@@ -3561,6 +3655,36 @@ fn literal_tokens(text: &str) -> Vec<Token> {
 
 /// Cleans one recognised utterance.
 #[must_use]
+/// "Third point: nobody has tested it." -> a bullet, like "bullet point":
+/// a sentence that opens with an ordinal (or "next", "another", "last") and
+/// "point", set off by a colon or comma. "The third point is fair" stays.
+fn spoken_point_markers(text: &str) -> String {
+    const ORDINALS: &[&str] = &[
+        "first", "second", "third", "fourth", "fifth", "sixth", "next", "another", "last", "final",
+    ];
+    let words: Vec<&str> = text.split(' ').collect();
+    let mut out: Vec<&str> = Vec::with_capacity(words.len());
+    let mut index = 0;
+    while index < words.len() {
+        let starts = out.last().is_none_or(|w| w.ends_with(['.', '?', '!', ':']));
+        let marker = starts
+            && ORDINALS.contains(&bare_word(words[index]).as_str())
+            && !words[index].ends_with([',', '.', ':'])
+            && words.get(index + 1).is_some_and(|w| {
+                let w = w.to_lowercase();
+                (w == "point:" || w == "point,") && index + 2 < words.len()
+            });
+        if marker {
+            out.push("bullet point");
+            index += 2;
+            continue;
+        }
+        out.push(words[index]);
+        index += 1;
+    }
+    out.join(" ")
+}
+
 pub fn clean(text: &str, options: &TextOptions) -> String {
     // "Mm." on its own: a hum, nothing to type.
     let hums = text.split_whitespace().map(bare_word).collect::<Vec<_>>();
@@ -3589,6 +3713,13 @@ pub fn clean(text: &str, options: &TextOptions) -> String {
             .collect::<Vec<_>>()
             .join("\n");
     }
+    let pointed;
+    let text = if options.spoken_punctuation {
+        pointed = spoken_point_markers(text);
+        pointed.as_str()
+    } else {
+        text
+    };
     let joined;
     let text = if options.filler_removal {
         joined = misheard_thanks(&rejoin_fragments(&continue_sentences(&rejoin_opened_phrases(&restarted_articles(&resolve_denied_value(&drop_repeated_runs(&drop_noun_restarts(&drop_resaid_sentences(&misheard_words(&restart_after_filler(text)))))))))));
@@ -3612,7 +3743,7 @@ pub fn clean(text: &str, options: &TextOptions) -> String {
     if options.filler_removal {
         tokens = remove_stutters(resolve_quick_swaps(resolve_corrections(drop_restarts(
             drop_number_restarts(drop_relative_restarts(drop_opinion_restarts(drop_stranded_to(
-                drop_subject_restarts(collapse_linking_runs(drop_double_comparatives(remove_fillers(tokens)))),
+                drop_subject_restarts(collapse_linking_runs(drop_double_comparatives(approximate_like(remove_fillers(tokens))))),
             )))),
         ))));
     }
@@ -4093,6 +4224,33 @@ mod tests {
         assert_eq!(
             clean("I missed the call sorry, the battery died.", &o),
             "I missed the call sorry, the battery died."
+        );
+    }
+
+    #[test]
+    fn spoken_lists_from_a_test_run_come_out_as_lists() {
+        let o = options();
+        assert_eq!(
+            clean("Notes from today's meeting. Here are the points. Here are a few points. Bullet point: the app crashes when you open settings twice. Bullet point: we have 2500 users. Sorry, two thousand seven hundred users on the beta. Third point: nobody has tested the Windows 10 build yet. Fourth point: the export button is moving to the top bar.", &o),
+            "Notes from today's meeting. Here are a few points:\n- The app crashes when you open settings twice.\n- We have two thousand seven hundred users on the beta.\n- Nobody has tested the Windows 10 build yet.\n- The export button is moving to the top bar."
+        );
+        assert_eq!(
+            clean("So here are three things that I'm worried about. The server costs, which are around four hundred dollars a month. The The login bug that only happens on Safari, and the fact that we we haven't backed up the database since last week. Can you can you tell me which one I should fix first?", &o),
+            "So here are three things that I'm worried about:\n- The server costs, which are around four hundred dollars a month.\n- The login bug that only happens on Safari.\n- The fact that we haven't backed up the database since last week.\nCan you tell me which one I should fix first?"
+        );
+        assert_eq!(clean("The third point is fair.", &o), "The third point is fair.");
+        assert_eq!(
+            clean("Here are the notes. The build is green. Bullet point: we have 2000 users sorry 2700 users on the beta.", &o),
+            "Here are the notes:\n- The build is green.\n- We have 2700 users on the beta."
+        );
+        assert_eq!(clean("I'm so sorry, 3 people missed it.", &o), "I'm so sorry, 3 people missed it.");
+        assert_eq!(clean("Hay paragraph Sorry, hey Priya, how are you?", &o), "Hey Priya, how are you?");
+        assert_eq!(clean("Book a call with Jack for like 3:30 p.m.", &o), "Book a call with Jack for about 3:30 p.m.");
+        assert_eq!(clean("It will take like an hour.", &o), "It will take about an hour.");
+        assert_eq!(clean("I like 3 of them.", &o), "I like 3 of them.");
+        assert_eq!(
+            clean("We sold 5 cars. Sorry, 2 cars were returned.", &o),
+            "We sold 5 cars. Sorry, 2 cars were returned."
         );
     }
 
