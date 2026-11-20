@@ -1852,6 +1852,58 @@ fn drop_subject_restarts(tokens: Vec<Token>) -> Vec<Token> {
     out
 }
 
+/// "what has what is the next thing that has that needs to be built" ->
+/// "what is the next thing that needs to be built": "what", "that", "which"
+/// or "who" with a helper verb, then the same word again with a different
+/// verb, is the clause begun twice. The second try stays.
+///
+/// The second word after the restart must be a verb too, so "a car that has
+/// that sound" and "what is what" stay.
+fn drop_relative_restarts(tokens: Vec<Token>) -> Vec<Token> {
+    const OPENERS: &[&str] = &["what", "that", "which", "who"];
+    const HELPERS: &[&str] = &[
+        "is", "are", "was", "were", "has", "have", "had", "does", "do", "did", "will", "would", "can",
+        "could", "should",
+    ];
+    // A present-tense verb after "that": "needs", "makes", "goes".
+    let verb = |word: &str| {
+        HELPERS.contains(&word)
+            || (word.len() >= 4
+                && word.ends_with('s')
+                && !word.ends_with("ss")
+                && !word.ends_with("us")
+                && !word.ends_with("is")
+                && !FUNCTION_WORDS.contains(&word))
+    };
+    let plain = |token: &Token| !token.verbatim && token.lead.is_empty() && token.trail.is_empty();
+    let mut out: Vec<Token> = Vec::with_capacity(tokens.len());
+    let mut index = 0;
+    while index < tokens.len() {
+        let restarted = tokens.get(index..index + 4).is_some_and(|w| {
+            let (a, h1, b, h2) = (norm(&w[0]), norm(&w[1]), norm(&w[2]), norm(&w[3]));
+            w[..3].iter().all(plain)
+                && !w[3].verbatim
+                && OPENERS.contains(&a.as_str())
+                && a == b
+                && HELPERS.contains(&h1.as_str())
+                && h1 != h2
+                && verb(&h2)
+        });
+        if restarted {
+            let mut kept = tokens[index + 2].clone();
+            if tokens[index].word.starts_with(char::is_uppercase) {
+                capitalize(&mut kept);
+            }
+            out.push(kept);
+            index += 3;
+            continue;
+        }
+        out.push(tokens[index].clone());
+        index += 1;
+    }
+    out
+}
+
 /// A bare number word or numeral, as a value.
 fn small_number(token: &Token) -> Option<i64> {
     if token.verbatim && !token.word.chars().all(|c| c.is_ascii_digit()) {
@@ -3248,7 +3300,9 @@ pub fn clean(text: &str, options: &TextOptions) -> String {
     }
     if options.filler_removal {
         tokens = remove_stutters(resolve_quick_swaps(resolve_corrections(drop_restarts(
-            drop_number_restarts(drop_subject_restarts(collapse_linking_runs(remove_fillers(tokens)))),
+            drop_number_restarts(drop_relative_restarts(drop_subject_restarts(collapse_linking_runs(
+                remove_fillers(tokens),
+            )))),
         ))));
     }
     safety::punctuate_questions(&mut tokens);
@@ -3651,6 +3705,20 @@ mod tests {
             "Can you send me the report by Friday?"
         );
     }
+
+    #[test]
+    fn a_restarted_what_or_that_clause_keeps_the_second_try() {
+        let o = options();
+        assert_eq!(
+            clean("Tell me what has what is the next thing that has that needs to be built?", &o),
+            "Tell me what is the next thing that needs to be built?"
+        );
+        assert_eq!(clean("What was what is the plan?", &o), "What is the plan?");
+        assert_eq!(clean("The one which is which has the most votes wins.", &o), "The one which has the most votes wins.");
+        // A real object, a saying, and a plain repeat stay.
+        assert_eq!(clean("It's a car that has that sound I like.", &o), "It's a car that has that sound I like.");
+        assert_eq!(clean("I know what is what.", &o), "I know what is what.");
+        assert_eq!(clean("He said that is that and left.", &o), "He said that is that and left.");    }
 
     #[test]
     fn deliberate_repeats_and_real_words_are_kept() {
