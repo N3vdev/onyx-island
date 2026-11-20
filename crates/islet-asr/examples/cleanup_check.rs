@@ -45,7 +45,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for case in cases.as_array().unwrap() {
         let input = clean(case["input"].as_str().unwrap(), &options);
         let start = Instant::now();
-        let output = polisher.rewrite(&input, Duration::from_secs(15))?;
+        let output = polisher.rewrite(&input, Duration::from_secs(15), false)?;
         assert!(islet_core::transcript::accept_rewrite(&input, &output));
         let output = islet_core::transcript::format_numbers(&output);
         assert!(islet_core::transcript::accept_rewrite(&input, &output));

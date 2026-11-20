@@ -973,6 +973,19 @@ fn ai_cleanup_card(app: &mut SettingsApp, ui: &mut egui::Ui) {
             });
         },
     );
+    divider(ui);
+    let can_rewrite = installed && dictation.ai_cleanup;
+    row(
+        ui,
+        "Professional rewrite",
+        "Rewrites what you say as clear, professional text instead of only tidying it. Names, numbers, \
+         \"not\" and questions are checked, and a rewrite that changes them is not typed.",
+        |ui| {
+            ui.add_enabled_ui(can_rewrite, |ui| {
+                toggle(ui, &mut dictation.ai_professional, "Professional rewrite");
+            });
+        },
+    );
 
     if download {
         app.dictation_ui.start_addon_download(addon);

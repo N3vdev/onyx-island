@@ -106,7 +106,10 @@ impl Polisher {
     }
 
     /// Rewrites `text`, giving up after `budget` (including any start-up).
-    pub fn rewrite(&self, text: &str, budget: Duration) -> Result<String, PolishError> {
+    /// `professional` asks for a professional rewrite rather than a light
+    /// cleanup; the same checks apply, plus one that most of what was said
+    /// is still there.
+    pub fn rewrite(&self, text: &str, budget: Duration, professional: bool) -> Result<String, PolishError> {
         let deadline = Instant::now() + budget;
         let mut server = self
             .server
@@ -123,15 +126,19 @@ impl Polisher {
         for piece in &pieces {
             let remaining = deadline.saturating_duration_since(Instant::now());
             let proposed = if piece.infer && remaining >= Duration::from_millis(200) {
-                request(port, piece.text, remaining)
+                request(port, piece.text, remaining, professional)
             } else {
                 Err(PolishError::TimedOut)
             };
             match proposed {
                 Ok(rewrite) => {
-                    if let Some(reason) =
-                        islet_core::transcript::rewrite_rejection(piece.text, &rewrite)
-                    {
+                    let rejected = islet_core::transcript::rewrite_rejection(piece.text, &rewrite)
+                        .or_else(|| {
+                            professional
+                                .then(|| islet_core::transcript::professional_rejection(piece.text, &rewrite))
+                                .flatten()
+                        });
+                    if let Some(reason) = rejected {
                         tracing::info!(?reason, "Onyx cleanup chunk retained rule-cleaned text");
                         result.push_str(piece.text);
                     } else {
@@ -240,14 +247,20 @@ fn start(exe: &Path, model: &Path, threads: usize) -> Result<Server, PolishError
     }
 }
 
-fn messages(text: &str) -> Vec<Value> {
-    vec![json!({"role": "user", "content": format!("Clean up this dictation:\n{text}")})]
+/// The two prompts the model was trained on (Round 9 onwards).
+fn messages(text: &str, professional: bool) -> Vec<Value> {
+    let prompt = if professional {
+        "Rewrite this dictation professionally:"
+    } else {
+        "Clean up this dictation:"
+    };
+    vec![json!({"role": "user", "content": format!("{prompt}\n{text}")})]
 }
 
-fn request(port: u16, text: &str, budget: Duration) -> Result<String, PolishError> {
+fn request(port: u16, text: &str, budget: Duration, professional: bool) -> Result<String, PolishError> {
     use std::io::BufRead;
     let deadline = Instant::now() + budget;
-    let body = json!({"messages": messages(text), "temperature": 0,
+    let body = json!({"messages": messages(text, professional),"temperature": 0,
         "max_tokens": (text.split_whitespace().count() * 3 + 24).clamp(64, 192),
         "cache_prompt": false, "stream": true});
     let response = ureq::AgentBuilder::new()
@@ -321,10 +334,12 @@ mod tests {
 
     #[test]
     fn prompt_matches_gemma_training() {
-        let all = messages("Hello there.");
+        let all = messages("Hello there.", false);
         assert_eq!(all.len(), 1);
         assert_eq!(all[0]["role"], "user");
         assert_eq!(all[0]["content"], "Clean up this dictation:\nHello there.");
+        let all = messages("Hello there.", true);
+        assert_eq!(all[0]["content"], "Rewrite this dictation professionally:\nHello there.");
     }
 
     #[test]

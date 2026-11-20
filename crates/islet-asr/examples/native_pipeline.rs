@@ -3,7 +3,7 @@
 //! Reads one JSON object per line on stdin and answers one per line on
 //! stdout, so a script can push many texts through without restarting:
 //!
-//! - `native_pipeline <llama-server.exe> <model.gguf>`: what the app does
+//! - `native_pipeline <llama-server.exe> <model.gguf> [--professional]`: what the app does
 //!   with a transcript. `{"input"}` → `{"output", "rule", "accepted",
 //!   "elapsed_ms"}`: rule cleanup, the model rewrite with the app's time
 //!   budget, the outer guard (falling back to the rule text), then number
@@ -35,6 +35,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         spoken_punctuation: true,
         ..Default::default()
     };
+    // `--professional` after the model: the professional rewrite prompt.
+    let professional = args.iter().any(|arg| arg == "--professional");
     let polisher = if args.first().map(String::as_str) == Some("--rules-only") {
         None
     } else {
@@ -70,7 +72,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let (text, accepted) = if rule.is_empty() {
                     (String::new(), false)
                 } else {
-                    match polisher.rewrite(&rule, budget(&rule)) {
+                    match polisher.rewrite(&rule, budget(&rule), professional) {
                         Ok(rewrite) => {
                             let rewrite = unwrap_rewrite(&rewrite);
                             if accept_rewrite(&rule, &rewrite) {

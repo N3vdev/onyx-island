@@ -401,6 +401,10 @@ pub struct DictationConfig {
     /// it only runs once the model is downloaded, and until then dictation
     /// uses the rule-based cleanup.
     pub ai_cleanup: bool,
+    /// With AI cleanup on, rewrite each dictation as clear, professional
+    /// text instead of only cleaning it up. Names, numbers, negations and
+    /// questions are checked; a rewrite that changes them is not typed.
+    pub ai_professional: bool,
     /// Keep a WAV file of each dictation's audio (never its text). Off by
     /// default.
     pub save_recordings: bool,
@@ -517,6 +521,7 @@ impl Default for DictationConfig {
             dictionary: Vec::new(),
             snippets: Vec::new(),
             ai_cleanup: true,
+            ai_professional: false,
             save_recordings: false,
             recordings_folder: String::new(),
             delete_recordings_after_days: 7,

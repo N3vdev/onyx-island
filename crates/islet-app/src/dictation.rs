@@ -1292,8 +1292,9 @@ impl Controller {
         let (sender, events) = crossbeam_channel::bounded(1);
         let polisher = Arc::clone(&self.polisher);
         let input = text.clone();
+        let professional = self.config.ai_professional;
         std::thread::spawn(move || {
-            let _ = sender.send(polisher.rewrite(&input, budget));
+            let _ = sender.send(polisher.rewrite(&input, budget, professional));
         });
         self.polishing = Some(Polishing {
             events,

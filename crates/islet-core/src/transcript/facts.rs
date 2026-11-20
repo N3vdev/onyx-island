@@ -178,6 +178,17 @@ pub(super) fn spoken_number(tokens: &[Token], start: usize) -> Option<(u64, usiz
             break;
         }
         if let Some((value, after)) = group(tokens, next) {
+            // "the seven billion one" is the 7 billion model, not
+            // 7,000,000,001: after a million or a billion, a small count
+            // only joins when a smaller scale follows ("two million fifty
+            // thousand").
+            let scaled = adjacent(tokens, after)
+                && tokens
+                    .get(after)
+                    .is_some_and(|t| matches!(norm(t).as_str(), "million" | "thousand"));
+            if scale >= 1_000_000 && value < 100 && !scaled {
+                break;
+            }
             part = value;
             end = after;
         } else {
@@ -364,6 +375,49 @@ pub(super) fn spoken_decimal(tokens: &[Token], start: usize) -> Option<(String, 
     (points > 0).then_some((value, end))
 }
 
+/// "3 billion", "2.5 million", "one point five billion": a number followed
+/// by a scale word, as its full value, so "three billion" and "3 billion"
+/// are the same quantity.
+fn scaled(tokens: &[Token], start: usize) -> Option<Quantity> {
+    let token = tokens.get(start)?;
+    let bare = token.word.replace(',', "");
+    let (number, end) = if !bare.is_empty()
+        && bare.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+        && bare.matches('.').count() <= 1
+    {
+        (bare, start + 1)
+    } else {
+        spoken_decimal(tokens, start)?
+    };
+    let scale_token = tokens.get(end)?;
+    if !tokens[end - 1].trail.is_empty() || scale_token.verbatim {
+        return None;
+    }
+    let scale: u64 = match norm(scale_token).as_str() {
+        "billion" => 1_000_000_000,
+        "million" => 1_000_000,
+        _ => return None,
+    };
+    let (whole, fraction) = number.split_once('.').unwrap_or((&number, ""));
+    let mut value = whole.parse::<u64>().ok()?.checked_mul(scale)?;
+    let mut place = scale;
+    for digit in fraction.bytes() {
+        place /= 10;
+        value += u64::from(digit - b'0') * place;
+    }
+    let mut end = end + 1;
+    let mut number_unit = tokens.get(end).and_then(|t| unit(&norm(t))).map(str::to_owned);
+    if number_unit.is_some() {
+        end += 1;
+    }
+    for (symbol, currency) in [('$', "usd"), ('\u{20b9}', "inr"), ('\u{20ac}', "eur"), ('\u{a3}', "gbp")] {
+        if token.lead.contains(symbol) {
+            number_unit = Some(currency.to_owned());
+        }
+    }
+    Some(Quantity { end, value: value.to_string(), unit: number_unit })
+}
+
 pub(super) fn quantity(tokens: &[Token], start: usize) -> Option<Quantity> {
     if let Some(clock) = clock(tokens, start) {
         return Some(clock);
@@ -375,6 +429,9 @@ pub(super) fn quantity(tokens: &[Token], start: usize) -> Option<Quantity> {
             value.unit = unit(&key).map(str::to_owned);
             return Some(value);
         }
+    }
+    if let Some(scaled) = scaled(tokens, start) {
+        return Some(scaled);
     }
     if let Some((value, mut end)) = spoken_decimal(tokens, start) {
         let identifier = value.matches('.').count() > 1

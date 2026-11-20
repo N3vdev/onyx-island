@@ -3087,6 +3087,8 @@ pub enum RewriteRejection {
     NovelContent,
     ListStructure,
     QuotedText,
+    /// Professional rewrite only: too much of what was said is gone.
+    DroppedContent,
 }
 
 /// Whether a language model's rewrite of `original` can be typed instead of
@@ -3143,6 +3145,77 @@ pub fn rewrite_rejection(original: &str, rewrite: &str) -> Option<RewriteRejecti
         })
         .count();
     (novel > 1 + after.len() / 10).then_some(RewriteRejection::NovelContent)
+}
+
+/// Words a professional rewrite may add or drop freely: grammar, politeness
+/// and request framing ("Can you please...", "I'd like...").
+const REWRITE_FREE: &[&str] = &[
+    "a", "an", "the", "and", "or", "but", "so", "to", "of", "in", "on", "at", "for", "from", "by", "with",
+    "about", "into", "as", "is", "are", "was", "were", "be", "been", "being", "am", "it", "its", "it's", "this",
+    "that", "these", "those", "there", "here", "i", "me", "my", "mine", "you", "your", "we", "our", "us", "they",
+    "them", "their", "he", "she", "him", "her", "his", "can", "could", "would", "will", "shall", "should", "may",
+    "might", "must", "do", "does", "did", "done", "have", "has", "had", "having", "i'm", "i'll", "i've", "i'd",
+    "you're", "let's", "please", "also", "too", "just", "really", "very", "actually", "basically", "kind",
+    "sort", "like", "then", "than", "if", "when", "what", "which", "who", "how", "why", "where", "whether",
+    "any", "some", "all", "each", "every", "more", "most", "much", "many", "one", "up", "out", "off", "over",
+    "now", "again", "still", "even", "well", "need", "needs", "want", "wants", "wanted", "make", "made", "get",
+    "got", "give", "gives", "help", "let", "able", "sure", "okay", "yes", "no",
+];
+
+fn rewrite_stem(word: &str) -> &str {
+    for suffix in ["'s", "ing", "ed", "es", "s", "ly"] {
+        if word.len() > suffix.len() + 2 {
+            if let Some(stem) = word.strip_suffix(suffix) {
+                return stem;
+            }
+        }
+    }
+    word
+}
+
+/// The professional rewrite's extra check, on top of `rewrite_rejection`:
+/// rewording is fine, but at least three quarters of what was said must
+/// still be there ("make a revision plan for physics" must not become "a
+/// literature review").
+#[must_use]
+pub fn professional_rejection(original: &str, rewrite: &str) -> Option<RewriteRejection> {
+    let words = |text: &str| -> std::collections::BTreeSet<String> {
+        content_words(&text.replace('\u{2019}', "'"))
+            .into_iter()
+            .filter(|word| !REWRITE_FREE.contains(&word.as_str()))
+            .map(|word| rewrite_stem(&word).to_owned())
+            .collect()
+    };
+    let (before, after) = (words(original), words(rewrite));
+    let kept = before.intersection(&after).count();
+    if !before.is_empty() && kept * 4 < before.len() * 3 {
+        return Some(RewriteRejection::DroppedContent);
+    }
+    // "Basically, a to-do list" -> "maybe, a to-do list": a hedge that was
+    // not said changes how sure the speaker is.
+    const HEDGES: &[&str] = &["maybe", "perhaps", "probably", "possibly", "might"];
+    let said = content_words(original);
+    content_words(rewrite)
+        .iter()
+        .any(|word| HEDGES.contains(&word.as_str()) && !said.contains(word))
+        .then_some(RewriteRejection::NovelContent)
+}
+
+/// "three billion" -> "3 billion", "two point five million" -> "2.5
+/// million": a round million or billion reads better as a word than as
+/// "3000000000". Anything else is written in digits.
+fn written_cardinal(value: u64) -> String {
+    for (scale, word) in [(1_000_000_000u64, "billion"), (1_000_000, "million")] {
+        if value >= scale && value % (scale / 10) == 0 {
+            let tenths = value / (scale / 10);
+            return if tenths % 10 == 0 {
+                format!("{} {word}", tenths / 10)
+            } else {
+                format!("{}.{} {word}", tenths / 10, tenths % 10)
+            };
+        }
+    }
+    value.to_string()
 }
 
 fn written_decimal_or_clock(tokens: &[Token], at: usize) -> Option<(String, usize)> {
@@ -3246,7 +3319,7 @@ pub fn format_numbers(text: &str) -> String {
         let explicit = written_decimal_or_clock(&tokens, at);
         let cardinal = explicit.is_none();
         let value = explicit
-            .or_else(|| facts::spoken_number(&tokens, at).map(|(n, end)| (n.to_string(), end)));
+            .or_else(|| facts::spoken_number(&tokens, at).map(|(n, end)| (written_cardinal(n), end)));
         let Some((value, end)) = value else {
             at += 1;
             continue;
@@ -3781,6 +3854,42 @@ mod tests {
         assert_eq!(clean("It's a car that has that sound I like.", &o), "It's a car that has that sound I like.");
         assert_eq!(clean("I know what is what.", &o), "I know what is what.");
         assert_eq!(clean("He said that is that and left.", &o), "He said that is that and left.");    }
+
+    #[test]
+    fn round_millions_and_billions_are_written_as_words() {
+        assert_eq!(format_numbers(&clean("Now the one billion parameters is not worth it.", &options())), "Now the 1 billion parameters is not worth it.");
+        assert_eq!(format_numbers(&clean("He can only run a three billion model.", &options())), "He can only run a 3 billion model.");
+        assert_eq!(format_numbers(&clean("Compare it with the seven billion one.", &options())), "Compare it with the 7 billion one.");
+        assert_eq!(format_numbers(&clean("It has two point five million users.", &options())), "It has 2.5 million users.");
+        assert_eq!(format_numbers(&clean("We sold two million fifty thousand units.", &options())), "We sold 2050000 units.");
+        assert_eq!(format_numbers(&clean("It costs twelve thousand rupees.", &options())), "It costs 12000 rupees.");
+    }
+
+    #[test]
+    fn a_professional_rewrite_may_reword_but_must_keep_what_was_said() {
+        let said = "Make revision plan for physics, exam in four days, I didn't start yet.";
+        assert!(professional_rejection(
+            said,
+            "Can you make me a revision plan for physics? The exam is in four days, and I haven't started yet."
+        )
+        .is_none());
+        assert_eq!(
+            professional_rejection(said, "I need a literature review for a few days."),
+            Some(RewriteRejection::DroppedContent)
+        );
+        assert_eq!(
+            professional_rejection(
+                "Now I want a widget of to-do list with reminders and Basically, a to-do list.",
+                "Now I want a to-do list widget with reminders and maybe, a to-do list."
+            ),
+            Some(RewriteRejection::NovelContent)
+        );
+        assert!(professional_rejection(
+            "the app is slow as since we added the new charts and I think the database queries is the problem",
+            "The app is slow since we added the new charts. I think the database queries are the problem."
+        )
+        .is_none());
+    }
 
     #[test]
     fn a_phrase_said_again_after_a_mid_sentence_sorry_replaces_the_first_try() {
