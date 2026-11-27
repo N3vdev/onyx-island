@@ -27,6 +27,9 @@ const TEAR_AT: f32 = 1.0;
 const TEAR_RUN: f32 = 1.6;
 /// How long the sad face keeps moving after it starts.
 pub(crate) const SULK_LENGTH: f64 = (TEAR_AT + TEAR_RUN) as f64 + 0.1;
+/// How long the cross face keeps moving after it starts: brows down and a
+/// short huff.
+pub(crate) const GRUMBLE_LENGTH: f64 = 1.2;
 const EYE_SPACING: f32 = 14.0;
 /// One blink: the lids close quickly, rest a moment, and open more slowly.
 const CLOSE: f64 = 0.085;
@@ -111,9 +114,12 @@ pub(crate) struct EyePose {
     /// 0..1: tinted yellow, for the night light.
     pub warm: f32,
     /// 0..1: sad, the top of each eye cut by a lid sloping down toward the
-    /// outside (/ \), like worried brows. Pushed off to the screen side,
-    /// they sulk.
+    /// outside (/ \), like worried brows. Left at the screen side long
+    /// enough, they sulk.
     pub sad: f32,
+    /// 0..1: cross, the top of each eye cut by a lid sloping down toward the
+    /// middle (\ /), like frowning brows.
+    pub angry: f32,
     /// 0..1: how far a single tear has run down (0: none).
     pub tear: f32,
 }
@@ -132,6 +138,7 @@ impl EyePose {
         shift_y: 0.0,
         warm: 0.0,
         sad: 0.0,
+        angry: 0.0,
         tear: 0.0,
     };
 
@@ -156,6 +163,7 @@ impl EyePose {
             shift_y: 0.0,
             warm: 0.0,
             sad: 0.0,
+            angry: 0.0,
             tear: 0.0,
         };
         pose.settle_lids();
@@ -260,6 +268,17 @@ impl EyePose {
         self
     }
 
+    /// Cross at being left at the screen side, `t` seconds in: the brows
+    /// come down toward the middle, the eyes narrow a little, and a short
+    /// huff shakes them.
+    pub fn grumble(mut self, t: f64) -> Self {
+        let t = t as f32;
+        self.angry = self.angry.max(smoothstep(0.0, 0.35, t));
+        self.open = self.open.min(1.0 - 0.18 * self.angry);
+        self.shift_x += 1.4 * (TAU * 7.0 * t).sin() * (-4.0 * t).exp() * smoothstep(0.1, 0.3, t);
+        self
+    }
+
     /// Happy or squeezed eyes are already closed in their own way, so they
     /// do not blink on top of it.
     fn settle_lids(&mut self) {
@@ -269,9 +288,10 @@ impl EyePose {
 
     /// Settled-frame key at about half-pixel steps, so a frame that would
     /// look the same as the last one is skipped.
-    pub fn key(self) -> [i16; 13] {
+    pub fn key(self) -> [i16; 14] {
         [
             self.sad,
+            self.angry,
             self.tear,
             self.warm,
             self.wink,
@@ -453,9 +473,9 @@ impl Gfx {
             // The eye on the side they look toward comes a touch closer.
             let near = 1.0 + 0.08 * pose.look_x * side;
             let at_x = cx + side * EYE_SPACING * unit + look_x;
-            // The sad lid takes some of the top: raise the eye by about
-            // half of that, so what is left sits in the middle.
-            let at_y = cy + look_y - eye_h * 0.1 * pose.sad;
+            // A sad or cross lid takes some of the top: raise the eye by
+            // about half of that, so what is left sits in the middle.
+            let at_y = cy + look_y - eye_h * 0.1 * pose.sad.max(pose.angry);
             if narrow < 1.0 {
                 let w = eye_w * near;
                 let full = eye_h * near;
@@ -468,13 +488,18 @@ impl Gfx {
                 let h = lerp(lidded, stroke, narrow);
                 let mid = lerp(lid_y, at_y, narrow);
                 let sad = pose.sad * (1.0 - narrow);
-                if sad > 0.01 {
-                    // A lid sloping down toward the outside cuts the top of
-                    // the eye: untouched at the inner edge, some way down
-                    // at the outer.
+                let angry = pose.angry * (1.0 - narrow);
+                if sad.max(angry) > 0.01 {
+                    // A sloping lid cuts the top of the eye: sad, it comes
+                    // down toward the outer edge; cross, toward the inner.
                     let top = mid - h * 0.5;
-                    let inner = (at_x - side * eye_w * 0.5, top - 0.5 * unit);
-                    let outer = (at_x + side * eye_w * 0.5, top + h * 0.42 * sad);
+                    let (inner_y, outer_y) = if angry > sad {
+                        (top + h * 0.42 * angry, top - 0.5 * unit)
+                    } else {
+                        (top - 0.5 * unit, top + h * 0.42 * sad)
+                    };
+                    let inner = (at_x - side * eye_w * 0.5, inner_y);
+                    let outer = (at_x + side * eye_w * 0.5, outer_y);
                     let outline = round_rect_outline(at_x - w * 0.5, mid - h * 0.5, w, h, w.min(h) * 0.5);
                     self.fill_polygon(&below_line(&outline, inner, outer), ink)?;
                 } else {

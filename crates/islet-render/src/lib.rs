@@ -238,8 +238,10 @@ mod devices;
 
 /// How long the pill takes to grow in before the night light's eyes react.
 const NIGHT_EYES_DELAY: f64 = 1.0;
-/// Arrived at a screen side, the pill grows in before the eyes turn cross.
-const SULK_DELAY: f64 = 0.35;
+/// Left at a screen side, the eyes keep their usual face for a while, turn
+/// cross after this many seconds, and sad after this many.
+const ANGRY_AFTER: f64 = 25.0 * 60.0;
+const SAD_AFTER: f64 = 30.0 * 60.0;
 /// Back in the middle, the pill grows in before the eyes hop for joy.
 const CHEER_DELAY: f64 = 0.4;
 
@@ -250,7 +252,8 @@ pub struct Renderer {
     /// The night light's eyes on screen last frame.
     night_shown: Option<islet_core::island::NightGreeting>,
     eyes_shown: bool,
-    /// When the eyes arrived at a screen side, where they sulk.
+    /// When the eyes arrived at a screen side, where they turn cross and
+    /// then sad if left there.
     sulk_since: Option<f64>,
     /// Where the pointer last held the island while it is held, and the
     /// eyes' reaction to the last pull being let go (with when it began).
@@ -669,19 +672,29 @@ impl Renderer {
             self.sulk_since.get_or_insert(now);
         } else {
             // Brought back to the middle: cheered up, they hop for joy once
-            // the pill has grown in.
-            if eyes && self.sulk_since.is_some() {
+            // the pill has grown in (only if they had turned cross or sad).
+            if eyes && self.sulk_since.is_some_and(|since| now - since >= ANGRY_AFTER) {
                 self.reaction = Some((eyes::Reaction::Hop, now + CHEER_DELAY));
                 self.blinker.blink_at(now + CHEER_DELAY + eyes::Reaction::Hop.length());
             }
             self.sulk_since = None;
         }
         let eye_pose = if eyes {
-            // A sad face does not wink.
-            let wink = if self.sulk_since.is_some() { 0.0 } else { self.blinker.wink(now) };
+            // A cross or sad face does not wink.
+            let tucked = self.sulk_since.map(|since| now - since);
+            let moody = tucked.is_some_and(|t| t >= ANGRY_AFTER);
+            let wink = if moody { 0.0 } else { self.blinker.wink(now) };
             let mut pose = eyes::EyePose::new(x, y, self.lift(y), self.blinker.open(now), now).wink(wink);
-            if let Some(since) = self.sulk_since {
-                pose = pose.sulk(now - since - SULK_DELAY);
+            match tucked {
+                Some(t) if t >= SAD_AFTER => {
+                    // The frown melts into the sad face.
+                    let sad = t - SAD_AFTER;
+                    pose.angry = 1.0 - smoothstep(0.0, 0.5, sad as f32);
+                    pose.open = pose.open.min(1.0 - 0.18 * pose.angry);
+                    pose = pose.sulk(sad);
+                }
+                Some(t) if t >= ANGRY_AFTER => pose = pose.grumble(t - ANGRY_AFTER),
+                _ => {}
             }
             // Yellow while the night light is on, and as it comes on; going
             // off, only until they wake.
@@ -871,7 +884,13 @@ impl Renderer {
     /// the render thread can sleep until then.
     #[must_use]
     pub fn wake_in(&self, now: f64) -> Option<f64> {
-        self.eyes_visible().then(|| self.blinker.wake_in(now))
+        self.eyes_visible().then(|| {
+            // Also wake when the face left at a side turns cross or sad.
+            let mood = self.sulk_since.and_then(|since| {
+                [ANGRY_AFTER, SAD_AFTER].into_iter().map(|at| since + at - now).find(|&left| left > 0.0)
+            });
+            mood.map_or(self.blinker.wake_in(now), |left| left.min(self.blinker.wake_in(now)))
+        })
     }
 
     /// How far a vertical pull of `y` lifts the island away from its edge
@@ -885,8 +904,13 @@ impl Renderer {
     fn eyes_reacting(&self, now: f64) -> bool {
         self.held_pull.is_some()
             || self.reaction.is_some_and(|(reaction, start)| now - start < reaction.length() + 0.05)
-            // Turning sad, sighing, and the tear running down.
-            || self.sulk_since.is_some_and(|since| now - since < SULK_DELAY + eyes::SULK_LENGTH)
+            // Turning cross with a huff, then sad, sighing, and the tear
+            // running down.
+            || self.sulk_since.is_some_and(|since| {
+                let t = now - since;
+                (ANGRY_AFTER..ANGRY_AFTER + eyes::GRUMBLE_LENGTH).contains(&t)
+                    || (SAD_AFTER..SAD_AFTER + eyes::SULK_LENGTH).contains(&t)
+            })
     }
 
     /// The night light is warming the screen.
